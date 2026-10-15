@@ -38,3 +38,7 @@ id_ecdsa*
 credentials.json
 .netrc
 *.local.toml
+
+# VLResearch: Python bytecode from running the skill helpers.
+__pycache__/
+*.pyc
