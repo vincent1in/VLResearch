@@ -167,6 +167,8 @@ pub fn git_command() -> Command {
     if let Some(paths) = super::shell_env::search_path() {
         command.env("PATH", paths);
     }
+    // VLResearch: local repositories only, unless VLR_GIT_PROTOCOLS widens it.
+    crate::flavor::egress::restrict_git(&mut command);
     command
 }
 

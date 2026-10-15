@@ -28,7 +28,10 @@ pub struct LocalProject {
 
 impl LocalProject {
     pub fn github_enabled(&self) -> bool {
-        self.github_sync_enabled && self.has_github_repository()
+        // VLResearch: GitHub stays off unless VLR_ALLOW_GITHUB is set.
+        self.github_sync_enabled
+            && self.has_github_repository()
+            && crate::flavor::egress::github_allowed()
     }
 
     pub fn has_github_repository(&self) -> bool {

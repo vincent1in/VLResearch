@@ -36,6 +36,10 @@ pub async fn status() -> Status {
 }
 
 async fn gh(args: &[&str], timeout: Duration) -> Result<String> {
+    // VLResearch: GitHub stays off unless VLR_ALLOW_GITHUB is set.
+    if !crate::flavor::egress::github_allowed() {
+        return Err(anyhow!("{}", crate::flavor::egress::GITHUB_DISABLED));
+    }
     let mut command = match super::shell_env::find_on_path("gh") {
         Some(path) => Command::new(path),
         None => Command::new("gh"),
