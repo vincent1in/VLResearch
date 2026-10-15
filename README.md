@@ -6,7 +6,7 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 
 - **Nothing leaves your machine except SSH and your LLM.** orx itself never calls an LLM; your coding agent does. VLResearch blocks what orx would otherwise send on its own: update checks, accounts and managed compute, literature APIs, GitHub, Overleaf and agent installers. It also turns off the agents' own telemetry and auto-updates.
 - **Chats hear back from their runs.** Every run a chat launches wakes that chat when it finishes, instead of only when the agent remembered to ask.
-- **Waiting is visible.** When Claude Code is retrying a failed API call, the chat shows a retry row instead of a silent hang.
+- **Waiting is visible.** When Claude Code is retrying a failed API call, the chat shows a retry row instead of a silent hang. Claude Code also keeps a checklist of its steps (its TodoWrite tool), whichever model you pick.
 
 Planned next: a metrics ledger, an idea queue, a "grill me" scoping step before any compute is spent, a forecast-and-verify improvement loop, and a findings ledger.
 
@@ -49,6 +49,7 @@ All optional. Set them in the environment `orx up` starts from.
 | `VLR_ALLOW_INSTALLERS` | off | Lets the dashboard install or update coding agents |
 | `VLR_AUTO_WAKE` | on | `0` keeps OpenResearch's opt-in wake-ups |
 | `VLR_AGENT_ENV_DEFAULTS` | on | `0` stops orx adding the no-telemetry settings to agent processes |
+| `VLR_AGENT_CHECKLIST` | on | `0` leaves Claude Code's task tools as Claude Code configures them |
 
 ## Keys and secrets
 

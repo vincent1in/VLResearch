@@ -6,7 +6,7 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 
 | Path | What it holds |
 | --- | --- |
-| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent events surfaced in chat) |
+| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat) |
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
 | `flavor/egress-baseline.txt` | Accepted network call sites outside the egress gate |
 | `.github/workflows/vlresearch.yml` | Secret scan and egress audit; upstream's `ci.yml` still runs fmt, clippy and tests |
@@ -33,7 +33,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/local/github.rs`, `src/local/model.rs` | GitHub off unless `VLR_ALLOW_GITHUB` |
 | `src/updates.rs`, `src/commands/update.rs`, `src/commands/version.rs` | No release-feed checks, update warnings or installs from alphaXiv |
 | `src/commands/up/harness_setup.rs` | No agent installs or updates unless `VLR_ALLOW_INSTALLERS` |
-| `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry settings |
+| `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings |
 | `src/compute.rs` | `submit` registers the launching chat's wake-up |
 | `src/commands/exp.rs`, `src/plane/local_plane.rs` | `orx exp wait` timeout under Claude Code; a wait that sees the result settles the wake-up |
 | `src/invocation.rs` | The line printed after a launch mentions the automatic wake-up |

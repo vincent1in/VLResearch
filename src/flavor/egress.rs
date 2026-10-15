@@ -147,15 +147,7 @@ pub(crate) fn apply_agent_env_defaults(cmd: &mut tokio::process::Command) {
     if std::env::var(AGENT_DEFAULTS_ENV).is_ok_and(|value| value.trim() == "0") {
         return;
     }
-    for (key, value) in AGENT_ENV_DEFAULTS {
-        let on_command = cmd
-            .as_std()
-            .get_envs()
-            .any(|(name, _)| name == std::ffi::OsStr::new(key));
-        if !on_command && crate::local::shell_env::var(key).is_none() {
-            cmd.env(key, value);
-        }
-    }
+    super::set_env_defaults(cmd, AGENT_ENV_DEFAULTS);
 }
 
 /// Lowercased host without IPv6 brackets or a trailing root dot.
