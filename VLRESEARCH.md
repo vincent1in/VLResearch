@@ -41,7 +41,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `watch_runs` runs the stall check; a finished turn calls the autocompactor; declares the `vlresearch` child module |
 | `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server |
 | `ui/src/components/ChatPanel.tsx` | The progress strip above the composer; the agent's checklist tool reads as progress |
-| `ui/src/App.tsx` | The Experiments tab's Research toggle, beside Table and Tree |
+| `ui/src/App.tsx` | The Experiments tab's Research toggle, beside Table and Tree; the Research view's side chats, which bring the loop's chat to the front and open upstream's side chat off it |
 | `src/compute.rs` | `submit` checks the scoping gate before any compute is spent and the locked paths against the commit it staged, then registers the launching chat's wake-up and records probe runs |
 | `src/plane/local_plane.rs` | `launch` passes a probe request on to the gate, which runs in the `orx up` process for launches from chat |
 | `src/commands/exp.rs`, `src/plane/local_plane.rs` | `orx exp wait` timeout under Claude Code; a wait that sees the result settles the wake-up |

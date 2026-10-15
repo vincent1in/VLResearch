@@ -5,6 +5,10 @@ import {
   CONFIRMED_MESSAGE,
   ablationLine,
   adjustedText,
+  askAboutFinding,
+  askAboutIdea,
+  askAboutNext,
+  askAboutStep,
   briefPayload,
   budgetLines,
   draftFromBrief,
@@ -351,4 +355,22 @@ test("the brief payload carries pointers, the chat link and the metric", () => {
   assert.equal(brief?.sources, "/data/opt");
   assert.equal(brief?.chatSessionId, "chat_1");
   assert.equal(primary?.key, "val_ic");
+});
+
+test("side chats open with a question that names the item and its id", () => {
+  const idea = {
+    id: "idea_7", title: "Volume features", kind: "science", class: "incremental", priority: 2, hypothesis: null, killTest: null,
+    forecast: 0.003, forecastLow: -0.001, forecastHigh: 0.007, costHours: 2, status: "open", statusLabel: "open",
+    experimentId: null, outcome: null, createdAt: 1, startedAt: null, closedAt: null, adjusted: null,
+  };
+  assert.match(askAboutNext(idea), /“Volume features” \(`idea_7`\) the next one/);
+  assert.match(askAboutIdea(idea), /forecast of \+0\.003 \(\u22120\.001 to \+0\.007\) based on/);
+  const tried = { ...idea, status: "refuted", statusLabel: "refuted", experimentId: "exp_2", outcome: -0.0004, closedAt: 5 };
+  assert.match(askAboutIdea(tried), /why is it refuted\? It measured \u22120\.0004 against a forecast of \+0\.003/);
+  const dropped = { ...idea, status: "dropped", statusLabel: "dropped", closedAt: 5 };
+  assert.match(askAboutIdea(dropped), /why is it dropped\?$/);
+  const step = { label: "Volume features", detail: "vol-20d", kind: "step", from: 0.02, to: 0.023, delta: 0.003, tone: "gain", share: 0.6 };
+  assert.equal(askAboutStep(step, "val_ic"), "Why did “Volume features” (experiment vol-20d) move val_ic by +0.003? Would the gain hold without the steps around it?");
+  assert.match(askAboutStep({ ...step, detail: null }, "val_ic"), /^Why did “Volume features” move/);
+  assert.match(askAboutFinding({ id: "fnd_1", statement: "Volume helps in volatile months", kind: "model", status: "supported", locked: false }), /“Volume helps in volatile months” \(`fnd_1`\)/);
 });

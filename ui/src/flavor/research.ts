@@ -902,3 +902,31 @@ export function kickoffMessage(projectId: string, seedIdeas: number): string {
 /** Sent to that chat when the user confirms the brief in the Research view. */
 export const CONFIRMED_MESSAGE =
   "I confirmed the brief in the Research view. Start the improvement loop with the orx-improve skill.";
+
+// --- side chats -------------------------------------------------------------------------------
+
+// Questions the Research view opens a side chat with, off the chat that runs
+// the loop. They carry each item's id, so the side chat's agent can look it up
+// (`orx idea show`, `orx finding show`) while the loop keeps running.
+
+export function askAboutNext(idea: Idea): string {
+  return `Why is the idea “${idea.title}” (\`${idea.id}\`) the next one to try, and what is its forecast based on?`;
+}
+
+export function askAboutIdea(idea: Idea): string {
+  const name = `“${idea.title}” (\`${idea.id}\`)`;
+  if (idea.closedAt !== null) {
+    const measured = idea.outcome !== null ? ` It measured ${formatSigned(idea.outcome)} against a forecast of ${forecastText(idea)}.` : "";
+    return `What did trying ${name} show, and why is it ${idea.statusLabel}?${measured}`;
+  }
+  return `What does the idea ${name} change, and what is its forecast of ${forecastText(idea)} based on?`;
+}
+
+export function askAboutStep(row: WaterfallRow, metric: string): string {
+  const step = row.detail ? `“${row.label}” (experiment ${row.detail})` : `“${row.label}”`;
+  return `Why did ${step} move ${metric} by ${formatSigned(row.delta)}? Would the gain hold without the steps around it?`;
+}
+
+export function askAboutFinding(finding: Finding): string {
+  return `What is the evidence for the finding “${finding.statement}” (\`${finding.id}\`), and how far does it hold?`;
+}

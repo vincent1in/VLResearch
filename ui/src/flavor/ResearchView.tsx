@@ -4,10 +4,10 @@
 // and the findings ledger. The user starts auto-research here (the setup
 // form) and confirms the brief here; the agent and `orx` write the rest.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, Play, Target, TriangleAlert } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessagesSquare, Play, Target, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { sendChatMessage } from "../api";
-import { Button } from "../components/ui";
+import { Button, IconButton } from "../components/ui";
 import { workspaceKey } from "../queries/client";
 import { ResearchSetup } from "./ResearchSetup";
 import {
@@ -17,6 +17,10 @@ import {
   isBlocker,
   ablationLine,
   adjustedText,
+  askAboutFinding,
+  askAboutIdea,
+  askAboutNext,
+  askAboutStep,
   budgetLines,
   calibrationLine,
   forecastText,
@@ -138,6 +142,17 @@ function Collapsible<T>({ items, render, noun }: { items: readonly T[]; render: 
   );
 }
 
+/** Opens a side chat off the chat that runs the loop, with a question. */
+type Ask = (question: string) => void;
+
+function AskButton({ label, question, onAsk }: { label: string; question: string; onAsk: Ask }) {
+  return (
+    <IconButton size="small" className="h-6 w-6 text-muted" aria-label={label} title={`${label} in a side chat; the loop keeps running`} onClick={() => onAsk(question)}>
+      <MessagesSquare size={13} />
+    </IconButton>
+  );
+}
+
 // --- the optimization surface ---------------------------------------------------------
 
 function Headline({ metrics }: { metrics: MetricsPayload }) {
@@ -251,7 +266,7 @@ function bar(row: WaterfallRow, domain: [number, number]): { left: string; width
   return { left: `${(100 * start).toFixed(2)}%`, width: `${(100 * (end - start)).toFixed(2)}%` };
 }
 
-function Waterfall({ metrics }: { metrics: MetricsPayload }) {
+function Waterfall({ metrics, onAsk }: { metrics: MetricsPayload; onAsk?: Ask }) {
   const primary = metrics.primary;
   const rows = useMemo(
     () => (primary ? waterfall(metrics.path, primary.direction, primary.noiseFloor) : []),
@@ -276,8 +291,11 @@ function Waterfall({ metrics }: { metrics: MetricsPayload }) {
           return (
             <div key={`${row.kind}-${index}`} className="contents">
               <div className={`min-w-0 ${cell}`}>
-                <div dir="auto" className={`truncate text-sm text-text ${total || row.kind === "baseline" ? "font-medium" : ""}`} title={row.label}>
-                  {row.label}
+                <div className="flex min-w-0 items-center gap-1">
+                  <div dir="auto" className={`truncate text-sm text-text ${total || row.kind === "baseline" ? "font-medium" : ""}`} title={row.label}>
+                    {row.label}
+                  </div>
+                  {onAsk && row.kind === "step" && <AskButton label="Ask about this step" question={askAboutStep(row, primary.key)} onAsk={onAsk} />}
                 </div>
                 {(row.detail || row.kind === "unscored") && (
                   <div dir="auto" className="truncate text-xs text-muted" title={row.detail ?? undefined}>
@@ -344,7 +362,7 @@ function statusChip(idea: Idea) {
   }
 }
 
-function IdeaRow({ idea, tried }: { idea: Idea; tried?: boolean }) {
+function IdeaRow({ idea, tried, onAsk }: { idea: Idea; tried?: boolean; onAsk?: Ask }) {
   const inside = insideInterval(idea);
   return (
     <div className="flex flex-col gap-0.5 py-1.5 border-b border-b-border-variant last:border-b-0">
@@ -354,6 +372,7 @@ function IdeaRow({ idea, tried }: { idea: Idea; tried?: boolean }) {
         </span>
         {idea.class && <Chip tone="muted">{idea.class}</Chip>}
         {(tried || idea.status === "running") && statusChip(idea)}
+        {onAsk && <AskButton label="Ask about this idea" question={askAboutIdea(idea)} onAsk={onAsk} />}
       </div>
       <div className="text-xs text-muted tabular-nums">
         {tried && idea.outcome !== null ? (
@@ -377,7 +396,7 @@ function IdeaRow({ idea, tried }: { idea: Idea; tried?: boolean }) {
   );
 }
 
-function IdeasPanel({ ideas }: { ideas: IdeasPayload }) {
+function IdeasPanel({ ideas, onAsk }: { ideas: IdeasPayload; onAsk?: Ask }) {
   const groups = useMemo(() => groupIdeas(ideas.ideas), [ideas.ideas]);
   const calibration = calibrationLine(ideas.calibration);
   if (ideas.ideas.length === 0) {
@@ -387,7 +406,10 @@ function IdeasPanel({ ideas }: { ideas: IdeasPayload }) {
     <div className="flex flex-col gap-4">
       {ideas.next && (
         <div className="flex flex-col gap-1 py-2 px-3 rounded-md border border-border bg-surface">
-          <div className="text-xs font-medium text-subtext">Up next</div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-medium text-subtext">Up next</div>
+            {onAsk && <AskButton label="Ask why it's next" question={askAboutNext(ideas.next.idea)} onAsk={onAsk} />}
+          </div>
           <div dir="auto" className="text-sm font-medium text-text">{ideas.next.idea.title}</div>
           <div className="text-xs text-subtext">Why: {ideas.next.reason}.</div>
           {ideas.next.idea.killTest && <div className="text-xs text-subtext">Kill test first: {ideas.next.idea.killTest}</div>}
@@ -410,13 +432,13 @@ function IdeasPanel({ ideas }: { ideas: IdeasPayload }) {
           <div className="mb-1 text-xs font-medium text-subtext">
             Queued ({groups.running.length + groups.open.length})
           </div>
-          <Collapsible items={[...groups.running, ...groups.open]} noun="ideas" render={(idea) => <IdeaRow key={idea.id} idea={idea} />} />
+          <Collapsible items={[...groups.running, ...groups.open]} noun="ideas" render={(idea) => <IdeaRow key={idea.id} idea={idea} onAsk={onAsk} />} />
         </div>
       )}
       {groups.tried.length > 0 && (
         <div className="flex flex-col">
           <div className="mb-1 text-xs font-medium text-subtext">Tried ({groups.tried.length})</div>
-          <Collapsible items={groups.tried} noun="ideas" render={(idea) => <IdeaRow key={idea.id} idea={idea} tried />} />
+          <Collapsible items={groups.tried} noun="ideas" render={(idea) => <IdeaRow key={idea.id} idea={idea} tried onAsk={onAsk} />} />
         </div>
       )}
       {ideas.byClass.length > 0 && (
@@ -628,7 +650,7 @@ function verdictChip(status: string) {
   }
 }
 
-function FindingsPanel({ rows }: { rows: FindingRow[] }) {
+function FindingsPanel({ rows, onAsk }: { rows: FindingRow[]; onAsk?: Ask }) {
   if (rows.length === 0) {
     return <Note>No findings yet. The agent records what each result says beyond its one idea, with the runs as evidence.</Note>;
   }
@@ -643,6 +665,7 @@ function FindingsPanel({ rows }: { rows: FindingRow[] }) {
               <span dir="auto" className="min-w-0 flex-1 text-sm text-text">{row.finding.statement}</span>
               {row.finding.locked && <Lock size={12} className="mt-1 shrink-0 text-muted" aria-label="Settled by you" />}
               {verdictChip(row.finding.status)}
+              {onAsk && <AskButton label="Ask about this finding" question={askAboutFinding(row.finding)} onAsk={onAsk} />}
             </div>
             <div className="text-xs text-muted tabular-nums">
               {row.finding.kind}
@@ -663,7 +686,14 @@ function Loading({ error }: { error: unknown }) {
   return <Note>{error ? "Couldn't load this section." : "Loading…"}</Note>;
 }
 
-export function ResearchView({ projectId }: { projectId: string }) {
+export function ResearchView({
+  projectId,
+  onSideChat,
+}: {
+  projectId: string;
+  /** Opens a side chat off a chat, with a question (empty to just open it). */
+  onSideChat?: (parentSessionId: string, question: string) => void;
+}) {
   const metrics = useProjectData(projectId, "vlresearchMetrics", "metrics", parseMetrics);
   const ideas = useProjectData(projectId, "vlresearchIdeas", "ideas", parseIdeas);
   const brief = useProjectData(projectId, "vlresearchBrief", "brief", parseBrief);
@@ -692,6 +722,9 @@ export function ResearchView({ projectId }: { projectId: string }) {
     );
   }
   const unconfirmed = brief.data?.brief && !brief.data.brief.confirmedAt ? brief.data : null;
+  // Side chats branch off the chat that runs the loop, which the brief links.
+  const loopChat = brief.data?.brief?.chatSessionId ?? null;
+  const ask: Ask | undefined = loopChat && onSideChat ? (question) => onSideChat(loopChat, question) : undefined;
   return (
     <div className="vlr-research absolute inset-0 overflow-y-auto bg-background">
       <div className="w-full max-w-230 mx-auto pt-5 px-5 pb-10">
@@ -709,10 +742,17 @@ export function ResearchView({ projectId }: { projectId: string }) {
             <ConfirmBar data={unconfirmed} projectId={projectId} onEdit={() => setSetup("edit")} />
           </div>
         )}
-        <h2 className="m-0 mb-3 flex items-center gap-1.5 text-sm font-semibold text-text [&_svg]:text-muted">
-          <Target size={14} />
-          Optimization
-        </h2>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <h2 className="m-0 flex items-center gap-1.5 text-sm font-semibold text-text [&_svg]:text-muted">
+            <Target size={14} />
+            Optimization
+          </h2>
+          {ask && (
+            <Button variant="ghost" size="small" title="Ask about the optimization in a side chat; the loop keeps running" onClick={() => ask("")}>
+              <MessagesSquare size={13} /> Side chat
+            </Button>
+          )}
+        </div>
         {metrics.data ? <Headline metrics={metrics.data} /> : <Loading error={metrics.error} />}
         {metrics.data?.primary && (
           <>
@@ -728,17 +768,17 @@ export function ResearchView({ projectId }: { projectId: string }) {
               {details ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               What moved the score
             </button>
-            {details && <Waterfall metrics={metrics.data} />}
+            {details && <Waterfall metrics={metrics.data} onAsk={ask} />}
           </>
         )}
         <Section icon={<Lightbulb size={14} />} title="Ideas">
-          {ideas.data ? <IdeasPanel ideas={ideas.data} /> : <Loading error={ideas.error} />}
+          {ideas.data ? <IdeasPanel ideas={ideas.data} onAsk={ask} /> : <Loading error={ideas.error} />}
         </Section>
         <Section icon={<ClipboardList size={14} />} title="Brief">
           {brief.data ? <BriefPanel data={brief.data} onEdit={() => setSetup("edit")} /> : <Loading error={brief.error} />}
         </Section>
         <Section icon={<BookOpen size={14} />} title="Findings">
-          {findings.data ? <FindingsPanel rows={findings.data} /> : <Loading error={findings.error} />}
+          {findings.data ? <FindingsPanel rows={findings.data} onAsk={ask} /> : <Loading error={findings.error} />}
         </Section>
       </div>
     </div>

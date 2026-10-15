@@ -1315,6 +1315,15 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       showAlert(errorText(error), "error");
     }
   }, [openSideTab]);
+  // VLResearch: the Research view's side chats branch off the chat that runs
+  // the loop, so that chat comes to the front first.
+  const openResearchSideChat = useCallback(async (sessionId: string, question: string) => {
+    const current = navigationRef.current;
+    if (current.activeSessionId !== sessionId && current.projectId) {
+      await router.navigate({ href: taskLocation(current.projectId, sessionId, current.pane) });
+    }
+    await startSideChat(sessionId, question);
+  }, [router, startSideChat]);
 
   // Side chats are temporary: closing the tab is what deletes one.
   const closeSideTab = useCallback(
@@ -1990,7 +1999,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 </div>
                 <div className="pane-content flex-1 min-h-0 relative bg-background">
                   {vlrResearch && activeProject ? (
-                    <ResearchView projectId={activeProject.id} />
+                    <ResearchView projectId={activeProject.id} onSideChat={(sessionId, question) => void openResearchSideChat(sessionId, question)} />
                   ) : view === "tree" ? (
                     activeProject && (
                       <TreeView
