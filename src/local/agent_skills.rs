@@ -260,6 +260,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_INSTANCES,
             &S_LOGS,
             &S_RESULTS,
+            &crate::flavor::skills::METRICS, // VLResearch
             &S_REPORTS,
             &S_FIGURES,
             &S_PAPER,
@@ -276,6 +277,7 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_INSTANCES,
             &S_LOGS,
             &S_RESULTS,
+            &crate::flavor::skills::METRICS, // VLResearch
             &S_REPORTS,
             &S_FIGURES,
             &S_PAPER,

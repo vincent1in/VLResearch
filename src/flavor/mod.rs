@@ -7,8 +7,11 @@
 
 pub(crate) mod activity;
 pub(crate) mod api;
+pub(crate) mod cli;
 pub(crate) mod egress;
 pub(crate) mod harness;
+pub(crate) mod metrics;
+pub(crate) mod skills;
 pub(crate) mod stall;
 pub(crate) mod wake;
 

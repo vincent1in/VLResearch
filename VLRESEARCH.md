@@ -6,7 +6,8 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 
 | Path | What it holds |
 | --- | --- |
-| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `activity.rs` (each chat's last-activity clock), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
+| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `activity.rs` (each chat's last-activity clock), `metrics.rs` (the metrics ledger), `cli.rs` (`orx metric`), `skills.rs` (agent skills), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
+| `agent-skills/orx-metrics/` | The agent skill for reporting and comparing metrics, with its Python helper |
 | `src/flavor/chat_host.rs` | Code that starts hidden chat turns. It is compiled as a child module of `src/local/chat/mod.rs` (a `#[path]` declaration there), the only way to reach the chat host's private turn machinery without making upstream's items public |
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
 | `flavor/egress-baseline.txt` | Accepted network call sites outside the egress gate |
@@ -28,7 +29,9 @@ Find them all with `git grep -n 'VLResearch:'`.
 
 | File | Hook |
 | --- | --- |
-| `src/main.rs` | Declares `mod flavor` |
+| `src/main.rs` | Declares `mod flavor`; one flattened `Flavor` command variant adds every VLResearch command, plus its arms in `command_name` and `dispatch` |
+| `src/local/harness/plan_gate.rs` | `orx metric`'s reading forms pass Claude's plan-mode gate |
+| `src/local/agent_skills.rs` | Registers the `orx-metrics` skill in both skill sets |
 | `src/net.rs` | Both HTTP client builders go through the egress gate |
 | `src/local/git.rs` | `git_command()` sets `GIT_ALLOW_PROTOCOL` |
 | `src/local/github.rs`, `src/local/model.rs` | GitHub off unless `VLR_ALLOW_GITHUB` |
@@ -65,6 +68,5 @@ Upstream merges are never rebased, so `main` is never force-pushed.
 
 ## Next up
 
-1. The dashboard side of the chat progress strip (the agent's checklist, time since its last update, the runs it waits on). Its data is served by `GET /api/vlresearch/sessions/{id}/progress`.
-2. A metrics ledger: `ORX_METRIC {json}` lines in run output, stored per run.
-3. An idea queue, a "grill me" scoping gate, a forecast-and-verify loop, and a findings ledger.
+1. Dashboard views on the endpoints that already exist: the chat progress strip (`GET /api/vlresearch/sessions/{id}/progress`) and the optimization surface, with the running best and the lineage waterfall (`GET /api/vlresearch/projects/{id}/metrics`).
+2. An idea queue, a "grill me" scoping gate, a forecast-and-verify loop, and a findings ledger.

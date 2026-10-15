@@ -181,6 +181,10 @@ enum Command {
     /// Internal: manage a persistent SSH remote host.
     #[command(name = "remote-host", hide = true)]
     RemoteHost(RemoteHostArgs),
+
+    // VLResearch: this distribution's commands (src/flavor/cli.rs).
+    #[command(flatten)]
+    Flavor(flavor::cli::FlavorCommand),
 }
 
 #[derive(Args, Debug)]
@@ -1246,6 +1250,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::AntigravityGate => "antigravity-gate",
         Command::PublishBranch(_) => "publish-branch",
         Command::RemoteHost(_) => "remote-host",
+        Command::Flavor(command) => command.name(), // VLResearch
     }
 }
 
@@ -1302,6 +1307,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::AntigravityGate => commands::mcp_gate::run_antigravity().await,
         Command::PublishBranch(_) => unreachable!("handled before dispatch"),
         Command::RemoteHost(_) => unreachable!("handled before dispatch"),
+        Command::Flavor(command) => flavor::cli::run(command).await, // VLResearch
     }
 }
 

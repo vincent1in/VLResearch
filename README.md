@@ -2,14 +2,35 @@
 
 A local-first workspace for research agents, tuned for quantitative research: adding datasets, updating models, and making processes faster, with experiments run on your own machines over SSH.
 
-VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes four things:
+VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes five things:
 
 - **Nothing leaves your machine except SSH and your LLM.** orx itself never calls an LLM; your coding agent does. VLResearch blocks what orx would otherwise send on its own: update checks, accounts and managed compute, literature APIs, GitHub, Overleaf and agent installers. It also turns off the agents' own telemetry and auto-updates.
 - **Chats hear back from their runs.** Every run a chat launches wakes that chat when it finishes, instead of only when the agent remembered to ask.
 - **Stuck runs get noticed.** If a run a chat is waiting on prints nothing for 30 minutes, logs a NaN or infinite metric, or hits an out-of-memory error while still running, orx tells the agent. The agent can then read the log and cancel the run instead of letting it burn compute.
 - **Waiting is visible.** When Claude Code is retrying a failed API call, the chat shows a retry row instead of a silent hang. Claude Code also keeps a checklist of its steps (its TodoWrite tool), whichever model you pick.
+- **Runs are scored.** Run code prints `ORX_METRIC {json}` lines and orx records them per run. Each project names one primary metric and its direction. `orx metric` then ranks runs on it, tracks the best run against the baseline, and splits the gain across the experiments between them. A noise floor keeps a lucky run from counting as an improvement.
 
-Planned next: a metrics ledger, an idea queue, a "grill me" scoping step before any compute is spent, a forecast-and-verify improvement loop, and a findings ledger.
+Planned next: dashboard views for chat progress and metrics, an idea queue, a "grill me" scoping step before any compute is spent, a forecast-and-verify improvement loop, and a findings ledger.
+
+## Scoring runs
+
+Print metrics from the run's code, one JSON object per line:
+
+```text
+ORX_METRIC {"key": "val_ic", "value": 0.031, "step": 1200}
+ORX_METRIC {"step": 1200, "val_ic": 0.031, "train_loss": 0.42}
+```
+
+`orx skill metrics/assets/orx_metrics.py` prints a small Python helper that writes these lines. Then:
+
+```sh
+orx metric primary <projectId> val_ic --maximize --noise-floor 0.002   # once per project
+orx metric runs <projectId>     # runs ranked on the primary metric
+orx metric best <projectId>     # best run against the baseline, step by step
+orx metric show <runId>         # everything one run reported
+```
+
+A run's score is the last value it reported. Choose a validation metric as primary, and keep test splits for final reports. Coding agents in VLResearch chats get these instructions as the `orx-metrics` skill.
 
 ## Install from source
 

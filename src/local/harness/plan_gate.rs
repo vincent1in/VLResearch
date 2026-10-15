@@ -314,6 +314,8 @@ fn is_readonly_orx(tokens: &[&str], stage: &str) -> bool {
             Some("desc") => !stage.contains("--set") && !stage.contains("--stdin"),
             _ => false,
         },
+        // VLResearch: `orx metric`'s reading forms.
+        "metric" => crate::flavor::cli::is_readonly(tokens),
 
         // Everything else — create-*, instance, login/logout, install-skills,
         // update, serve, supervise, up, and any unrecognized future verb — is
