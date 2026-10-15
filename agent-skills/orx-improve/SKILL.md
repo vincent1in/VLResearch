@@ -48,6 +48,10 @@ outcome, kept or refuted, and the best against the baseline.
   match the baseline's. Check that before claiming the gain.
 - Dataset additions get a point-in-time and coverage check before any
   modeling.
+- orx compacts the chat between turns when its context fills up. When
+  earlier rounds survive only as a summary, re-read the state before the
+  next step: `orx brief show`, `orx metric best`, `orx idea list` and the
+  status of runs you launched. The ledgers are the record, not the summary.
 - Stop when the brief's stop rule fires or its budget runs out. Then report
   the best against the baseline, the ideas that built it (the path in
   `orx metric best`), what was refuted, and how calibrated the forecasts

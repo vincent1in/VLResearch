@@ -2,7 +2,7 @@
 
 A local-first workspace for research agents, tuned for quantitative research: adding datasets, updating models, and making processes faster, with experiments run on your own machines over SSH.
 
-VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes eight things:
+VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes nine things:
 
 - **Nothing leaves your machine except SSH and your LLM.** orx itself never calls an LLM; your coding agent does. VLResearch blocks what orx would otherwise send on its own: update checks, accounts and managed compute, literature APIs, GitHub, Overleaf and agent installers. It also turns off the agents' own telemetry and auto-updates.
 - **Chats hear back from their runs.** Every run a chat launches wakes that chat when it finishes, instead of only when the agent remembered to ask.
@@ -12,6 +12,7 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **Ideas are work items.** Each idea to try is queued with a forecast, an 80% interval, a GPU-hour cost and a cheap kill test. `orx idea next` picks the next one by expected gain per GPU-hour, with blockers first and a rule that keeps the search from only making small steps. Closing an idea measures what its experiment did against its parent, so forecasts can be checked.
 - **Work is scoped before compute is spent.** The agent interviews you in rounds, each question with its recommended answer, until the objective, metric, limits, budget and stop rule are agreed, then reviews the data for leakage and proposes ideas. Once a project has this brief, orx holds every launch to it.
 - **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
+- **Long chats keep going.** When a chat's context window is 80% full, orx compacts it as soon as the turn that filled it ends, so a long research loop doesn't run out of room in the middle of a task. The metrics, ideas, brief and findings live outside the chat, so compacting loses none of them.
 
 Planned next: dashboard views for chat progress, metrics, ideas, the brief and findings.
 
@@ -72,6 +73,12 @@ orx finding lock <findingId>     # settled; agents can add evidence but not chan
 
 The `orx-improve` skill then runs the loop: pick the next idea, check its forecast against past calibration, build it on a child of the best experiment, run it, measure it, and keep a new best only past the noise floor, after a replicate with new seeds.
 
+## Long chats
+
+When a chat's context window is 80% full (`VLR_AUTO_COMPACT`), orx compacts the chat as soon as the turn that filled it ends and nothing else is waiting to run. It uses the agent's own compaction where there is one (Claude Code, Codex), and otherwise a summary that the next turn starts from; OpenCode and Cursor chats would otherwise never be compacted. It shows in the chat like a manual compaction, Stop cancels it, and messages you send meanwhile run after it.
+
+orx doesn't compact a chat while a plan, question or permission card is waiting for your answer, or a helper agent that another chat delegated to. After compacting a chat, it lets three turns run before compacting it again; after a compaction that failed or that you stopped, it waits 30 minutes.
+
 ## Install from source
 
 You need a stable Rust toolchain and git. VLResearch has no release builds, and it never installs alphaXiv's releases over itself.
@@ -115,6 +122,7 @@ All optional. Set them in the environment `orx up` starts from.
 | `VLR_STALL_MINUTES` | `30` | Minutes a running job may print nothing before its chat is told; `0` turns stall alerts off |
 | `VLR_SCOPE_GATE` | on | Holds launches to a project's brief once it has one; `strict` also refuses projects without a brief; `0` turns the gate off |
 | `VLR_PROBE` | off | Set to `1` on a single launch to run it as a probe |
+| `VLR_AUTO_COMPACT` | `0.8` | How full a chat's context window gets before orx compacts it, as a fraction (`0.8`) or a percentage (`80`, `80%`); `0` turns autocompaction off |
 
 ## Keys and secrets
 

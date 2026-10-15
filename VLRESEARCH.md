@@ -6,7 +6,7 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 
 | Path | What it holds |
 | --- | --- |
-| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `activity.rs` (each chat's last-activity clock), `metrics.rs` (the metrics ledger), `ideas.rs` (the idea queue and its selector), `scope.rs` (the brief and its launch gate), `findings.rs` (the findings ledger), `cli.rs` (the commands' arguments and dispatch), `metric_cli.rs`, `idea_cli.rs`, `brief_cli.rs` and `finding_cli.rs` (`orx metric`, `orx idea`, `orx brief`, `orx finding`), `skills.rs` (agent skills), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
+| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `compact.rs` (autocompaction), `activity.rs` (each chat's last-activity clock), `metrics.rs` (the metrics ledger), `ideas.rs` (the idea queue and its selector), `scope.rs` (the brief and its launch gate), `findings.rs` (the findings ledger), `cli.rs` (the commands' arguments and dispatch), `metric_cli.rs`, `idea_cli.rs`, `brief_cli.rs` and `finding_cli.rs` (`orx metric`, `orx idea`, `orx brief`, `orx finding`), `skills.rs` (agent skills), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
 | `agent-skills/orx-metrics/`, `orx-ideas/`, `orx-findings/`, `orx-grill/`, `orx-improve/` | Agent skills: reporting metrics (with a Python helper), working the idea queue, keeping findings, scoping a goal with the user, and running the improvement loop |
 | `src/flavor/chat_host.rs` | Code that starts hidden chat turns. It is compiled as a child module of `src/local/chat/mod.rs` (a `#[path]` declaration there), the only way to reach the chat host's private turn machinery without making upstream's items public |
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
@@ -37,7 +37,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/local/github.rs`, `src/local/model.rs` | GitHub off unless `VLR_ALLOW_GITHUB` |
 | `src/updates.rs`, `src/commands/update.rs`, `src/commands/version.rs` | No release-feed checks, update warnings or installs from alphaXiv |
 | `src/commands/up/harness_setup.rs` | No agent installs or updates unless `VLR_ALLOW_INSTALLERS` |
-| `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `watch_runs` runs the stall check; declares the `vlresearch` child module |
+| `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `watch_runs` runs the stall check; a finished turn calls the autocompactor; declares the `vlresearch` child module |
 | `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server |
 | `src/compute.rs` | `submit` checks the scoping gate before any compute is spent and the locked paths against the commit it staged, then registers the launching chat's wake-up and records probe runs |
 | `src/plane/local_plane.rs` | `launch` passes a probe request on to the gate, which runs in the `orx up` process for launches from chat |

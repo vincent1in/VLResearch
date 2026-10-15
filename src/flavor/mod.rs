@@ -9,6 +9,7 @@ pub(crate) mod activity;
 pub(crate) mod api;
 pub(crate) mod brief_cli;
 pub(crate) mod cli;
+pub(crate) mod compact;
 pub(crate) mod egress;
 pub(crate) mod finding_cli;
 pub(crate) mod findings;

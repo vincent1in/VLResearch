@@ -5849,6 +5849,8 @@ impl ChatHost {
                 .finish_turn(&ctx.session_id, Some(&ctx.assistant.id))
                 .await;
             ctx.host.drain_queue(&ctx.session_id).await;
+            // VLResearch: compact a nearly full chat once it is idle.
+            crate::flavor::compact::after_turn(&ctx.host, &ctx.session_id, &ctx.assistant.id).await;
         });
         turns.insert(
             sid.clone(),
