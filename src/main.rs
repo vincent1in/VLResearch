@@ -18,6 +18,8 @@ mod commands;
 mod compute;
 mod config;
 mod error;
+// VLResearch: this distribution's additions; see VLRESEARCH.md.
+mod flavor;
 mod folder_picker;
 mod invocation;
 mod jobs;
