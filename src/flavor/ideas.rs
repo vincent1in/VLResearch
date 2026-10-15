@@ -103,6 +103,16 @@ impl Status {
     }
 }
 
+impl Idea {
+    /// The status as people read it: a closed blocker was resolved, not kept.
+    pub(crate) fn status_label(&self) -> &'static str {
+        match self.status {
+            Status::Kept if self.kind.is_blocker() => "resolved",
+            status => status.as_str(),
+        }
+    }
+}
+
 /// One idea, as stored.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -437,6 +447,8 @@ pub(crate) fn close(
         Verdict::Kept => Status::Kept,
         Verdict::Refuted => Status::Refuted,
         Verdict::Dropped => Status::Dropped,
+        // A blocker is done when it is resolved; there is nothing to measure.
+        Verdict::Measured if idea.kind.is_blocker() => Status::Kept,
         Verdict::Measured => {
             let (Some(change), Some(metric)) = (measured, &primary) else {
                 return Err(anyhow!(
@@ -489,7 +501,7 @@ fn measured_change(
     let runs = metrics::scored_runs(store, project_id, &metric.key)?;
     let best = |experiment: &str| {
         runs.iter()
-            .filter(|run| run.experiment_id == experiment && run.status == "done")
+            .filter(|run| run.experiment_id == experiment && run.counts())
             .filter_map(|run| run.score)
             .max_by(|a, b| {
                 metric
@@ -720,7 +732,7 @@ pub(crate) struct Calibration {
 pub(crate) fn calibration(ideas: &[Idea]) -> Calibration {
     let mut result = Calibration::default();
     let mut errors = Vec::new();
-    for idea in ideas {
+    for idea in ideas.iter().filter(|idea| !idea.kind.is_blocker()) {
         if matches!(idea.status, Status::Kept | Status::Refuted) {
             result.tested += 1;
             if idea.status == Status::Kept {

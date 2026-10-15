@@ -25,6 +25,36 @@ where
             get(project_metrics),
         )
         .route("/api/vlresearch/projects/{id}/ideas", get(project_ideas))
+        .route("/api/vlresearch/projects/{id}/brief", get(project_brief))
+}
+
+/// The project's brief, what it still lacks, and the budget used so far.
+async fn project_brief(Path(project_id): Path<String>) -> ApiResult {
+    let body = tokio::task::spawn_blocking(move || -> crate::error::Result<Option<Value>> {
+        let store = Store::open()?;
+        let Some(project) = store.get_local_project(&project_id)? else {
+            return Ok(None);
+        };
+        let brief = super::scope::get(&store, &project.id)?;
+        let (usage, missing) = match &brief {
+            Some(brief) => (
+                Some(super::scope::usage(&store, brief)?),
+                super::scope::missing(&store, brief)?,
+            ),
+            None => (None, Vec::new()),
+        };
+        Ok(Some(json!({
+            "brief": brief,
+            "primary": super::metrics::primary(&store, &project.id)?,
+            "usage": usage,
+            "missing": missing,
+        })))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    body.map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))
 }
 
 /// The project's idea queue, the selector's next pick, and how well forecasts

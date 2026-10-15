@@ -504,6 +504,16 @@ pub(crate) struct ScoredRun {
     pub created_at: i64,
     pub ended_at: Option<i64>,
     pub score: Option<f64>,
+    /// Launched with `VLR_PROBE=1`: a smoke test or baseline check, never a
+    /// result.
+    pub probe: bool,
+}
+
+impl ScoredRun {
+    /// Whether the run can stand as a result: finished, and not a probe.
+    pub(crate) fn counts(&self) -> bool {
+        self.status == "done" && !self.probe
+    }
 }
 
 /// Every run in the project, newest first, scored on `key` after reading any
@@ -514,6 +524,7 @@ pub(crate) fn scored_runs(store: &Store, project_id: &str, key: &str) -> Result<
     for run in store.list_runs_by_project(project_id)? {
         ingest(store, &run)?;
         let score = final_value(store, &run.id, key)?;
+        let probe = super::scope::is_probe(store, &run.id)?;
         scored.push(ScoredRun {
             experiment: names
                 .get(&run.experiment_id)
@@ -525,6 +536,7 @@ pub(crate) fn scored_runs(store: &Store, project_id: &str, key: &str) -> Result<
             created_at: run.created_at,
             ended_at: run.ended_at,
             score,
+            probe,
         });
     }
     Ok(scored)
@@ -594,7 +606,7 @@ pub(crate) struct HistoryPoint {
 pub(crate) fn running_best(runs: &[ScoredRun], metric: &PrimaryMetric) -> Standing {
     let mut finished: Vec<&ScoredRun> = runs
         .iter()
-        .filter(|run| run.status == "done" && run.score.is_some())
+        .filter(|run| run.counts() && run.score.is_some())
         .collect();
     finished.sort_by_key(|run| (run.ended_at.unwrap_or(run.created_at), run.created_at));
     let floor = metric.noise_floor.unwrap_or(0.0);
@@ -671,7 +683,7 @@ pub(crate) fn lineage(
     for id in chain {
         let best_run = runs
             .iter()
-            .filter(|run| run.experiment_id == id && run.status == "done")
+            .filter(|run| run.experiment_id == id && run.counts())
             .filter_map(|run| run.score.map(|score| (run, score)))
             .max_by(|(_, a), (_, b)| {
                 metric
@@ -904,6 +916,7 @@ mod tests {
             created_at: ended - 1,
             ended_at: Some(ended),
             score: Some(score),
+            probe: false,
         }
     }
 

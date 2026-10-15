@@ -16,6 +16,71 @@ pub(crate) enum FlavorCommand {
     /// Queue ideas to try, each with a forecast, a cost and a kill test, and
     /// record what each did.
     Idea(IdeaArgs),
+    /// The project's agreed brief: objective, limits, budget and stop rule.
+    /// Once a project has one, launches wait for it to be confirmed.
+    Brief(BriefArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BriefArgs {
+    #[command(subcommand)]
+    pub command: BriefCommand,
+}
+
+// Parsed once per process, so the size of `Set` doesn't matter.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum BriefCommand {
+    /// Show the brief, what it still needs, and the budget used so far.
+    Show {
+        project_id: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fill in or change the brief. Any change reopens a confirmed brief.
+    Set {
+        project_id: String,
+        /// The goal in words. The number that measures it is the primary
+        /// metric (`orx metric primary`).
+        #[arg(long)]
+        objective: Option<String>,
+        /// What runs may change: feature code, model code, loaders, …
+        #[arg(long)]
+        may_change: Option<String>,
+        /// What must stay fixed: evaluation code, split dates, the
+        /// out-of-sample window, …
+        #[arg(long)]
+        must_not_change: Option<String>,
+        /// A repository file no run may change, checked at every launch
+        /// (repeatable).
+        #[arg(long, value_name = "PATH")]
+        lock: Vec<String>,
+        /// Stop locking a file (repeatable).
+        #[arg(long, value_name = "PATH")]
+        unlock: Vec<String>,
+        /// How many runs (probes excluded) the brief allows.
+        #[arg(long, value_name = "RUNS")]
+        budget_runs: Option<i64>,
+        /// GPU-hours the brief allows (reported, not enforced).
+        #[arg(long, value_name = "HOURS")]
+        budget_gpu_hours: Option<f64>,
+        /// Days from confirmation the brief allows.
+        #[arg(long, value_name = "DAYS")]
+        budget_days: Option<f64>,
+        /// Where the user wants the search to start.
+        #[arg(long)]
+        pointers: Option<String>,
+        /// Datasets, earlier experiments and papers to draw on.
+        #[arg(long)]
+        sources: Option<String>,
+        /// When to stop, e.g. no validation gain in 5 runs.
+        #[arg(long)]
+        stop_rule: Option<String>,
+    },
+    /// Confirm the brief once the user has agreed to it. Locked files are
+    /// pinned to their content on the baseline branch.
+    Confirm { project_id: String },
 }
 
 impl FlavorCommand {
@@ -24,6 +89,7 @@ impl FlavorCommand {
         match self {
             FlavorCommand::Metric(_) => "metric",
             FlavorCommand::Idea(_) => "idea",
+            FlavorCommand::Brief(_) => "brief",
         }
     }
 }
@@ -206,6 +272,7 @@ pub(crate) async fn run(command: FlavorCommand) -> Result<()> {
     tokio::task::spawn_blocking(move || match command {
         FlavorCommand::Metric(args) => metric(args.command),
         FlavorCommand::Idea(args) => super::idea_cli::run(args.command),
+        FlavorCommand::Brief(args) => super::brief_cli::run(args.command),
     })
     .await
     .map_err(|error| anyhow!("orx {name} stopped unexpectedly: {error}"))?
@@ -228,6 +295,8 @@ pub(crate) fn is_readonly(tokens: &[&str]) -> bool {
                         | IdeaCommand::Show { .. }
                         | IdeaCommand::Next { .. }
                         | IdeaCommand::Calibration { .. },
+                }) | FlavorCommand::Brief(BriefArgs {
+                    command: BriefCommand::Show { .. },
                 })
             ))
         ),
@@ -404,6 +473,8 @@ fn runs(store: &Store, project_id: &str, key: Option<String>, json: bool) -> Res
                 "best"
             } else if Some(&run.run_id) == baseline_id.as_ref() {
                 "baseline"
+            } else if run.probe {
+                "probe"
             } else {
                 ""
             };
@@ -580,6 +651,7 @@ mod tests {
             "orx idea show idea_1",
             "orx idea next proj_1",
             "orx idea calibration proj_1 --json",
+            "orx brief show proj_1",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();
             assert!(is_readonly(&tokens), "{call}");
@@ -591,6 +663,8 @@ mod tests {
             "orx idea add proj_1 Volume",
             "orx idea done idea_1",
             "orx idea start idea_1 exp_1",
+            "orx brief confirm proj_1",
+            "orx brief set proj_1 --objective x",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();
             assert!(!is_readonly(&tokens), "{call}");

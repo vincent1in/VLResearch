@@ -192,7 +192,7 @@ fn list(store: &Store, project_id: &str, all: bool, json: bool) -> Result<()> {
                     .unwrap_or("")
                     .to_string(),
                 idea.priority.to_string(),
-                idea.status.as_str().to_string(),
+                idea.status_label().to_string(),
                 forecast_text(idea),
                 idea.cost_hours
                     .map(|hours| metrics::format_value(Some(hours)))
@@ -217,7 +217,7 @@ fn print_idea(idea: &Idea) {
             println!("  {label:<11} {value}");
         }
     };
-    line("status", Some(idea.status.as_str().to_string()));
+    line("status", Some(idea.status_label().to_string()));
     line(
         "kind",
         Some(match idea.class {
@@ -256,7 +256,7 @@ fn report_closed(idea: &Idea) {
         (Some(outcome), Some(key)) => format!(" Measured change: {} {key}.", signed(outcome)),
         _ => String::new(),
     };
-    println!("Idea {} is {}.{outcome}", idea.id, idea.status.as_str());
+    println!("Idea {} is {}.{outcome}", idea.id, idea.status_label());
 }
 
 fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {

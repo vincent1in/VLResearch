@@ -21,8 +21,22 @@ pub(crate) const IDEAS: AgentSkill = AgentSkill {
     resources: &[],
 };
 
+pub(crate) const GRILL: AgentSkill = AgentSkill {
+    name: "orx-grill",
+    description: "Scope research work with the user before spending compute: interview in numbered rounds with a recommended answer to each question, check the data and baseline, review for leakage, propose ideas with kill tests, and record the brief with `orx brief`. Use at the start of a research goal, when a launch says the brief is missing or unconfirmed, or when the goal changes.",
+    content: include_str!("../../agent-skills/orx-grill/SKILL.md"),
+    resources: &[],
+};
+
+pub(crate) const IMPROVE: AgentSkill = AgentSkill {
+    name: "orx-improve",
+    description: "Run the forecast-and-verify improvement loop on a scoped project: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on a project with a confirmed brief.",
+    content: include_str!("../../agent-skills/orx-improve/SKILL.md"),
+    resources: &[],
+};
+
 /// VLResearch's skills, in the order they are listed.
-const SKILLS: [&AgentSkill; 2] = [&METRICS, &IDEAS];
+const SKILLS: [&AgentSkill; 4] = [&METRICS, &IDEAS, &GRILL, &IMPROVE];
 
 /// Adds VLResearch's skills to an upstream skill list, right after
 /// `orx-results` (or at the end if upstream renames it).
@@ -51,8 +65,8 @@ mod tests {
                 .position(|name| *name == "orx-results")
                 .unwrap();
             assert_eq!(
-                names[results + 1..results + 3],
-                ["orx-metrics", "orx-ideas"]
+                names[results + 1..results + 5],
+                ["orx-metrics", "orx-ideas", "orx-grill", "orx-improve"]
             );
         }
     }

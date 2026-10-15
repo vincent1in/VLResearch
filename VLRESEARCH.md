@@ -6,8 +6,8 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 
 | Path | What it holds |
 | --- | --- |
-| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `activity.rs` (each chat's last-activity clock), `metrics.rs` (the metrics ledger), `ideas.rs` (the idea queue and its selector), `cli.rs` and `idea_cli.rs` (`orx metric`, `orx idea`), `skills.rs` (agent skills), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
-| `agent-skills/orx-metrics/`, `agent-skills/orx-ideas/` | Agent skills for reporting metrics (with a Python helper) and for working the idea queue |
+| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `activity.rs` (each chat's last-activity clock), `metrics.rs` (the metrics ledger), `ideas.rs` (the idea queue and its selector), `scope.rs` (the brief and its launch gate), `cli.rs`, `idea_cli.rs` and `brief_cli.rs` (`orx metric`, `orx idea`, `orx brief`), `skills.rs` (agent skills), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
+| `agent-skills/orx-metrics/`, `orx-ideas/`, `orx-grill/`, `orx-improve/` | Agent skills: reporting metrics (with a Python helper), working the idea queue, scoping a goal with the user, and running the improvement loop |
 | `src/flavor/chat_host.rs` | Code that starts hidden chat turns. It is compiled as a child module of `src/local/chat/mod.rs` (a `#[path]` declaration there), the only way to reach the chat host's private turn machinery without making upstream's items public |
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
 | `flavor/egress-baseline.txt` | Accepted network call sites outside the egress gate |
@@ -30,7 +30,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | File | Hook |
 | --- | --- |
 | `src/main.rs` | Declares `mod flavor`; one flattened `Flavor` command variant adds every VLResearch command, plus its arms in `command_name` and `dispatch` |
-| `src/local/harness/plan_gate.rs` | The reading forms of `orx metric` and `orx idea` pass Claude's plan-mode gate |
+| `src/local/harness/plan_gate.rs` | The reading forms of `orx metric`, `orx idea` and `orx brief` pass Claude's plan-mode gate |
 | `src/local/agent_skills.rs` | `skills()` hands both skill lists to `src/flavor/skills.rs`, which adds VLResearch's skills |
 | `src/net.rs` | Both HTTP client builders go through the egress gate |
 | `src/local/git.rs` | `git_command()` sets `GIT_ALLOW_PROTOCOL` |
@@ -39,7 +39,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/commands/up/harness_setup.rs` | No agent installs or updates unless `VLR_ALLOW_INSTALLERS` |
 | `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `watch_runs` runs the stall check; declares the `vlresearch` child module |
 | `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server |
-| `src/compute.rs` | `submit` registers the launching chat's wake-up |
+| `src/compute.rs` | `submit` checks the scoping gate before any compute is spent, then registers the launching chat's wake-up and records probe runs |
 | `src/commands/exp.rs`, `src/plane/local_plane.rs` | `orx exp wait` timeout under Claude Code; a wait that sees the result settles the wake-up |
 | `src/invocation.rs` | The line printed after a launch mentions the automatic wake-up |
 | `src/local/harness/claude.rs` | Claude Code `api_retry` events become retry rows |
@@ -68,5 +68,5 @@ Upstream merges are never rebased, so `main` is never force-pushed.
 
 ## Next up
 
-1. Dashboard views on the endpoints that already exist: the chat progress strip (`GET /api/vlresearch/sessions/{id}/progress`), the optimization surface with the running best and the lineage waterfall (`GET /api/vlresearch/projects/{id}/metrics`), and the idea board (`GET /api/vlresearch/projects/{id}/ideas`), which shows titles and never ids.
-2. A "grill me" scoping gate, the forecast-and-verify loop as an agent skill, and a findings ledger.
+1. Dashboard views on the endpoints that already exist: the chat progress strip (`GET /api/vlresearch/sessions/{id}/progress`), the optimization surface with the running best and the lineage waterfall (`GET /api/vlresearch/projects/{id}/metrics`), the idea board (`GET /api/vlresearch/projects/{id}/ideas`), which shows titles and never ids, and the brief with its budget (`GET /api/vlresearch/projects/{id}/brief`).
+2. A findings ledger: lessons tied to run ids, kept with refuted ideas so every trial behind a best result is counted.
