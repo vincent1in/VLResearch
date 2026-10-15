@@ -12,6 +12,8 @@ permissions:
 jobs:
   linked-issue:
     name: linked issue
+    # VLResearch: alphaXiv's contribution rule; not enforced here.
+    if: github.repository == 'alphaXiv/OpenResearch'
     runs-on: ubuntu-latest
     steps:
       - name: Require a linked issue on fork PRs

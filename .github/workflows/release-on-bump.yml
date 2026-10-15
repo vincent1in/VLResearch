@@ -55,6 +55,8 @@ permissions:
 jobs:
   dispatch:
     name: dispatch release if Cargo.toml version is unreleased
+    # VLResearch: releases are alphaXiv's; never dispatch them from this repository.
+    if: github.repository == 'alphaXiv/OpenResearch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
