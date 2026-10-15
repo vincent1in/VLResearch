@@ -8680,6 +8680,8 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
         }
     }
     crate::jobs::ssh::prepare_sharing_env(cmd);
+    // VLResearch: keep the agent's own telemetry and auto-updates off.
+    crate::flavor::egress::apply_agent_env_defaults(cmd);
 }
 
 /// Env var carrying the launching chat session's id into a harness child. The
