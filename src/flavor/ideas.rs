@@ -537,18 +537,26 @@ pub(crate) enum Verdict {
     Dropped,
 }
 
-/// An idea just closed, and the ablation checks its result queued.
+/// An idea just closed, and the checks its result queued.
 #[derive(Debug, Clone)]
 pub(crate) struct Closed {
     pub idea: Idea,
-    /// Queued when the idea was kept and its experiment holds the best.
+    /// Queued when the idea was kept and its experiment holds the best: a
+    /// rerun with a new seed.
+    pub replicate: Option<Idea>,
+    /// Queued with it, when ablation checks are on.
     pub ablations: Vec<Idea>,
+    /// For a replicate: the attempt it repeated, judged again on the mean.
+    pub repeated: Vec<Idea>,
 }
 
 /// Closes an idea. With an experiment and a primary metric, the outcome is the
-/// experiment's best finished score minus its parent's, the "verify" half of
-/// forecast-and-verify. A kept idea whose experiment now holds the project's
-/// best queues ablation checks for the biggest earlier steps behind it.
+/// experiment's score minus its parent's, the "verify" half of
+/// forecast-and-verify; an experiment scores the mean of its runs. A kept
+/// attempt whose experiment now holds the optimization's best queues a
+/// replicate (a rerun with a new seed) and, when they are on, ablation checks
+/// for the biggest earlier steps behind it. Closing the replicate judges the
+/// attempt again on the mean of both runs.
 pub(crate) fn close(
     store: &Store,
     id: &str,
@@ -564,6 +572,11 @@ pub(crate) fn close(
         ));
     }
     let primary = metrics::primary(store, &idea.optimization_id)?;
+    if let (Kind::Replicate, Verdict::Measured, Some(experiment_id), Some(metric)) =
+        (idea.kind, verdict, &idea.experiment_id, &primary)
+    {
+        rerun_since(store, &idea, experiment_id, metric)?;
+    }
     let measured = match (&idea.experiment_id, &primary) {
         (Some(experiment_id), Some(metric)) if verdict != Verdict::Dropped => {
             measured_change(store, &idea.project_id, experiment_id, metric)?
@@ -606,24 +619,149 @@ pub(crate) fn close(
         ],
     )?;
     let idea = require(store, &idea.id)?;
-    let ablations = match (&idea.experiment_id, &primary) {
+    let mut repeated = Vec::new();
+    if idea.kind == Kind::Replicate {
+        if let (Some(experiment_id), Some(metric), Some(change)) =
+            (&idea.experiment_id, &primary, measured)
+        {
+            repeated = rejudge(store, &idea, experiment_id, change, metric, now)?;
+        }
+        // A best that doesn't hold takes its ablation checks with it.
+        if idea.status == Status::Refuted {
+            store.flavor_conn().execute(
+                "UPDATE vlr_ideas SET status = 'dropped', closed_at = ?2, updated_at = ?2,
+                     evidence = COALESCE(evidence, 'The best it checked did not replicate.')
+                 WHERE optimization_id = ?1 AND ablates IS NOT NULL AND status = 'open'",
+                params![idea.optimization_id, now],
+            )?;
+        }
+    }
+    let (replicate, ablations) = match (&idea.experiment_id, &primary) {
         (Some(experiment_id), Some(metric))
-            if idea.status == Status::Kept
-                && !idea.kind.is_blocker()
-                && !idea.is_check()
-                && auto_ablate(store) =>
+            if idea.status == Status::Kept && !idea.kind.is_blocker() && !idea.is_check() =>
         {
             // The close has landed; a failure here only costs the checks.
-            super::scope::require(store, &idea.optimization_id)
-                .and_then(|brief| queue_ablations(store, &brief, experiment_id, metric))
-                .unwrap_or_else(|err| {
-                    eprintln!("vlresearch: could not queue ablation checks: {err}");
-                    Vec::new()
-                })
+            new_best_checks(store, &idea, experiment_id, metric).unwrap_or_else(|err| {
+                eprintln!("vlresearch: could not queue checks on the new best: {err}");
+                (None, Vec::new())
+            })
         }
-        _ => Vec::new(),
+        _ => (None, Vec::new()),
     };
-    Ok(Closed { idea, ablations })
+    Ok(Closed {
+        idea,
+        replicate,
+        ablations,
+        repeated,
+    })
+}
+
+/// A replicate measures a rerun: its experiment needs a run that finished
+/// after the replicate was queued.
+fn rerun_since(
+    store: &Store,
+    replicate: &Idea,
+    experiment_id: &str,
+    metric: &PrimaryMetric,
+) -> Result<()> {
+    let runs = metrics::scored_runs(
+        store,
+        &replicate.project_id,
+        &metric.key,
+        metric.split.as_deref(),
+    )?;
+    let rerun = runs.iter().any(|run| {
+        run.experiment_id == experiment_id
+            && run.counts()
+            && run.score.is_some()
+            && run.ended_at.unwrap_or(run.created_at) >= replicate.created_at
+    });
+    if rerun {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Replicate {} measures a rerun, and experiment {experiment_id} has no finished, scored \
+         run since it was queued. Run it again with a new seed (`orx exp run {experiment_id}`), \
+         then close the replicate.",
+        replicate.id
+    ))
+}
+
+/// The attempts a closed replicate repeated (those tested on its experiment),
+/// judged again on the experiment's mean, which now includes the replicate.
+fn rejudge(
+    store: &Store,
+    replicate: &Idea,
+    experiment_id: &str,
+    change: f64,
+    metric: &PrimaryMetric,
+    now: i64,
+) -> Result<Vec<Idea>> {
+    let mut repeated = Vec::new();
+    for attempt in list(store, &replicate.optimization_id)? {
+        let tested_here = attempt.id != replicate.id
+            && attempt.experiment_id.as_deref() == Some(experiment_id)
+            && !attempt.is_check()
+            && !attempt.kind.is_blocker()
+            && matches!(attempt.status, Status::Kept | Status::Refuted);
+        if !tested_here {
+            continue;
+        }
+        let status = judge(&attempt, change, metric);
+        store.flavor_conn().execute(
+            "UPDATE vlr_ideas SET status = ?2, outcome = ?3, updated_at = ?4 WHERE id = ?1",
+            params![attempt.id, status.as_str(), change, now],
+        )?;
+        repeated.push(require(store, &attempt.id)?);
+    }
+    Ok(repeated)
+}
+
+/// The checks on a kept attempt whose experiment now holds the best: a
+/// replicate, unless replicates are off, and ablation checks, when they are
+/// on.
+fn new_best_checks(
+    store: &Store,
+    idea: &Idea,
+    experiment_id: &str,
+    metric: &PrimaryMetric,
+) -> Result<(Option<Idea>, Vec<Idea>)> {
+    let brief = super::scope::require(store, &idea.optimization_id)?;
+    let (standing, _, _) = metrics::standing(store, &brief, metric)?;
+    if standing
+        .best
+        .is_none_or(|best| best.experiment_id != experiment_id)
+    {
+        return Ok((None, Vec::new()));
+    }
+    let replicate = if auto_replicate(store) {
+        let replicate = add(
+            store,
+            &idea.optimization_id,
+            IdeaFields {
+                title: Some(format!("Replicate \"{}\" with a new seed", idea.title)),
+                kind: Some(Kind::Replicate),
+                priority: Some(1),
+                hypothesis: Some(format!(
+                    "Run experiment {experiment_id} again with a new seed. orx scores an \
+                     experiment by the mean of its runs, so if the gain was luck, the mean \
+                     falls back and the best returns to what it was before."
+                )),
+                cost_hours: idea.cost_hours,
+                author: Some(Author::Review),
+                ..IdeaFields::default()
+            },
+        )?;
+        Some(replicate)
+    } else {
+        None
+    };
+    let ablations = if auto_ablate(store) {
+        queue_ablations(store, &brief, experiment_id, metric)?
+    } else {
+        Vec::new()
+    };
+    Ok((replicate, ablations))
 }
 
 /// The keep rule for an idea measured at `change` against its parent: an
@@ -649,14 +787,28 @@ pub(crate) fn judge(idea: &Idea, change: f64, metric: &PrimaryMetric) -> Status 
     }
 }
 
+/// Turns the automatic replicates on or off (`VLR_AUTO_REPLICATE` or the
+/// Settings page; on unless turned off).
+pub(crate) const AUTO_REPLICATE_ENV: &str = "VLR_AUTO_REPLICATE";
 /// Turns the automatic ablation checks on or off (`VLR_AUTO_ABLATE` or the
-/// Settings page; on unless `0`).
+/// Settings page; off unless turned on). In the loop benchmark they spent a
+/// tenth to a quarter of the budget without changing what got built.
 pub(crate) const AUTO_ABLATE_ENV: &str = "VLR_AUTO_ABLATE";
 /// Ablation checks queued for one new best at most.
 const ABLATIONS_PER_BEST: usize = 2;
 
+fn auto_replicate(store: &Store) -> bool {
+    super::settings::switch_on(
+        super::settings::value(store, AUTO_REPLICATE_ENV).as_deref(),
+        true,
+    )
+}
+
 fn auto_ablate(store: &Store) -> bool {
-    super::settings::switch_on(super::settings::value(store, AUTO_ABLATE_ENV).as_deref())
+    super::settings::switch_on(
+        super::settings::value(store, AUTO_ABLATE_ENV).as_deref(),
+        false,
+    )
 }
 
 /// When `experiment_id` holds the optimization's best, queues a leave-one-out check
@@ -786,8 +938,9 @@ pub(crate) fn ablation_targets<'a>(
         .collect()
 }
 
-/// The experiment's best finished score minus its parent's, on the primary
-/// metric, in the metric's own units.
+/// The experiment's score minus its parent's on the primary metric, in the
+/// metric's own units: each the mean of its finished, counted runs, so a
+/// replicate (a rerun with a new seed) is measured with the run it repeats.
 fn measured_change(
     store: &Store,
     project_id: &str,
@@ -801,8 +954,8 @@ fn measured_change(
     let runs = metrics::scored_runs(store, project_id, &metric.key, metric.split.as_deref())?;
     // The idea's own experiment needs a counted run; its parent may be scored
     // by probe runs alone (a baseline measured with seed runs, say).
-    let tested = metrics::experiment_reference(&runs, &experiment.id, metric, false);
-    let reference = metrics::experiment_reference(&runs, &parent, metric, true);
+    let tested = metrics::experiment_reference(&runs, &experiment.id, false);
+    let reference = metrics::experiment_reference(&runs, &parent, true);
     Ok(match (tested, reference) {
         (Some(tested), Some(reference)) => Some(tested.score - reference.score),
         _ => None,
@@ -836,8 +989,10 @@ pub(crate) fn titles_by_experiment(
     store: &Store,
     project_id: &str,
 ) -> Result<std::collections::HashMap<String, String>> {
+    // A replicate runs on the experiment of the idea it repeats.
     Ok(list_project(store, project_id)?
         .into_iter()
+        .filter(|idea| idea.kind != Kind::Replicate)
         .filter_map(|idea| Some((idea.experiment_id?, idea.title)))
         .collect())
 }
@@ -1594,7 +1749,15 @@ mod tests {
     }
 
     fn scored_run(store: &Store, experiment: &str, value: f64) {
-        let run_id = format!("r_{experiment}");
+        scored_run_as(store, &format!("r_{experiment}"), experiment, value);
+    }
+
+    fn scored_run_as(store: &Store, run_id: &str, experiment: &str, value: f64) {
+        scored_run_at(store, run_id, experiment, value, 2);
+    }
+
+    fn scored_run_at(store: &Store, run_id: &str, experiment: &str, value: f64, ended: i64) {
+        let run_id = run_id.to_string();
         store
             .upsert_run(&StoredRun {
                 id: run_id.clone(),
@@ -1603,9 +1766,9 @@ mod tests {
                 status: "done".into(),
                 backend_json: "{}".into(),
                 command: "python train.py".into(),
-                created_at: 1,
-                updated_at: 2,
-                ended_at: Some(2),
+                created_at: ended - 1,
+                updated_at: ended,
+                ended_at: Some(ended),
                 exit_code: Some(0),
                 commit_sha: None,
                 result_markdown: None,
@@ -1635,9 +1798,88 @@ mod tests {
         close(store, &idea.id, Verdict::Measured, None).unwrap()
     }
 
+    /// Turns the automatic checks on a new best on or off for this store.
+    fn checks(store: &Store, replicate: bool, ablate: bool) {
+        let on = |on: bool| Some(if on { "on" } else { "off" }.to_string());
+        super::super::settings::save(
+            store,
+            &[
+                (AUTO_REPLICATE_ENV.to_string(), on(replicate)),
+                (AUTO_ABLATE_ENV.to_string(), on(ablate)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_new_best_is_replicated_and_a_failed_replicate_takes_it_back() {
+        let (store, dir) = temp_store();
+        val_ic_primary(&store);
+        experiment(&store, "base", None);
+        scored_run(&store, "base", 0.020);
+        experiment(&store, "lucky", Some("base"));
+        scored_run(&store, "lucky", 0.026);
+        let closed = tested(&store, "Lucky tweak", "lucky", IdeaFields::default());
+        assert_eq!(closed.idea.status, Status::Kept);
+        let replicate = closed.replicate.expect("a replicate for the new best");
+        assert_eq!(replicate.kind, Kind::Replicate);
+        assert_eq!(replicate.status, Status::Open);
+        assert!(
+            closed.ablations.is_empty(),
+            "ablation checks are off by default"
+        );
+        // It goes before new ideas.
+        add(
+            &store,
+            "p",
+            IdeaFields {
+                forecast: Some(0.01),
+                ..fields("Next idea")
+            },
+        )
+        .unwrap();
+        assert_eq!(next(&store, "p").unwrap().unwrap().idea.id, replicate.id);
+
+        // It measures a rerun, so it can't close before there is one.
+        start(&store, &replicate.id, "lucky").unwrap();
+        let early = close(&store, &replicate.id, Verdict::Measured, None).unwrap_err();
+        assert!(early.to_string().contains("orx exp run lucky"), "{early}");
+        // The rerun with a new seed brings the experiment's mean (0.0205)
+        // within the noise floor of the baseline: the result doesn't hold.
+        scored_run_at(&store, "r_lucky_2", "lucky", 0.015, crate::store::now_ms());
+        let replicated = close(&store, &replicate.id, Verdict::Measured, None).unwrap();
+        assert_eq!(replicated.idea.status, Status::Refuted);
+        assert!(replicated.replicate.is_none());
+        assert_eq!(replicated.repeated.len(), 1);
+        let attempt = &replicated.repeated[0];
+        assert_eq!(attempt.id, closed.idea.id);
+        assert_eq!(attempt.status, Status::Refuted);
+        assert!((attempt.outcome.unwrap() - 0.0005).abs() < 1e-9);
+        let brief = super::super::scope::require(&store, "p").unwrap();
+        let metric = metrics::primary(&store, "p").unwrap().unwrap();
+        let (standing, path, _) = metrics::standing(&store, &brief, &metric).unwrap();
+        assert_eq!(standing.best.unwrap().experiment_id, "base");
+        assert_eq!(path.len(), 1);
+        // The record counts the attempt as refuted.
+        let report = calibration(&list(&store, "p").unwrap());
+        assert_eq!((report.tested, report.kept), (1, 0));
+
+        // With replicates off, a new best queues nothing.
+        checks(&store, false, false);
+        experiment(&store, "solid", Some("base"));
+        scored_run(&store, "solid", 0.030);
+        let solid = tested(&store, "Solid change", "solid", IdeaFields::default());
+        assert_eq!(solid.idea.status, Status::Kept);
+        assert!(solid.replicate.is_none() && solid.ablations.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_new_best_queues_ablations_of_its_biggest_earlier_steps() {
         let (store, dir) = temp_store();
+        checks(&store, false, true);
         // base 0.020 → wide 0.026 (+0.006) → tiny 0.0265 (+0.0005, noise)
         // → lags 0.0285 (+0.002) → best 0.0335 (+0.005).
         experiment(&store, "base", None);
@@ -1772,6 +2014,7 @@ mod tests {
     #[test]
     fn ablation_checks_hold_only_inside_their_interval_and_dropped_ones_come_back() {
         let (store, dir) = temp_store();
+        checks(&store, false, true);
         val_ic_primary(&store);
         for (id, parent, value) in [
             ("base", None, 0.020),

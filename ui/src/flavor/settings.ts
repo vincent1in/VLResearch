@@ -24,6 +24,7 @@ export type ResearchSettings = { settings: SettingEntry[]; network: PolicyEntry[
 /** The variable behind each setting. */
 export const SETTING = {
   compact: "VLR_AUTO_COMPACT",
+  replicate: "VLR_AUTO_REPLICATE",
   ablate: "VLR_AUTO_ABLATE",
   stall: "VLR_STALL_MINUTES",
   wake: "VLR_AUTO_WAKE",

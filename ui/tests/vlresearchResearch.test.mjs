@@ -93,6 +93,16 @@ test("the metrics payload is read defensively", () => {
   assert.equal(metrics.path[1].ablation?.status, "confirmed");
   assert.equal(metrics.path[2].ablation, undefined);
   assert.deepEqual(metrics.trials, { runs: 5, ideasTested: 4, ideasKept: 3 });
+  // Older payloads name one run; an experiment's score is the mean of its runs.
+  assert.equal(metrics.best?.runs, 1);
+  assert.equal(metrics.baseline?.runs, 1);
+  const replicated = parseMetrics({
+    ...metricsPayload,
+    best: { ...metricsPayload.best, runs: 2 },
+    baseline: { experimentId: "base", experiment: "Base", runId: null, score: 0.02, runs: 0, probeRuns: 3 },
+  });
+  assert.equal(replicated.best?.runs, 2);
+  assert.deepEqual([replicated.baseline?.runs, replicated.baseline?.probeRuns], [0, 3]);
 
   const empty = parseMetrics({ primary: null, keys: ["loss", 3], history: [{ runId: "x" }] });
   assert.equal(empty.primary, null);

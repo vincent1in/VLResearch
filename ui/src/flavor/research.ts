@@ -23,6 +23,8 @@ export interface ScoredRun {
   endedAt: number | null;
   score: number | null;
   probe: boolean;
+  /** For the best: how many runs its score averages. */
+  runs: number;
 }
 
 export interface Reference {
@@ -30,6 +32,8 @@ export interface Reference {
   experiment: string;
   runId: string | null;
   score: number;
+  /** How many counted runs the score averages. */
+  runs: number;
   /** How many probe runs the score averages, when it is such a mean. */
   probeRuns: number;
 }
@@ -54,6 +58,8 @@ export interface PathStep {
   idea: string | null;
   runId: string | null;
   score: number | null;
+  /** How many counted runs the score averages. */
+  runs: number;
   probeRuns: number;
   delta: number | null;
   ablation?: Ablation;
@@ -216,6 +222,7 @@ function readRun(value: unknown): ScoredRun | null {
     endedAt: number(value.endedAt),
     score: number(value.score),
     probe: value.probe === true,
+    runs: number(value.runs) ?? 1,
   };
 }
 
@@ -227,6 +234,7 @@ export function parseMetrics(value: unknown): MetricsPayload {
         experiment: text(body.baseline.experiment) ?? "",
         runId: text(body.baseline.runId),
         score: number(body.baseline.score) ?? 0,
+        runs: number(body.baseline.runs) ?? (text(body.baseline.runId) ? 1 : 0),
         probeRuns: number(body.baseline.probeRuns) ?? 0,
       }
     : null;
@@ -254,6 +262,7 @@ export function parseMetrics(value: unknown): MetricsPayload {
       idea: text(step.idea),
       runId: text(step.runId),
       score: number(step.score),
+      runs: number(step.runs) ?? (text(step.runId) ? 1 : 0),
       probeRuns: number(step.probeRuns) ?? 0,
       delta: number(step.delta),
       ...(ablation ? { ablation } : {}),
@@ -963,7 +972,8 @@ export function askAboutNext(idea: Idea): string {
 export function askAboutIdea(idea: Idea): string {
   const name = `“${idea.title}” (\`${idea.id}\`)`;
   if (idea.closedAt !== null) {
-    const measured = idea.outcome !== null ? ` It measured ${formatSigned(idea.outcome)} against a forecast of ${forecastText(idea)}.` : "";
+    const forecast = idea.forecast !== null ? ` against a forecast of ${forecastText(idea)}` : "";
+    const measured = idea.outcome !== null ? ` It measured ${formatSigned(idea.outcome)}${forecast}.` : "";
     return `What did trying ${name} show, and why is it ${idea.statusLabel}?${measured}`;
   }
   return `What does the idea ${name} change, and what is its forecast of ${forecastText(idea)} based on?`;

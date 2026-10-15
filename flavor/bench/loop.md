@@ -10,27 +10,33 @@ cargo test --release --bin orx flavor::bench::report -- --ignored --nocapture
 
 Each campaign is a research problem whose truth is known: 40 ideas, each with a true effect on the metric and a true cost in GPU-hours, and the agent's forecast of each with an 80% interval and a cost estimate. A run's score is the true score of its experiment plus seed noise, plus, in one scenario, luck on the validation split. Every idea builds on the current best, and a campaign ends when its budget is spent. Every strategy works the same campaigns with the same luck, so the differences between them come from the strategies alone.
 
-The VLResearch strategies go through the loop's own code: `ideas::pick` chooses (what `orx idea next` prints), `ideas::judge` keeps or refutes, and `metrics::best_by_rule` decides the best to build on (what `orx metric best` prints). Each new best gets a replicate, as the `orx-improve` skill says, and the ablation checks `orx idea done` queues. Their baseline is measured with 3 seed runs; the plain loops measure it once. Seed runs count against the budget.
+The VLResearch strategies go through the loop's own code: `ideas::pick` chooses (what `orx idea next` prints), `ideas::judge` keeps or refutes, and `metrics::experiment_scores` and `metrics::best_of` decide the best to build on (what `orx metric best` prints). What `orx idea done` queues after a new best (a replicate, and ablation checks when they are on) is mirrored. Their baseline is measured with 3 seed runs; the plain loops measure it once. Seed runs count against the budget.
 
 Scores are in units of one run's seed noise (its standard deviation). **True gain** is the true, out-of-sample score of the experiment a strategy ends on, minus the baseline's. **Claimed gain** is what it reports, its best's score minus the baseline's as measured, and **overclaim** is the difference. ± is a 95% confidence interval.
 
 ## Result
 
-In the typical scenario the VLResearch loop finds +2.18 of true gain against +4.66 for a plain loop that keeps any gain, trying the most promising idea first (paired difference -2.48 ± 0.10), and overstates its gain by +1.34 against +1.82. Across the 7 scenarios it is ahead on true gain in 0, level in 0 and behind in 7, and it overstates less in 7.
+In the typical scenario the VLResearch loop finds +4.61 of true gain against +4.66 for a plain loop that keeps any gain, trying the most promising idea first (paired difference -0.05 ± 0.09), and overstates its gain by +1.10 against +1.82. Across the 7 scenarios it is ahead on true gain in 2, level in 2 and behind in 3, and it overstates less in 7. With its old settings (a noise floor at the spread of the baseline's seed runs, and ablation checks on) it finds +1.67 in the typical scenario.
+
+What decided it:
+
+- **Keep any gain, and let replicates catch luck.** A noise floor at the spread of the baseline's seed runs rejects most real gains: true gain falls from +4.61 to +1.67. Replicates work because an experiment scores the mean of its runs, so a lucky first run that doesn't repeat falls back, and the best returns to what it was. Without them, true gain is +4.35 and the overclaim +1.74.
+- **Ablation checks are diagnostics.** They test whether the steps behind a best add up. On, they take 10.6 GPU-hours of the 40-hour budget and true gain is +4.01, so they are off unless turned on in Settings.
+- **Validation luck is not seed noise.** Where changes also have luck on the validation split, no rerun separates it from a real gain, and every strategy overstates more. Check the out-of-sample split at milestones before relying on a gain.
 
 ## Across scenarios
 
 True gain of each, the VLResearch loop's paired advantage over keeping any gain in forecast order, and how much each overstates its gain.
 
-| Scenario | VLResearch loop | Keep if higher | Random order | VLResearch advantage | VLResearch overclaim | Keep-if-higher overclaim |
-| --- | --- | --- | --- | --- | --- | --- |
-| Typical | +2.18 | +4.66 | +2.40 | -2.48 ± 0.10 | +1.34 | +1.82 |
-| Clear signal | +4.94 | +7.87 | +5.46 | -2.93 ± 0.09 | +0.40 | +0.44 |
-| Overfitting the validation split | +2.22 | +4.66 | +2.40 | -2.45 ± 0.10 | +1.72 | +2.90 |
-| Mostly harmful ideas | +0.68 | +1.35 | +0.32 | -0.68 ± 0.06 | +1.17 | +1.85 |
-| Uninformative forecasts | +1.63 | +3.40 | +2.40 | -1.77 ± 0.10 | +1.32 | +1.73 |
-| Calibrated forecaster | +2.39 | +4.91 | +2.40 | -2.53 ± 0.10 | +1.36 | +1.85 |
-| Tight budget | +1.91 | +4.00 | +1.06 | -2.09 ± 0.09 | +1.04 | +1.33 |
+| Scenario | VLResearch loop | Old guidance | Keep if higher | Random order | VLResearch advantage | VLResearch overclaim | Keep-if-higher overclaim |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Typical | +4.61 | +1.67 | +4.66 | +2.40 | -0.05 ± 0.09 | +1.10 | +1.82 |
+| Clear signal | +7.25 | +4.98 | +7.87 | +5.46 | -0.62 ± 0.06 | +0.21 | +0.44 |
+| Overfitting the validation split | +4.57 | +1.74 | +4.66 | +2.40 | -0.10 ± 0.09 | +2.19 | +2.90 |
+| Mostly harmful ideas | +1.43 | +0.55 | +1.35 | +0.32 | +0.08 ± 0.05 | +1.15 | +1.85 |
+| Uninformative forecasts | +3.86 | +1.53 | +3.40 | +2.40 | +0.46 ± 0.09 | +1.05 | +1.73 |
+| Calibrated forecaster | +4.83 | +1.70 | +4.91 | +2.40 | -0.09 ± 0.09 | +1.13 | +1.85 |
+| Tight budget | +3.35 | +1.40 | +4.00 | +1.06 | -0.65 ± 0.08 | +0.84 | +1.33 |
 
 ## Typical
 
@@ -38,11 +44,11 @@ True effects about the size of seed noise, and most ideas no help; forecasts inf
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +2.18 ± 0.09 | +3.52 | +1.34 | 7% | 0.3 of 2.3 | 2.7 | +5.5 |
-| ↳ without replicates | +2.25 ± 0.09 | +3.58 | +1.33 | 7% | 0.3 of 2.5 | 1.0 | +5.7 |
-| ↳ without ablation checks | +2.20 ± 0.09 | +3.54 | +1.34 | 7% | 0.3 of 2.3 | 2.0 | +5.5 |
-| ↳ floor at one SD of the seed runs | +2.75 ± 0.09 | +4.38 | +1.62 | 5% | 0.4 of 3.1 | 4.3 | +6.9 |
-| ↳ floor at zero | +3.74 ± 0.10 | +5.49 | +1.76 | 3% | 0.9 of 5.1 | 8.4 | +9.4 |
+| **VLResearch loop** | +4.61 ± 0.12 | +5.71 | +1.10 | 1% | 0.7 of 5.6 | 8.2 | +11.6 |
+| ↳ with ablation checks on | +4.01 ± 0.11 | +5.25 | +1.24 | 1% | 0.9 of 5.3 | 10.6 | +10.1 |
+| ↳ without replicates | +4.35 ± 0.12 | +6.09 | +1.74 | 2% | 1.0 of 6.0 | 0.0 | +10.9 |
+| ↳ floor at one SD of the seed runs | +2.70 ± 0.10 | +3.72 | +1.02 | 2% | 0.1 of 2.4 | 4.4 | +6.8 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +1.67 ± 0.09 | +2.42 | +0.75 | 2% | 0.1 of 1.3 | 3.3 | +4.2 |
 | **Keep if higher, best forecast first** | +4.66 ± 0.12 | +6.49 | +1.82 | 1% | 0.8 of 5.9 | 0.0 | +11.7 |
 | **Keep if higher, random order** | +2.40 ± 0.10 | +4.06 | +1.65 | 12% | 1.2 of 4.6 | 0.0 | +6.0 |
 
@@ -52,11 +58,11 @@ Seed noise a third of the typical, so true effects stand out: 40 ideas, 40 GPU-h
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +4.94 ± 0.12 | +5.34 | +0.40 | 1% | 0.3 of 4.9 | 9.2 | +12.4 |
-| ↳ without replicates | +5.28 ± 0.13 | +5.68 | +0.40 | 1% | 0.4 of 5.6 | 4.8 | +13.3 |
-| ↳ without ablation checks | +5.11 ± 0.13 | +5.53 | +0.42 | 1% | 0.3 of 5.1 | 5.9 | +12.8 |
-| ↳ floor at one SD of the seed runs | +5.71 ± 0.11 | +6.12 | +0.41 | 1% | 0.4 of 6.2 | 11.9 | +14.3 |
-| ↳ floor at zero | +6.36 ± 0.11 | +6.75 | +0.39 | 0% | 0.9 of 8.4 | 15.4 | +16.0 |
+| **VLResearch loop** | +7.25 ± 0.12 | +7.46 | +0.21 | 0% | 0.7 of 9.6 | 12.0 | +18.2 |
+| ↳ with ablation checks on | +6.54 ± 0.11 | +6.79 | +0.25 | 0% | 1.1 of 9.2 | 17.1 | +16.4 |
+| ↳ without replicates | +7.63 ± 0.13 | +8.03 | +0.40 | 0% | 1.2 of 11.1 | 0.0 | +19.2 |
+| ↳ floor at one SD of the seed runs | +6.29 ± 0.12 | +6.53 | +0.23 | 0% | 0.2 of 6.6 | 9.1 | +15.8 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +4.98 ± 0.12 | +5.20 | +0.22 | 0% | 0.1 of 4.4 | 10.1 | +12.5 |
 | **Keep if higher, best forecast first** | +7.87 ± 0.13 | +8.30 | +0.44 | 0% | 1.2 of 11.4 | 0.0 | +19.8 |
 | **Keep if higher, random order** | +5.46 ± 0.12 | +5.75 | +0.30 | 0% | 1.3 of 9.0 | 0.0 | +13.7 |
 
@@ -66,11 +72,11 @@ Each change also has luck on the validation split, half the seed noise: 40 ideas
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +2.22 ± 0.09 | +3.94 | +1.72 | 7% | 0.3 of 2.5 | 3.0 | +5.6 |
-| ↳ without replicates | +2.29 ± 0.09 | +4.02 | +1.73 | 7% | 0.4 of 2.6 | 1.1 | +5.7 |
-| ↳ without ablation checks | +2.23 ± 0.09 | +3.96 | +1.73 | 7% | 0.3 of 2.5 | 2.1 | +5.6 |
-| ↳ floor at one SD of the seed runs | +2.80 ± 0.09 | +4.90 | +2.10 | 5% | 0.5 of 3.3 | 4.8 | +7.0 |
-| ↳ floor at zero | +3.77 ± 0.11 | +6.28 | +2.51 | 2% | 1.1 of 5.5 | 9.1 | +9.5 |
+| **VLResearch loop** | +4.57 ± 0.12 | +6.76 | +2.19 | 2% | 0.9 of 6.1 | 8.8 | +11.5 |
+| ↳ with ablation checks on | +3.94 ± 0.11 | +6.10 | +2.16 | 2% | 1.1 of 5.7 | 11.2 | +9.9 |
+| ↳ without replicates | +4.37 ± 0.12 | +7.18 | +2.80 | 3% | 1.2 of 6.6 | 0.0 | +11.0 |
+| ↳ floor at one SD of the seed runs | +2.83 ± 0.10 | +4.51 | +1.68 | 2% | 0.2 of 2.8 | 4.8 | +7.1 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +1.74 ± 0.09 | +2.88 | +1.14 | 2% | 0.1 of 1.5 | 3.6 | +4.4 |
 | **Keep if higher, best forecast first** | +4.66 ± 0.12 | +7.56 | +2.90 | 1% | 1.1 of 6.7 | 0.0 | +11.7 |
 | **Keep if higher, random order** | +2.40 ± 0.10 | +5.06 | +2.66 | 13% | 1.6 of 5.4 | 0.0 | +6.0 |
 
@@ -80,11 +86,11 @@ Most ideas make things worse: 40 ideas, 40 GPU-hours; true effects of incrementa
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +0.68 ± 0.05 | +1.84 | +1.17 | 29% | 0.6 of 1.8 | 1.5 | +1.7 |
-| ↳ without replicates | +0.68 ± 0.05 | +1.84 | +1.16 | 29% | 0.6 of 1.9 | 0.4 | +1.7 |
-| ↳ without ablation checks | +0.68 ± 0.05 | +1.85 | +1.17 | 29% | 0.6 of 1.8 | 1.2 | +1.7 |
-| ↳ floor at one SD of the seed runs | +0.88 ± 0.05 | +2.42 | +1.54 | 25% | 0.8 of 2.3 | 2.6 | +2.2 |
-| ↳ floor at zero | +1.14 ± 0.06 | +2.95 | +1.80 | 21% | 1.3 of 3.6 | 5.2 | +2.9 |
+| **VLResearch loop** | +1.43 ± 0.07 | +2.58 | +1.15 | 13% | 0.8 of 3.1 | 5.5 | +3.6 |
+| ↳ with ablation checks on | +1.33 ± 0.06 | +2.58 | +1.25 | 13% | 0.9 of 3.1 | 6.7 | +3.3 |
+| ↳ without replicates | +1.22 ± 0.06 | +2.98 | +1.76 | 20% | 1.2 of 3.5 | 0.0 | +3.1 |
+| ↳ floor at one SD of the seed runs | +0.88 ± 0.05 | +1.78 | +0.90 | 8% | 0.2 of 1.3 | 2.9 | +2.2 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +0.55 ± 0.04 | +1.13 | +0.59 | 5% | 0.1 of 0.7 | 1.9 | +1.4 |
 | **Keep if higher, best forecast first** | +1.35 ± 0.06 | +3.21 | +1.85 | 16% | 1.1 of 3.4 | 0.0 | +3.4 |
 | **Keep if higher, random order** | +0.32 ± 0.05 | +2.07 | +1.75 | 42% | 1.3 of 2.7 | 0.0 | +0.8 |
 
@@ -94,11 +100,11 @@ The agent's forecasts are mostly noise: 40 ideas, 40 GPU-hours; true effects of 
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +1.63 ± 0.08 | +2.95 | +1.32 | 17% | 0.6 of 2.3 | 2.4 | +4.1 |
-| ↳ without replicates | +1.70 ± 0.09 | +3.00 | +1.31 | 17% | 0.6 of 2.4 | 0.8 | +4.3 |
-| ↳ without ablation checks | +1.65 ± 0.08 | +2.97 | +1.32 | 17% | 0.6 of 2.3 | 1.8 | +4.2 |
-| ↳ floor at one SD of the seed runs | +2.17 ± 0.09 | +3.75 | +1.58 | 11% | 0.7 of 3.0 | 4.0 | +5.4 |
-| ↳ floor at zero | +2.97 ± 0.10 | +4.69 | +1.71 | 7% | 1.3 of 4.9 | 7.7 | +7.5 |
+| **VLResearch loop** | +3.86 ± 0.11 | +4.91 | +1.05 | 3% | 0.8 of 5.0 | 7.6 | +9.7 |
+| ↳ with ablation checks on | +3.42 ± 0.10 | +4.59 | +1.18 | 3% | 1.0 of 4.9 | 9.8 | +8.6 |
+| ↳ without replicates | +3.57 ± 0.11 | +5.27 | +1.70 | 6% | 1.2 of 5.5 | 0.0 | +9.0 |
+| ↳ floor at one SD of the seed runs | +2.44 ± 0.10 | +3.42 | +0.98 | 4% | 0.2 of 2.2 | 4.2 | +6.1 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +1.53 ± 0.08 | +2.25 | +0.72 | 3% | 0.1 of 1.2 | 3.1 | +3.9 |
 | **Keep if higher, best forecast first** | +3.40 ± 0.11 | +5.13 | +1.73 | 5% | 1.1 of 5.2 | 0.0 | +8.6 |
 | **Keep if higher, random order** | +2.40 ± 0.10 | +4.06 | +1.65 | 12% | 1.2 of 4.6 | 0.0 | +6.0 |
 
@@ -108,11 +114,11 @@ Forecasts unbiased, intervals honest: 40 ideas, 40 GPU-hours; true effects of in
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +2.39 ± 0.08 | +3.74 | +1.36 | 4% | 0.2 of 2.3 | 2.8 | +6.0 |
-| ↳ without replicates | +2.47 ± 0.09 | +3.81 | +1.33 | 4% | 0.2 of 2.4 | 1.0 | +6.2 |
-| ↳ without ablation checks | +2.41 ± 0.09 | +3.76 | +1.36 | 4% | 0.2 of 2.3 | 2.0 | +6.0 |
-| ↳ floor at one SD of the seed runs | +2.97 ± 0.09 | +4.60 | +1.64 | 2% | 0.3 of 3.0 | 4.5 | +7.4 |
-| ↳ floor at zero | +3.98 ± 0.11 | +5.77 | +1.79 | 2% | 0.7 of 5.0 | 8.6 | +10.0 |
+| **VLResearch loop** | +4.83 ± 0.12 | +5.96 | +1.13 | 1% | 0.6 of 5.6 | 8.5 | +12.1 |
+| ↳ with ablation checks on | +4.18 ± 0.11 | +5.46 | +1.28 | 1% | 0.8 of 5.3 | 10.8 | +10.5 |
+| ↳ without replicates | +4.63 ± 0.12 | +6.39 | +1.76 | 2% | 0.8 of 6.0 | 0.0 | +11.6 |
+| ↳ floor at one SD of the seed runs | +2.79 ± 0.11 | +3.81 | +1.02 | 2% | 0.1 of 2.4 | 4.5 | +7.0 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +1.70 ± 0.09 | +2.45 | +0.75 | 1% | 0.1 of 1.3 | 3.4 | +4.3 |
 | **Keep if higher, best forecast first** | +4.91 ± 0.12 | +6.76 | +1.85 | 1% | 0.7 of 6.0 | 0.0 | +12.4 |
 | **Keep if higher, random order** | +2.40 ± 0.10 | +4.06 | +1.65 | 12% | 1.2 of 4.6 | 0.0 | +6.0 |
 
@@ -122,11 +128,11 @@ Forecasts unbiased, intervals honest: 40 ideas, 40 GPU-hours; true effects of in
 
 | Strategy | True gain | Claimed gain | Overclaim | Ends below baseline | Steps kept that hurt or did nothing | GPU-hours on checks | True gain per 100 GPU-hours |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **VLResearch loop** | +1.91 ± 0.07 | +2.95 | +1.04 | 8% | 0.3 of 2.0 | 1.5 | +12.9 |
-| ↳ without replicates | +2.01 ± 0.08 | +3.05 | +1.04 | 8% | 0.3 of 2.1 | 0.5 | +13.5 |
-| ↳ without ablation checks | +1.94 ± 0.08 | +3.00 | +1.06 | 8% | 0.3 of 2.0 | 1.2 | +13.1 |
-| ↳ floor at one SD of the seed runs | +2.31 ± 0.08 | +3.62 | +1.31 | 6% | 0.3 of 2.5 | 2.2 | +15.6 |
-| ↳ floor at zero | +2.86 ± 0.08 | +4.26 | +1.40 | 4% | 0.6 of 3.6 | 3.6 | +19.2 |
+| **VLResearch loop** | +3.35 ± 0.09 | +4.20 | +0.84 | 2% | 0.4 of 3.7 | 3.3 | +22.5 |
+| ↳ with ablation checks on | +2.93 ± 0.08 | +3.89 | +0.96 | 2% | 0.6 of 3.6 | 4.2 | +19.7 |
+| ↳ without replicates | +3.60 ± 0.10 | +4.94 | +1.34 | 3% | 0.6 of 4.4 | 0.0 | +24.2 |
+| ↳ floor at one SD of the seed runs | +2.21 ± 0.08 | +3.02 | +0.80 | 2% | 0.1 of 1.8 | 2.1 | +14.9 |
+| ↳ floor at the seed spread, ablations on (the old guidance) | +1.40 ± 0.07 | +2.01 | +0.61 | 1% | 0.1 of 1.0 | 1.6 | +9.4 |
 | **Keep if higher, best forecast first** | +4.00 ± 0.11 | +5.33 | +1.33 | 1% | 0.4 of 4.2 | 0.0 | +26.9 |
 | **Keep if higher, random order** | +1.06 ± 0.06 | +2.39 | +1.33 | 21% | 0.8 of 2.5 | 0.0 | +7.2 |
 

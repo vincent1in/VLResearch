@@ -46,8 +46,13 @@ const SETTINGS: &[Setting] = &[
         accepts: accept_compaction,
     },
     Setting {
+        key: ideas::AUTO_REPLICATE_ENV,
+        reads_as: |value| on_off(switch_on(value, true)),
+        accepts: accept_switch,
+    },
+    Setting {
         key: ideas::AUTO_ABLATE_ENV,
-        reads_as: switch,
+        reads_as: |value| on_off(switch_on(value, false)),
         accepts: accept_switch,
     },
     Setting {
@@ -57,7 +62,7 @@ const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: wake::AUTO_WAKE_ENV,
-        reads_as: switch,
+        reads_as: |value| on_off(switch_on(value, true)),
         accepts: accept_switch,
     },
     Setting {
@@ -67,7 +72,7 @@ const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: harness::CHECKLIST_ENV,
-        reads_as: switch,
+        reads_as: |value| on_off(switch_on(value, true)),
         accepts: accept_switch,
     },
 ];
@@ -124,14 +129,17 @@ pub(crate) fn current(key: &str) -> Option<String> {
     })
 }
 
-/// Whether a switch is on: it is unless set to `0`, `off`, `false` or `no`.
-pub(crate) fn switch_on(value: Option<&str>) -> bool {
-    !value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "no"
-        )
-    })
+/// Whether a switch is on: `0`, `off`, `false` or `no` turn it off; `1`, `on`,
+/// `true` or `yes` turn it on; anything else, or unset, leaves the default.
+pub(crate) fn switch_on(value: Option<&str>, default: bool) -> bool {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("0" | "off" | "false" | "no") => false,
+        Some("1" | "on" | "true" | "yes") => true,
+        _ => default,
+    }
 }
 
 /// A value given in orx's environment, or on the Environment page, whose
@@ -338,8 +346,8 @@ fn accept_compaction(value: &str) -> Result<String> {
         })
 }
 
-fn switch(value: Option<&str>) -> String {
-    if switch_on(value) { "on" } else { "off" }.to_string()
+fn on_off(on: bool) -> String {
+    if on { "on" } else { "off" }.to_string()
 }
 
 fn accept_switch(value: &str) -> Result<String> {
@@ -446,9 +454,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(compact::threshold(&store), Some(0.7));
-        assert!(!switch_on(value(&store, ideas::AUTO_ABLATE_ENV).as_deref()));
-        assert!(!switch_on(value(&store, wake::AUTO_WAKE_ENV).as_deref()));
-        assert!(switch_on(value(&store, harness::CHECKLIST_ENV).as_deref()));
+        assert!(!switch_on(
+            value(&store, ideas::AUTO_ABLATE_ENV).as_deref(),
+            true
+        ));
+        assert!(!switch_on(
+            value(&store, wake::AUTO_WAKE_ENV).as_deref(),
+            true
+        ));
+        assert!(switch_on(
+            value(&store, harness::CHECKLIST_ENV).as_deref(),
+            false
+        ));
         assert_eq!(entry(&store, scope::GATE_ENV).value, "strict");
         assert_eq!(entry(&store, compact::AUTO_COMPACT_ENV).value, "70%");
 
@@ -509,9 +526,17 @@ mod tests {
         assert_eq!(compaction(None), "80%");
         assert_eq!(compaction(Some("0.65")), "65%");
         assert_eq!(compaction(Some("0")), "off");
-        assert_eq!(switch(None), "on");
-        assert_eq!(switch(Some("0")), "off");
-        assert_eq!(switch(Some("yes")), "on");
+        let reads = |key: &str, raw: Option<&str>| {
+            let setting = SETTINGS.iter().find(|setting| setting.key == key).unwrap();
+            (setting.reads_as)(raw)
+        };
+        assert_eq!(reads(wake::AUTO_WAKE_ENV, None), "on");
+        assert_eq!(reads(wake::AUTO_WAKE_ENV, Some("0")), "off");
+        assert_eq!(reads(ideas::AUTO_REPLICATE_ENV, None), "on");
+        // Ablation checks are off unless turned on.
+        assert_eq!(reads(ideas::AUTO_ABLATE_ENV, None), "off");
+        assert_eq!(reads(ideas::AUTO_ABLATE_ENV, Some("yes")), "on");
+        assert_eq!(reads(ideas::AUTO_ABLATE_ENV, Some("junk")), "off");
         assert_eq!(stall_window(Some("junk")), "30");
         assert_eq!(stall_window(Some("0")), "0");
         assert_eq!(gate(None), "scoped");
@@ -520,13 +545,16 @@ mod tests {
         for (raw, on) in [
             (None, true),
             (Some("1"), true),
+            (Some("maybe"), true),
             (Some(" off "), false),
             (Some("FALSE"), false),
             (Some("no"), false),
             (Some("0"), false),
         ] {
-            assert_eq!(switch_on(raw), on, "{raw:?}");
+            assert_eq!(switch_on(raw, true), on, "{raw:?}");
         }
+        assert!(!switch_on(None, false));
+        assert!(switch_on(Some(" On "), false));
     }
 
     #[test]

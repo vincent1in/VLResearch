@@ -716,82 +716,142 @@ fn display_name(experiment: &LocalExperiment) -> String {
         .to_owned()
 }
 
-/// The one rule for "best": walking finished, counted runs in the order they
-/// ended, a run takes over only when it gains more than the noise floor on the
-/// current best. Used for the project and for each experiment alike.
-pub(crate) fn best_by_rule<'a>(
-    runs: impl Iterator<Item = &'a ScoredRun>,
-    metric: &PrimaryMetric,
-) -> Option<&'a ScoredRun> {
-    let mut finished: Vec<&ScoredRun> = runs
-        .filter(|run| run.counts() && run.score.is_some())
-        .collect();
-    finished.sort_by_key(|run| (run.ended(), run.created_at));
-    let floor = metric.noise_floor.unwrap_or(0.0);
-    let mut best: Option<&ScoredRun> = None;
-    for run in finished {
-        let takes_over = match best.and_then(|incumbent| incumbent.score) {
-            None => true,
-            Some(incumbent) => {
-                metric
-                    .direction
-                    .gain(run.score.unwrap_or_default(), incumbent)
-                    > floor
+/// What an experiment scores on the primary metric: the mean of its finished,
+/// counted runs, so a rerun with a new seed (a replicate) moves it. A
+/// baseline that only probe runs measured (its seed runs, say) is scored by
+/// their mean.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExperimentScore {
+    pub experiment_id: String,
+    pub experiment: String,
+    /// Its latest scored run.
+    pub run_id: String,
+    pub score: f64,
+    /// How many runs the mean is over.
+    pub runs: usize,
+    /// Probe runs scored it: a baseline measured only with seed runs.
+    pub probe: bool,
+    /// When its first and its latest scored runs ended.
+    pub first_ended_at: i64,
+    pub ended_at: i64,
+}
+
+/// Every scored experiment among `runs`, in the order each was first scored.
+/// `is_baseline` says which experiments may be scored by probe runs when no
+/// counted run scores them: roots, whose seed runs measure the baseline.
+pub(crate) fn experiment_scores<'a>(
+    runs: impl IntoIterator<Item = &'a ScoredRun>,
+    is_baseline: &dyn Fn(&str) -> bool,
+) -> Vec<ExperimentScore> {
+    let mut groups: Vec<(&str, Vec<&ScoredRun>, Vec<&ScoredRun>)> = Vec::new();
+    for run in runs {
+        if run.status != "done" || run.score.is_none() {
+            continue;
+        }
+        let index = match groups
+            .iter()
+            .position(|(id, _, _)| *id == run.experiment_id)
+        {
+            Some(index) => index,
+            None => {
+                groups.push((run.experiment_id.as_str(), Vec::new(), Vec::new()));
+                groups.len() - 1
             }
         };
+        if run.probe {
+            groups[index].2.push(run);
+        } else {
+            groups[index].1.push(run);
+        }
+    }
+    let mut scores: Vec<ExperimentScore> = groups
+        .into_iter()
+        .filter_map(|(id, counted, probes)| {
+            if !counted.is_empty() {
+                mean_score(&counted, false)
+            } else if is_baseline(id) {
+                mean_score(&probes, true)
+            } else {
+                None
+            }
+        })
+        .collect();
+    scores.sort_by(|a, b| {
+        (a.first_ended_at, &a.experiment_id).cmp(&(b.first_ended_at, &b.experiment_id))
+    });
+    scores
+}
+
+fn mean_score(runs: &[&ScoredRun], probe: bool) -> Option<ExperimentScore> {
+    let order = |run: &&&ScoredRun| (run.ended(), run.created_at);
+    let first = runs.iter().min_by_key(order)?;
+    let last = runs.iter().max_by_key(order)?;
+    let sum: f64 = runs.iter().filter_map(|run| run.score).sum();
+    Some(ExperimentScore {
+        experiment_id: first.experiment_id.clone(),
+        experiment: first.experiment.clone(),
+        run_id: last.run_id.clone(),
+        score: sum / runs.len() as f64,
+        runs: runs.len(),
+        probe,
+        first_ended_at: first.ended(),
+        ended_at: last.ended(),
+    })
+}
+
+/// The one rule for "best": walking experiments in the order they were first
+/// scored, one takes over only when its score gains more than the noise floor
+/// on the current best's.
+pub(crate) fn best_of<'a>(
+    scores: &'a [ExperimentScore],
+    metric: &PrimaryMetric,
+) -> Option<&'a ExperimentScore> {
+    let floor = metric.noise_floor.unwrap_or(0.0);
+    let mut best: Option<&ExperimentScore> = None;
+    for score in scores {
+        let takes_over = best
+            .is_none_or(|incumbent| metric.direction.gain(score.score, incumbent.score) > floor);
         if takes_over {
-            best = Some(run);
+            best = Some(score);
         }
     }
     best
 }
 
-/// What an experiment scores: its best run by the same rule as the project's
-/// running best. An experiment whose runs are all probes (a baseline measured
-/// only with seed runs, say) can fall back to their mean.
+/// What an experiment scores, for measuring a change against it: the mean of
+/// its finished, counted runs; or, with `allow_probes` and no counted run,
+/// the mean of its probe runs (a baseline measured only with seed runs, say).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Reference {
     pub experiment_id: String,
     pub experiment: String,
-    /// The run behind the score; `None` when it is a mean of probe runs.
+    /// Its latest counted run; `None` when probe runs score it.
     pub run_id: Option<String>,
     pub score: f64,
-    /// How many probe runs the score averages (0 for a single counted run).
+    /// How many counted runs the score averages.
+    pub runs: usize,
+    /// How many probe runs the score averages, when they score it.
     pub probe_runs: usize,
 }
 
 pub(crate) fn experiment_reference(
     runs: &[ScoredRun],
     experiment_id: &str,
-    metric: &PrimaryMetric,
     allow_probes: bool,
 ) -> Option<Reference> {
-    let of_experiment = || runs.iter().filter(|run| run.experiment_id == experiment_id);
-    if let Some(run) = best_by_rule(of_experiment(), metric) {
-        return Some(Reference {
-            experiment_id: run.experiment_id.clone(),
-            experiment: run.experiment.clone(),
-            run_id: Some(run.run_id.clone()),
-            score: run.score?,
-            probe_runs: 0,
-        });
-    }
-    if !allow_probes {
-        return None;
-    }
-    let probes: Vec<&ScoredRun> = of_experiment()
-        .filter(|run| run.probe && run.status == "done")
-        .filter(|run| run.score.is_some())
-        .collect();
-    let first = probes.first()?;
-    let mean = probes.iter().filter_map(|run| run.score).sum::<f64>() / probes.len() as f64;
+    let of_experiment = runs.iter().filter(|run| run.experiment_id == experiment_id);
+    let score = experiment_scores(of_experiment, &|_| allow_probes)
+        .into_iter()
+        .next()?;
     Some(Reference {
-        experiment_id: first.experiment_id.clone(),
-        experiment: first.experiment.clone(),
-        run_id: None,
-        score: mean,
-        probe_runs: probes.len(),
+        run_id: (!score.probe).then(|| score.run_id.clone()),
+        runs: if score.probe { 0 } else { score.runs },
+        probe_runs: if score.probe { score.runs } else { 0 },
+        experiment_id: score.experiment_id,
+        experiment: score.experiment,
+        score: score.score,
     })
 }
 
@@ -802,8 +862,8 @@ pub(crate) struct Standing {
     /// The best experiment's root, scored by the same rule: the baseline every
     /// gain is measured from.
     pub baseline: Option<Reference>,
-    pub best: Option<ScoredRun>,
-    /// Finished, scored runs in the order they ended, with the best so far.
+    pub best: Option<ExperimentScore>,
+    /// Finished, counted runs in the order they ended, with the best so far.
     pub history: Vec<HistoryPoint>,
 }
 
@@ -813,34 +873,48 @@ pub(crate) struct HistoryPoint {
     pub run_id: String,
     pub ended_at: i64,
     pub score: f64,
+    /// The best experiment's score once this run had ended.
     pub best_so_far: f64,
-    /// This run became the best: it beat the previous best by more than the
-    /// noise floor.
+    /// This run's experiment became the best: it beat the previous best by
+    /// more than the noise floor.
     pub new_best: bool,
 }
 
-/// The running best over finished, counted runs.
-pub(crate) fn running_best(runs: &[ScoredRun], metric: &PrimaryMetric) -> Standing {
-    let mut finished: Vec<&ScoredRun> = runs
+/// The running best over the experiments of `runs`. Baselines (`is_baseline`)
+/// measured only by probe runs take part, so an attempt has to beat them.
+pub(crate) fn running_best(
+    runs: &[ScoredRun],
+    metric: &PrimaryMetric,
+    is_baseline: &dyn Fn(&str) -> bool,
+) -> Standing {
+    let mut scored: Vec<&ScoredRun> = runs
         .iter()
-        .filter(|run| run.counts() && run.score.is_some())
+        .filter(|run| run.status == "done" && run.score.is_some())
+        .filter(|run| !run.probe || is_baseline(&run.experiment_id))
         .collect();
-    finished.sort_by_key(|run| (run.ended(), run.created_at));
-    let mut history = Vec::with_capacity(finished.len());
-    for (index, run) in finished.iter().enumerate() {
-        let best = best_by_rule(finished[..=index].iter().copied(), metric);
-        let new_best = best.is_some_and(|best| best.run_id == run.run_id);
-        history.push(HistoryPoint {
-            run_id: run.run_id.clone(),
-            ended_at: run.ended(),
-            score: run.score.unwrap_or_default(),
-            best_so_far: best.and_then(|best| best.score).unwrap_or_default(),
-            new_best,
-        });
+    scored.sort_by_key(|run| (run.ended(), run.created_at));
+    let mut history = Vec::new();
+    let mut previous: Option<String> = None;
+    for (index, run) in scored.iter().enumerate() {
+        let scores = experiment_scores(scored[..=index].iter().copied(), is_baseline);
+        let best = best_of(&scores, metric);
+        let best_id = best.map(|best| best.experiment_id.clone());
+        if run.counts() {
+            history.push(HistoryPoint {
+                run_id: run.run_id.clone(),
+                ended_at: run.ended(),
+                score: run.score.unwrap_or_default(),
+                best_so_far: best.map_or(0.0, |best| best.score),
+                new_best: best_id.as_deref() == Some(run.experiment_id.as_str())
+                    && previous.as_deref() != Some(run.experiment_id.as_str()),
+            });
+        }
+        previous = best_id;
     }
+    let scores = experiment_scores(scored.iter().copied(), is_baseline);
     Standing {
         baseline: None,
-        best: best_by_rule(runs.iter(), metric).cloned(),
+        best: best_of(&scores, metric).cloned(),
         history,
     }
 }
@@ -853,30 +927,25 @@ pub(crate) struct PathStep {
     pub experiment: String,
     /// The title of the idea the experiment tested, when one is linked.
     pub idea: Option<String>,
-    /// The run behind the step's score (the best run itself on the last step).
+    /// The latest counted run behind the step's score.
     pub run_id: Option<String>,
     pub score: Option<f64>,
-    /// How many probe runs the score averages, when it is such a mean.
+    /// How many counted runs the score averages.
+    pub runs: usize,
+    /// How many probe runs the score averages, when they score it.
     pub probe_runs: usize,
     /// Change from the previous scored step, in the metric's raw units.
     pub delta: Option<f64>,
 }
 
-/// The lineage from the root of the best run's experiment down to that run.
-/// The last step is the best run itself and the first is the baseline, so
-/// the deltas between scored steps add up to the gain the headline reports.
-pub(crate) fn lineage(
-    store: &Store,
-    project_id: &str,
-    best: &ScoredRun,
+/// The lineage from the root of the best experiment down to it. The last
+/// step is the best itself and the first is the baseline, so the deltas
+/// between scored steps add up to the gain the headline reports.
+fn lineage(
+    experiments: &HashMap<String, LocalExperiment>,
+    best: &ExperimentScore,
     runs: &[ScoredRun],
-    metric: &PrimaryMetric,
-) -> Result<Vec<PathStep>> {
-    let experiments: HashMap<String, LocalExperiment> = store
-        .list_experiments_by_project(project_id)?
-        .into_iter()
-        .map(|experiment| (experiment.id.clone(), experiment))
-        .collect();
+) -> Vec<PathStep> {
     let chain = ancestry(&best.experiment_id, |id| {
         experiments
             .get(id)
@@ -888,7 +957,7 @@ pub(crate) fn lineage(
             .map(display_name)
             .unwrap_or_else(|| id.to_string())
     };
-    Ok(path_steps(&chain, name, best, runs, metric))
+    path_steps(&chain, name, best, runs)
 }
 
 /// An experiment and its ancestors, root first.
@@ -909,27 +978,32 @@ pub(crate) fn ancestry(
     chain
 }
 
-/// The scored steps along `chain` (root first), ending at the best run.
+/// The scored steps along `chain` (root first), ending at the best.
 pub(crate) fn path_steps(
     chain: &[String],
     name: impl Fn(&str) -> String,
-    best: &ScoredRun,
+    best: &ExperimentScore,
     runs: &[ScoredRun],
-    metric: &PrimaryMetric,
 ) -> Vec<PathStep> {
     let mut steps = Vec::with_capacity(chain.len());
     let mut previous: Option<f64> = None;
     for id in chain {
-        let (run_id, score, probe_runs) = if *id == best.experiment_id {
-            (Some(best.run_id.clone()), best.score, 0)
+        // The best is scored as the headline scores it.
+        let (run_id, score, counted, probe_runs) = if *id == best.experiment_id {
+            if best.probe {
+                (None, Some(best.score), 0, best.runs)
+            } else {
+                (Some(best.run_id.clone()), Some(best.score), best.runs, 0)
+            }
         } else {
-            match experiment_reference(runs, id, metric, true) {
+            match experiment_reference(runs, id, true) {
                 Some(reference) => (
                     reference.run_id,
                     Some(reference.score),
+                    reference.runs,
                     reference.probe_runs,
                 ),
-                None => (None, None, 0),
+                None => (None, None, 0, 0),
             }
         };
         let delta = match (score, previous) {
@@ -944,6 +1018,7 @@ pub(crate) fn path_steps(
             idea: None,
             run_id,
             score,
+            runs: counted,
             probe_runs,
             experiment_id: id.clone(),
             delta,
@@ -978,9 +1053,38 @@ pub(crate) fn standing_among(
         .filter(|run| members.is_none_or(|members| members.contains(&run.run_id)))
         .cloned()
         .collect();
-    let mut standing = running_best(&runs, metric);
+    let experiments: HashMap<String, LocalExperiment> = store
+        .list_experiments_by_project(project_id)?
+        .into_iter()
+        .map(|experiment| (experiment.id.clone(), experiment))
+        .collect();
+    let is_baseline = |id: &str| {
+        experiments
+            .get(id)
+            .is_some_and(|experiment| experiment.parent_experiment_id.is_none())
+    };
+    // The baselines the runs build on take part too, scored by any of the
+    // project's runs, as the path scores them: seed runs launched from a
+    // terminal, say, before the optimization had runs of its own.
+    let parent = |id: &str| {
+        experiments
+            .get(id)
+            .and_then(|experiment| experiment.parent_experiment_id.clone())
+    };
+    let roots: std::collections::HashSet<String> = runs
+        .iter()
+        .filter_map(|run| ancestry(&run.experiment_id, parent).into_iter().next())
+        .collect();
+    let mut candidates = runs.clone();
+    candidates.extend(
+        all.iter()
+            .filter(|run| roots.contains(&run.experiment_id))
+            .filter(|run| members.is_some_and(|members| !members.contains(&run.run_id)))
+            .cloned(),
+    );
+    let mut standing = running_best(&candidates, metric, &is_baseline);
     let mut path = match &standing.best {
-        Some(best) => lineage(store, project_id, best, &all, metric)?,
+        Some(best) => lineage(&experiments, best, &all),
         None => Vec::new(),
     };
     let ideas = super::ideas::titles_by_experiment(store, project_id)?;
@@ -993,6 +1097,7 @@ pub(crate) fn standing_among(
             experiment: root.experiment.clone(),
             run_id: root.run_id.clone(),
             score,
+            runs: root.runs,
             probe_runs: root.probe_runs,
         });
     }
@@ -1209,7 +1314,7 @@ mod tests {
             noise_floor: Some(0.001),
             split: None,
         };
-        let standing = running_best(&runs, &metric);
+        let standing = running_best(&runs, &metric, &|_| false);
         assert_eq!(standing.best.unwrap().run_id, "c");
         let marks: Vec<_> = standing.history.iter().map(|h| h.new_best).collect();
         assert_eq!(marks, [true, false, true, false]);
@@ -1220,15 +1325,68 @@ mod tests {
             noise_floor: None,
             ..metric
         };
-        assert_eq!(running_best(&runs, &lower).best.unwrap().run_id, "d");
+        assert_eq!(
+            running_best(&runs, &lower, &|_| false).best.unwrap().run_id,
+            "d"
+        );
+    }
+
+    fn probe(id: &str, experiment: &str, ended: i64, score: f64) -> ScoredRun {
+        ScoredRun {
+            probe: true,
+            ..scored(id, experiment, ended, score)
+        }
+    }
+
+    #[test]
+    fn an_attempt_has_to_beat_a_baseline_measured_with_seed_runs() {
+        let metric = PrimaryMetric {
+            key: "val_ic".into(),
+            direction: Direction::Max,
+            noise_floor: Some(0.002),
+            split: None,
+        };
+        let is_baseline = |id: &str| id == "base";
+        let mut runs = vec![
+            probe("s1", "base", 1, 0.0200),
+            probe("s2", "base", 2, 0.0210),
+            probe("s3", "base", 3, 0.0190),
+            // Worse than the baseline: it doesn't become the best.
+            scored("a", "e1", 4, 0.0180),
+        ];
+        let standing = running_best(&runs, &metric, &is_baseline);
+        let best = standing.best.unwrap();
+        assert_eq!((best.experiment_id.as_str(), best.probe), ("base", true));
+        assert!((best.score - 0.020).abs() < 1e-12);
+        assert_eq!(standing.history.len(), 1, "probe runs aren't results");
+        assert!(!standing.history[0].new_best);
+
+        // A lucky run takes over; its replicate with a new seed pulls the
+        // experiment's mean back under the floor, and the baseline is the
+        // best again.
+        runs.push(scored("b", "e2", 5, 0.0260));
+        let lucky = running_best(&runs, &metric, &is_baseline);
+        assert_eq!(lucky.best.unwrap().experiment_id, "e2");
+        assert!(lucky.history.last().unwrap().new_best);
+        runs.push(scored("b2", "e2", 6, 0.0180));
+        let replicated = running_best(&runs, &metric, &is_baseline);
+        let best = replicated.best.unwrap();
+        assert_eq!(best.experiment_id, "base");
+        let point = replicated.history.last().unwrap();
+        assert!(!point.new_best);
+        assert!((point.best_so_far - 0.020).abs() < 1e-12);
+        let e2 = experiment_reference(&runs, "e2", false).unwrap();
+        assert_eq!((e2.runs, e2.run_id.as_deref()), (2, Some("b2")));
+        assert!((e2.score - 0.022).abs() < 1e-12);
     }
 
     #[test]
     fn the_lineage_path_splits_the_total_gain_into_steps() {
-        let (store, dir) = temp_store();
+        let mut experiments = HashMap::new();
         for (id, parent) in [("base", None), ("e1", Some("base")), ("e2", Some("e1"))] {
-            store
-                .create_local_experiment(&LocalExperiment {
+            experiments.insert(
+                id.to_string(),
+                LocalExperiment {
                     id: id.into(),
                     project_id: "proj_1".into(),
                     parent_experiment_id: parent.map(Into::into),
@@ -1242,8 +1400,8 @@ mod tests {
                     updated_at: 1,
                     chat_session_id: None,
                     archived: false,
-                })
-                .unwrap();
+                },
+            );
         }
         let runs = [
             scored("r0", "base", 1, 0.020),
@@ -1251,23 +1409,22 @@ mod tests {
             scored("r1b", "e1", 3, 0.024),
             scored("r2", "e2", 4, 0.031),
         ];
-        let metric = PrimaryMetric {
-            key: "val_ic".into(),
-            direction: Direction::Max,
-            noise_floor: None,
-            split: None,
-        };
-        let path = lineage(&store, "proj_1", &runs[3], &runs, &metric).unwrap();
+        let scores = experiment_scores(&runs, &|_| false);
+        let best = scores.last().unwrap();
+        assert_eq!(best.experiment_id, "e2");
+        let path = lineage(&experiments, best, &runs);
         let ids: Vec<_> = path
             .iter()
             .map(|step| step.experiment_id.as_str())
             .collect();
         assert_eq!(ids, ["base", "e1", "e2"]);
         assert_eq!(path[0].experiment, "Step base");
-        assert_eq!(path[1].run_id.as_deref(), Some("r1"));
+        // A step run twice is scored by the mean of its runs.
+        assert_eq!(path[1].run_id.as_deref(), Some("r1b"));
+        assert_eq!(path[1].runs, 2);
+        assert!((path[1].score.unwrap() - 0.025).abs() < 1e-12);
         let total: f64 = path.iter().filter_map(|step| step.delta).sum();
         assert!((total - (0.031 - 0.020)).abs() < 1e-12);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

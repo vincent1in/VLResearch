@@ -35,7 +35,7 @@ it. Keep going until every field is pinned; don't fill a gap with a guess.
 | Field | Pin down | Example |
 | --- | --- | --- |
 | Objective and metric | The goal, the one number that measures it, its split and direction | Validation information coefficient of the forecast; maximize |
-| Noise floor | How far the metric moves between seeds of the baseline | Spread across three seeds of the baseline |
+| Noise floor | The smallest gain worth keeping; seed noise is handled by replicates | 0, or the smallest gain that would matter in practice |
 | What may change | Code and data runs may touch | Feature code, model code, loaders; new datasets under a named folder |
 | What must not change | Whatever defines the score | Evaluation code, split dates, the out-of-sample window |
 | Scope | When the work is on one part of the system, the paths runs may change | `features/`, `data/loaders.py` |
@@ -52,8 +52,9 @@ Use probe runs, which never count as results:
 `VLR_PROBE=1 orx exp run <expId>`.
 
 - The data paths exist, with the expected dates and coverage.
-- The baseline reproduces. Run it with three seeds; the spread of the primary
-  metric is the noise floor.
+- The baseline reproduces. Run it three times; each run draws its own seed
+  and prints it, so reruns of an experiment are replicates. The spread of
+  the primary metric is how far one run moves.
 - The metric comes from the evaluation code you are about to lock, and the
   code prints `ORX_METRIC` lines (`orx-metrics`).
 - A smoke run completes end to end.
@@ -88,7 +89,7 @@ Present the brief and the ideas together, and ask the user to approve or
 edit them. In plan mode, that is the plan you submit. Only after they agree:
 
 ```sh
-orx metric primary <projectId> <key> --maximize --noise-floor <spread>
+orx metric primary <projectId> <key> --maximize
 orx brief set <projectId> --objective "..." --may-change "..." \
   --must-not-change "..." --lock <evaluation file> --lock <split file> \
   --scope <path> \
@@ -99,7 +100,10 @@ orx brief confirm <projectId>
 ```
 
 Leave out `--scope` when the whole repository is in play; with it, a run may
-change only files inside those paths. `orx brief set` changes only the fields
+change only files inside those paths. Add `--noise-floor <gain>` to
+`orx metric primary` only when gains smaller than that wouldn't matter: each
+new best is rerun with a new seed and scored by the mean of its runs, which
+is what keeps a lucky run from staying the best. `orx brief set` changes only the fields
 you pass. The user may confirm the
 brief themselves, outside this chat, and this chat is told when they do. If
 they agree in the chat instead, confirm it yourself.

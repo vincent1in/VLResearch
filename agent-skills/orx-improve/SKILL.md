@@ -1,6 +1,6 @@
 ---
 name: orx-improve
-description: "Run the forecast-and-verify improvement loop on this chat's scoped optimization: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on an optimization with a confirmed brief."
+description: "Run the forecast-and-verify improvement loop on this chat's scoped optimization: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and confirm each new best with a rerun. Use when asked to improve a model, dataset or process over several experiments, or to keep going on an optimization with a confirmed brief."
 ---
 
 ## Before the loop
@@ -33,17 +33,20 @@ one, scope the work first with `orx-grill`; `orx idea next` and
    finish, and told if one stalls or diverges.
 5. **Verify.** `orx idea done <ideaId> --evidence "<runs and numbers>"`.
    orx measures the change against the parent, compares it with the noise
-   floor, and keeps or refutes the idea.
+   floor (0 unless the brief set one), and keeps or refutes the idea.
 6. **Learn.** Record what the result says beyond this one idea as a finding,
    with the runs as evidence (`orx-findings`), whether the idea was kept or
    refuted.
-7. **Retain.** A new best counts only past the noise floor
-   (`orx metric best`). Before building on it, queue a replicate
-   (`orx idea add <projectId> "Replicate <idea>" --kind replicate`) with new
-   seeds, and keep it as the incumbent only if the gain holds. orx also
-   queues ablation checks for the biggest earlier steps behind a new best
-   (`orx-ideas`); `orx idea next` runs the replicate, then those, before new
-   ideas. Drop the ablations if the replicate fails.
+7. **Retain.** When a kept idea makes a new best, `orx idea done` queues a
+   replicate of it, and `orx idea next` takes it before new ideas. Run the
+   same experiment again (`orx exp run <expId>`), which draws a new seed,
+   then `orx idea start <replicateId> <expId>` and
+   `orx idea done <replicateId>`. orx scores an experiment by the mean of its
+   runs: if the gain was luck, the mean falls back, the best returns to what
+   it was, and the idea it repeated is refuted. Build only on a best whose
+   replicate held. When ablation checks are turned on (`VLR_AUTO_ABLATE`),
+   orx queues those too (`orx-ideas`), and drops them if the replicate
+   fails.
 
 Report each round in two or three lines: the idea, forecast against
 outcome, kept or refuted, and the best against the baseline.

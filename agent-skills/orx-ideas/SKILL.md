@@ -48,13 +48,21 @@ orx idea add <projectId> "<title>" --class incremental \
 Close every idea you start. Refuted ideas are results too: they count the
 trials behind any "best" number, which is how its luck gets discounted.
 
-## Ablation checks
+## Replicates and ablation checks
 
-When a kept idea's experiment becomes the optimization's best, orx queues up to
-two ablation checks for the biggest earlier steps on its lineage path (the
-steps `orx metric best` lists), titled `Ablate "<step>" from the best`. Each
-forecasts that taking that step's change back out of the best loses about
-what the step gained.
+When a kept idea's experiment becomes the optimization's best, orx queues a
+replicate, titled `Replicate "<idea>" with a new seed`: run the same
+experiment again, start the replicate on it and close it with
+`orx idea done`. An experiment scores the mean of its runs, so a gain that
+was luck falls back, the best returns to what it was, and the idea it
+repeated is refuted.
+
+When ablation checks are turned on (`VLR_AUTO_ABLATE`), a new best also
+queues up to two of them for the biggest earlier steps on its lineage path
+(the steps `orx metric best` lists), titled `Ablate "<step>" from the best`.
+Each forecasts that taking that step's change back out of the best loses
+about what the step gained. They are off by default: they test whether the
+steps add up, and don't change what gets built.
 
 - Build it as a child of the best experiment that reverts only that step's
   change, start it, run it with the best's seeds, and close it with
@@ -62,8 +70,8 @@ what the step gained.
 - It is confirmed when the change lands inside its forecast interval, and
   refuted when it is far smaller or larger: then the steps interact, and the
   per-step gains in `orx metric best` don't add up the way they look.
-- If a replicate shows the new best doesn't hold, drop its ablations; a
-  later best queues them again.
+- If the replicate shows the new best doesn't hold, orx drops its
+  ablations; a later best queues them again.
 - Your own `--class ablation` ideas, which remove something hoping to
   improve, are ordinary ideas: judged by their gain and ranked like the rest.
 

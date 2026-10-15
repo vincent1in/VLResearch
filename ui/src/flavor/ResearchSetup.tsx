@@ -256,7 +256,7 @@ export function ResearchSetup({
             <Field label="Split (optional)" hint="When runs report the metric under several splits.">
               <Input value={draft.split} placeholder="val" onChange={(event) => update("split", event.target.value)} />
             </Field>
-            <Field label="Noise floor (optional)" hint="Left empty, the agent measures it from three seeds." error={problems.noiseFloor}>
+            <Field label="Noise floor (optional)" hint="The smallest gain worth keeping. Leave it empty to keep any gain that holds up when the run is repeated with a new seed." error={problems.noiseFloor}>
               <Input inputMode="decimal" value={draft.noiseFloor} placeholder="0.002" onChange={(event) => update("noiseFloor", event.target.value)} />
             </Field>
           </div>

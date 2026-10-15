@@ -1,7 +1,7 @@
 // VLResearch: the Research section of the Settings page. How the research
-// loop behaves on this machine, for every project: autocompaction, stall
-// alerts, wake-ups, ablation checks, the brief gate and the agent's
-// checklist. Each is a variable orx also reads from its environment, which
+// loop behaves on this machine, for every project: the brief gate,
+// replicates, ablation checks, autocompaction, wake-ups, stall alerts and the
+// agent's checklist. Each is a variable orx also reads from its environment, which
 // wins; the section says when it does. The network policy is shown here but
 // changes only in that environment.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -168,6 +168,7 @@ export function ResearchSettings({ cardClassName, rowClassName }: { cardClassNam
   const stall = entry(SETTING.stall);
   const minutes = stall ? stallMinutes(stall.value) : 0;
   const wake = entry(SETTING.wake);
+  const replicate = entry(SETTING.replicate);
   const ablate = entry(SETTING.ablate);
   const gate = entry(SETTING.gate);
   const checklist = entry(SETTING.checklist);
@@ -187,6 +188,47 @@ export function ResearchSettings({ cardClassName, rowClassName }: { cardClassNam
     <>
       {heading}
       <div className={`${cardClassName} mt-3`}>
+        <Row className={row} title="Hold runs to their brief" entry={gate} description={gateDescription(gate?.value ?? "scoped")}>
+          {gate && (
+            <div className="inline-flex flex-none gap-0.5 p-0.5 border border-border rounded-md bg-surface" role="group" aria-label="Hold runs to their brief">
+              {GATE_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={gate.value === option.value}
+                  disabled={locked(gate)}
+                  className={cn(
+                    "py-[5px] px-2.5 rounded-sm border-0 text-sm cursor-pointer whitespace-nowrap transition-[background,color] duration-120 ease-standard disabled:cursor-default",
+                    gate.value === option.value ? "text-background bg-primary" : "bg-transparent text-subtext [&:hover:not(:disabled)]:text-text [&:hover:not(:disabled)]:bg-highlight",
+                  )}
+                  onClick={() => gate.value !== option.value && save(gate, option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </Row>
+        <Row
+          className={row}
+          title="Rerun each new best with a new seed"
+          entry={replicate}
+          description={
+            replicate && !isOn(replicate.value)
+              ? "Off: a lucky run can stay the best. Turn it off only if your runs give the same score every time."
+              : "When a kept idea makes a new best, its experiment is run again before anything is built on it. An experiment scores the mean of its runs, so a gain that was luck falls back."
+          }
+        >
+          {toggle(replicate, "Rerun each new best with a new seed")}
+        </Row>
+        <Row
+          className={row}
+          title="Check each new best with ablations"
+          entry={ablate}
+          description="Queues leave-one-out checks for the biggest steps behind each new best, to test that their gains add up. Off by default: in the loop benchmark they took a tenth to a quarter of the budget without changing what got built."
+        >
+          {toggle(ablate, "Check each new best with ablations")}
+        </Row>
         <Row
           className={row}
           title="Compact chats automatically"
@@ -222,6 +264,18 @@ export function ResearchSettings({ cardClassName, rowClassName }: { cardClassNam
         </Row>
         <Row
           className={row}
+          title="Wake the chat when its runs finish"
+          entry={wake}
+          description={
+            wake && !isOn(wake.value)
+              ? "Off: a chat resumes after a run only if its agent asked to be woken."
+              : "Each run a chat launches resumes that chat when it ends, so the agent can end its turn instead of waiting."
+          }
+        >
+          {toggle(wake, "Wake the chat when its runs finish")}
+        </Row>
+        <Row
+          className={row}
           title="Flag stalled runs"
           entry={stall}
           description={
@@ -251,47 +305,6 @@ export function ResearchSettings({ cardClassName, rowClassName }: { cardClassNam
               disabled={locked(stall)}
               onClick={() => save(stall, minutes > 0 ? "0" : switchedOn(stall, STALL_DEFAULT))}
             />
-          )}
-        </Row>
-        <Row
-          className={row}
-          title="Wake the chat when its runs finish"
-          entry={wake}
-          description={
-            wake && !isOn(wake.value)
-              ? "Off: a chat resumes after a run only if its agent asked to be woken."
-              : "Each run a chat launches resumes that chat when it ends, so the agent can end its turn instead of waiting."
-          }
-        >
-          {toggle(wake, "Wake the chat when its runs finish")}
-        </Row>
-        <Row
-          className={row}
-          title="Check each new best with ablations"
-          entry={ablate}
-          description="When a run sets a new best, the biggest earlier steps on its path are queued as leave-one-out checks, to test that their gains add up."
-        >
-          {toggle(ablate, "Check each new best with ablations")}
-        </Row>
-        <Row className={row} title="Hold runs to their brief" entry={gate} description={gateDescription(gate?.value ?? "scoped")}>
-          {gate && (
-            <div className="inline-flex flex-none gap-0.5 p-0.5 border border-border rounded-md bg-surface" role="group" aria-label="Hold runs to their brief">
-              {GATE_OPTIONS.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  aria-pressed={gate.value === option.value}
-                  disabled={locked(gate)}
-                  className={cn(
-                    "py-[5px] px-2.5 rounded-sm border-0 text-sm cursor-pointer whitespace-nowrap transition-[background,color] duration-120 ease-standard disabled:cursor-default",
-                    gate.value === option.value ? "text-background bg-primary" : "bg-transparent text-subtext [&:hover:not(:disabled)]:text-text [&:hover:not(:disabled)]:bg-highlight",
-                  )}
-                  onClick={() => gate.value !== option.value && save(gate, option.value)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
           )}
         </Row>
         <Row

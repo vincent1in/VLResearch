@@ -1,9 +1,11 @@
 //! A seeded simulation of the improvement loop, run through the loop's own
 //! decision code: the selector (`ideas::pick`), the keep rule
-//! (`ideas::judge`), the rule for the best (`metrics::best_by_rule`), the
-//! scores it compares (`metrics::experiment_reference`) and the ablation
-//! checks a new best queues (`ideas::ablation_targets`). The replicate the
-//! `orx-improve` skill has the agent queue for a new best is mirrored here.
+//! (`ideas::judge`), the scores and the rule for the best
+//! (`metrics::experiment_scores`, `metrics::best_of`,
+//! `metrics::experiment_reference`) and the ablation checks a new best queues
+//! (`ideas::ablation_targets`). What `ideas::close` does after a kept attempt
+//! makes a new best (queue a replicate, and ablation checks when they are on)
+//! is mirrored here, since it goes through the store.
 //!
 //! Each campaign draws a research problem whose truth is known: every idea's
 //! true effect and cost, and the agent's forecasts of them, which are noisy,
@@ -25,7 +27,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use super::ideas::{self, Author, Class, Idea, Kind, Status};
-use super::metrics::{self, Direction, PathStep, PrimaryMetric, ScoredRun};
+use super::metrics::{self, Direction, ExperimentScore, PathStep, PrimaryMetric, ScoredRun};
 
 /// SplitMix64: small, and the same on every platform.
 struct Rng(u64);
@@ -245,16 +247,23 @@ struct Strategy {
     ablate: bool,
 }
 
-/// The loop as VLResearch runs it by default: the noise floor at the spread
-/// of the baseline's seed runs, as `orx-grill` has it measured, each new best
-/// replicated, and ablation checks on.
+/// The loop as VLResearch runs it by default.
 const VLRESEARCH: Strategy = Strategy {
     name: "VLResearch loop",
     order: Order::Selector,
     seeded: true,
-    floor: Floor::Spread,
+    floor: Floor::Zero,
     replicate: true,
+    ablate: false,
+};
+/// The loop as it ran before this benchmark: the floor at the spread of the
+/// seed runs, and ablation checks on. (Its replicates also counted for
+/// nothing then: an experiment scored its best run, not the mean.)
+const OLD_GUIDANCE: Strategy = Strategy {
+    name: "  floor at the seed spread, ablations on (the old guidance)",
+    floor: Floor::Spread,
     ablate: true,
+    ..VLRESEARCH
 };
 /// A plain autoresearch loop: try the most promising idea, keep any gain.
 const KEEP_IF_HIGHER: Strategy = Strategy {
@@ -274,13 +283,13 @@ const RANDOM: Strategy = Strategy {
 const STRATEGIES: [Strategy; 7] = [
     VLRESEARCH,
     Strategy {
-        name: "  without replicates",
-        replicate: false,
+        name: "  with ablation checks on",
+        ablate: true,
         ..VLRESEARCH
     },
     Strategy {
-        name: "  without ablation checks",
-        ablate: false,
+        name: "  without replicates",
+        replicate: false,
         ..VLRESEARCH
     },
     Strategy {
@@ -288,11 +297,7 @@ const STRATEGIES: [Strategy; 7] = [
         floor: Floor::Deviations(1.0),
         ..VLRESEARCH
     },
-    Strategy {
-        name: "  floor at zero",
-        floor: Floor::Zero,
-        ..VLRESEARCH
-    },
+    OLD_GUIDANCE,
     KEEP_IF_HIGHER,
     RANDOM,
 ];
@@ -367,21 +372,24 @@ impl Lab {
         self.hours += self.cost[id];
     }
 
-    /// The best run by the loop's rule.
-    fn best(&self, metric: &PrimaryMetric) -> Option<&ScoredRun> {
-        metrics::best_by_rule(self.runs.iter(), metric)
+    /// The best by the loop's rule, with a baseline measured by its seed
+    /// runs taking part.
+    fn best(&self, metric: &PrimaryMetric) -> Option<ExperimentScore> {
+        let scores =
+            metrics::experiment_scores(&self.runs, &|id: &str| !self.parent.contains_key(id));
+        metrics::best_of(&scores, metric).cloned()
     }
 
     /// What `orx metric best` names as the experiment to build on.
     fn best_experiment(&self, metric: &PrimaryMetric) -> String {
         self.best(metric)
-            .map_or_else(|| BASE.to_string(), |run| run.experiment_id.clone())
+            .map_or_else(|| BASE.to_string(), |best| best.experiment_id)
     }
 
     /// What closing an idea measures: its experiment against its parent.
-    fn measured(&self, experiment: &str, parent: &str, metric: &PrimaryMetric) -> Option<f64> {
-        let tested = metrics::experiment_reference(&self.runs, experiment, metric, false)?;
-        let reference = metrics::experiment_reference(&self.runs, parent, metric, true)?;
+    fn measured(&self, experiment: &str, parent: &str) -> Option<f64> {
+        let tested = metrics::experiment_reference(&self.runs, experiment, false)?;
+        let reference = metrics::experiment_reference(&self.runs, parent, true)?;
         Some(tested.score - reference.score)
     }
 
@@ -390,16 +398,14 @@ impl Lab {
             return Vec::new();
         };
         let chain = metrics::ancestry(&best.experiment_id, |id| self.parent.get(id).cloned());
-        metrics::path_steps(&chain, str::to_string, best, &self.runs, metric)
+        metrics::path_steps(&chain, str::to_string, &best, &self.runs)
     }
 
     /// The best's score over the baseline's, as measured: what is reported.
     fn claimed_gain(&self, metric: &PrimaryMetric) -> f64 {
-        let baseline = metrics::experiment_reference(&self.runs, BASE, metric, true)
+        let baseline = metrics::experiment_reference(&self.runs, BASE, true)
             .map_or(0.0, |reference| reference.score);
-        self.best(metric)
-            .and_then(|run| run.score)
-            .map_or(0.0, |score| score - baseline)
+        self.best(metric).map_or(0.0, |best| best.score - baseline)
     }
 }
 
@@ -586,7 +592,7 @@ fn campaign(scenario: &Scenario, campaign: u64, strategy: &Strategy) -> Outcome 
         if is_check {
             check_hours += cost;
         }
-        let change = lab.measured(&experiment, &parent, &metric);
+        let change = lab.measured(&experiment, &parent);
         let status = change.map_or(Status::Refuted, |change| {
             ideas::judge(&ideas[index], change, &metric)
         });
@@ -594,9 +600,17 @@ fn campaign(scenario: &Scenario, campaign: u64, strategy: &Strategy) -> Outcome 
         ideas[index].outcome = change;
         ideas[index].closed_at = Some(clock);
         if ideas[index].kind == Kind::Replicate {
-            // As `orx-improve` has the agent do: a best that doesn't hold
-            // drops its ablation checks.
+            // As `ideas::close` does: the attempt it repeats is judged again
+            // on the mean, and a best that doesn't hold drops its ablations.
             for other in ideas.iter_mut() {
+                let repeated = other.kind == Kind::Science
+                    && other.ablates.is_none()
+                    && other.experiment_id.as_deref() == Some(experiment.as_str())
+                    && matches!(other.status, Status::Kept | Status::Refuted);
+                if let (true, Some(change)) = (repeated, change) {
+                    other.outcome = Some(change);
+                    other.status = ideas::judge(other, change, &metric);
+                }
                 if status == Status::Refuted
                     && other.ablates.is_some()
                     && other.status == Status::Open
@@ -607,8 +621,7 @@ fn campaign(scenario: &Scenario, campaign: u64, strategy: &Strategy) -> Outcome 
             }
         } else if !is_check && status == Status::Kept && lab.best_experiment(&metric) == experiment
         {
-            // A replicate, as `orx-improve` has the agent queue, and the
-            // ablation checks `ideas::close` queues.
+            // As `ideas::close` does for a kept attempt that holds the best.
             if strategy.replicate {
                 let mut replicate = blank_idea(format!("replicate{clock}"), clock);
                 replicate.kind = Kind::Replicate;
@@ -806,8 +819,9 @@ fn render(campaigns: u64) -> String {
         .iter()
         .map(|scenario| simulate(scenario, &STRATEGIES, campaigns, SEED))
         .collect();
-    let (vlr, naive, random) = (
+    let (vlr, old, naive, random) = (
         position(&VLRESEARCH),
+        position(&OLD_GUIDANCE),
         position(&KEEP_IF_HIGHER),
         position(&RANDOM),
     );
@@ -829,9 +843,10 @@ fn render(campaigns: u64) -> String {
          strategy works the same campaigns with the same luck, so the differences between them \
          come from the strategies alone.\n\n\
          The VLResearch strategies go through the loop's own code: `ideas::pick` chooses (what \
-         `orx idea next` prints), `ideas::judge` keeps or refutes, and `metrics::best_by_rule` decides the best to \
-         build on (what `orx metric best` prints). Each new best gets a replicate, as the \
-         `orx-improve` skill says, and the ablation checks `orx idea done` queues. Their baseline is measured with {BASELINE_SEEDS} seed runs; \
+         `orx idea next` prints), `ideas::judge` keeps or refutes, and `metrics::experiment_scores` \
+         and `metrics::best_of` decide the best to build on (what `orx metric best` prints). \
+         What `orx idea done` queues after a new best (a replicate, and ablation checks when \
+         they are on) is mirrored. Their baseline is measured with {BASELINE_SEEDS} seed runs; \
          the plain loops measure it once. Seed runs count against the budget.\n\n\
          Scores are in units of one run's seed noise (its standard deviation). **True gain** is \
          the true, out-of-sample score of the experiment a strategy ends on, minus the \
@@ -841,6 +856,7 @@ fn render(campaigns: u64) -> String {
         TYPICAL.ideas,
     );
     let typical = &all[0];
+    let ablations = position(&STRATEGIES[1]);
     let (mut ahead, mut behind, mut honest) = (0, 0, 0);
     for results in &all {
         let difference = results.difference(vlr, naive);
@@ -861,27 +877,51 @@ fn render(campaigns: u64) -> String {
          plain loop that keeps any gain, trying the most promising idea first (paired \
          difference {}), and overstates its gain by {} against {}. Across the {} scenarios it \
          is ahead on true gain in {ahead}, level in {level} and behind in {behind}, and it \
-         overstates less in {honest}.\n",
+         overstates less in {honest}. With its old settings (a noise floor at the spread of \
+         the baseline's seed runs, and ablation checks on) it finds {} in the typical \
+         scenario.\n\n\
+         What decided it:\n\n\
+         - **Keep any gain, and let replicates catch luck.** A noise floor at the spread of \
+         the baseline's seed runs rejects most real gains: true gain falls from {} to {}. \
+         Replicates work because an experiment scores the mean of its runs, so a lucky first \
+         run that doesn't repeat falls back, and the best returns to what it was. Without \
+         them, true gain is {} and the overclaim {}.\n\
+         - **Ablation checks are diagnostics.** They test whether the steps behind a best add \
+         up. On, they take {:.1} GPU-hours of the {}-hour budget and true gain is {}, so they \
+         are off unless turned on in Settings.\n\
+         - **Validation luck is not seed noise.** Where changes also have luck on the \
+         validation split, no rerun separates it from a real gain, and every strategy \
+         overstates more. Check the out-of-sample split at milestones before relying on a \
+         gain.\n",
         signed(typical.true_gain(vlr)),
         signed(typical.true_gain(naive)),
         with_margin(typical.difference(vlr, naive)),
         signed(typical.overclaim(vlr)),
         signed(typical.overclaim(naive)),
         all.len(),
+        signed(typical.true_gain(old)),
+        signed(typical.true_gain(vlr)),
+        signed(typical.true_gain(old)),
+        signed(typical.true_gain(position(&STRATEGIES[2]))),
+        signed(typical.overclaim(position(&STRATEGIES[2]))),
+        typical.mean(ablations, |outcome| outcome.check_hours).mean,
+        TYPICAL.budget,
+        signed(typical.true_gain(ablations)),
     );
     out.push_str(
         "\n## Across scenarios\n\n\
          True gain of each, the VLResearch loop's paired advantage over keeping any gain in \
          forecast order, and how much each overstates its gain.\n\n\
-         | Scenario | VLResearch loop | Keep if higher | Random order | VLResearch advantage | VLResearch overclaim | Keep-if-higher overclaim |\n\
-         | --- | --- | --- | --- | --- | --- | --- |\n",
+         | Scenario | VLResearch loop | Old guidance | Keep if higher | Random order | VLResearch advantage | VLResearch overclaim | Keep-if-higher overclaim |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- |\n",
     );
     for results in &all {
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             results.scenario.name,
             signed(results.true_gain(vlr)),
+            signed(results.true_gain(old)),
             signed(results.true_gain(naive)),
             signed(results.true_gain(random)),
             with_margin(results.difference(vlr, naive)),
@@ -956,12 +996,31 @@ fn campaigns_are_reproducible() {
     assert!(a.hours <= TYPICAL.budget + 1e-9);
 }
 
-/// The benchmark's headline, on fewer campaigns: as it stands, the loop
-/// finds less than keeping any gain does.
+/// The benchmark's headline, on fewer campaigns: the loop overstates its
+/// gains far less than keeping any gain does, finds as much, and beats its
+/// old guidance by a wide margin.
 #[test]
-fn the_loop_finds_less_than_keeping_any_gain() {
-    let strategies = [VLRESEARCH, KEEP_IF_HIGHER];
+fn the_loop_finds_as_much_as_keeping_any_gain_and_overstates_less() {
+    let strategies = [VLRESEARCH, OLD_GUIDANCE, KEEP_IF_HIGHER];
     let results = simulate(&TYPICAL, &strategies, 150, SEED);
-    assert!(results.true_gain(0) < results.true_gain(1));
-    assert!(results.overclaim(0) < results.overclaim(1));
+    let (vlr, old, naive) = (0, 1, 2);
+    let difference = results.difference(vlr, naive);
+    assert!(
+        difference.mean + difference.margin > 0.0,
+        "true gain {:+.2} against {:+.2}",
+        results.true_gain(vlr),
+        results.true_gain(naive)
+    );
+    assert!(
+        results.overclaim(vlr) < 0.75 * results.overclaim(naive),
+        "overclaim {:+.2} against {:+.2}",
+        results.overclaim(vlr),
+        results.overclaim(naive)
+    );
+    assert!(
+        results.true_gain(old) < 0.6 * results.true_gain(vlr),
+        "old guidance {:+.2} against {:+.2}",
+        results.true_gain(old),
+        results.true_gain(vlr)
+    );
 }

@@ -293,11 +293,35 @@ fn report_closed(closed: &ideas::Closed) {
         _ => String::new(),
     };
     println!("Idea {} is {}.{outcome}", idea.id, idea.status_label());
+    for attempt in &closed.repeated {
+        let change = attempt
+            .outcome
+            .map(|outcome| format!(" ({} on the mean of its runs)", signed(outcome)))
+            .unwrap_or_default();
+        let verdict = if attempt.status == ideas::Status::Kept {
+            "holds"
+        } else {
+            "doesn't hold: it is refuted now, and the best is back to what it was before"
+        };
+        println!(
+            "The result it repeats, {} \"{}\"{change}, {verdict}.",
+            attempt.id, attempt.title
+        );
+    }
+    if let Some(replicate) = &closed.replicate {
+        let experiment = idea.experiment_id.as_deref().unwrap_or("its experiment");
+        println!(
+            "Its experiment holds the best now, so orx queued a replicate: run {experiment} \
+             again with a new seed, then `orx idea start {} {experiment}` and \
+             `orx idea done {}`. orx scores an experiment by the mean of its runs, so a lucky \
+             first run doesn't stay the best. `orx idea next` takes it before new ideas.",
+            replicate.id, replicate.id
+        );
+    }
     if !closed.ablations.is_empty() {
         println!(
-            "Its experiment holds the best now, so orx queued {} ablation check{} for the \
-             biggest steps behind it. `orx idea next` takes checks before new ideas; drop them \
-             if a replicate shows the best doesn't hold.",
+            "orx also queued {} ablation check{} for the biggest steps behind the new best; \
+             they are dropped if the replicate fails.",
             closed.ablations.len(),
             if closed.ablations.len() == 1 { "" } else { "s" }
         );

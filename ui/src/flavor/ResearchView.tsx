@@ -199,18 +199,23 @@ function Headline({ metrics }: { metrics: MetricsPayload }) {
         <>
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <span className="text-2xl font-semibold text-text tabular-nums">{formatValue(best.score)}</span>
-            {change !== null && baseline && (
+            {change !== null && baseline && baseline.experimentId !== best.experimentId && (
               <span className="text-sm text-subtext tabular-nums">
                 <span className={change === 0 ? "" : (primary.direction === "max") === (change > 0) ? "text-accent-green" : "text-accent-red"}>
                   {formatSigned(change)}
                 </span>{" "}
                 over the baseline&apos;s {formatValue(baseline.score)}
-                {baseline.probeRuns > 0 && ` (mean of ${baseline.probeRuns} probe runs)`}
+                {baseline.probeRuns > 0
+                  ? ` (mean of ${baseline.probeRuns} probe runs)`
+                  : baseline.runs > 1 && ` (mean of ${baseline.runs} runs)`}
               </span>
             )}
           </div>
           <div className="text-sm text-subtext">
             Best: <span className="text-text">{best.experiment}</span>
+            {baseline && best.experimentId === baseline.experimentId
+              ? ", the baseline: nothing has beaten it yet"
+              : best.runs > 1 && ` (mean of ${best.runs} runs)`}
             {metrics.trials && (
               <>
                 {" · "}
@@ -393,7 +398,8 @@ function IdeaRow({ idea, tried, onAsk }: { idea: Idea; tried?: boolean; onAsk?: 
       <div className="text-xs text-muted tabular-nums">
         {tried && idea.outcome !== null ? (
           <>
-            measured {formatSigned(idea.outcome)} against a forecast of {forecastText(idea)}
+            measured {formatSigned(idea.outcome)}
+            {idea.forecast !== null && ` against a forecast of ${forecastText(idea)}`}
             {inside !== null && (inside ? " · inside its interval" : " · outside its interval")}
           </>
         ) : (

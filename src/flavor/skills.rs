@@ -30,7 +30,7 @@ pub(crate) const GRILL: AgentSkill = AgentSkill {
 
 pub(crate) const IMPROVE: AgentSkill = AgentSkill {
     name: "orx-improve",
-    description: "Run the forecast-and-verify improvement loop on this chat's scoped optimization: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on an optimization with a confirmed brief.",
+    description: "Run the forecast-and-verify improvement loop on this chat's scoped optimization: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and confirm each new best with a rerun. Use when asked to improve a model, dataset or process over several experiments, or to keep going on an optimization with a confirmed brief.",
     content: include_str!("../../agent-skills/orx-improve/SKILL.md"),
     resources: &[],
 };

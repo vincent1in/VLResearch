@@ -17,6 +17,9 @@ ORX_METRIC {"step": 1200, "val_ic": 0.031, "train_loss": 0.42}
 - `step` and `split` (`"train"`, `"val"`, `"test"`) are optional.
 - A run's score on a key is the last value it reported. If the code restores
   its best checkpoint, report that checkpoint's validation score last.
+- An experiment's score is the mean of its finished runs. Have each run draw
+  its own seed and print it, so that running an experiment again is a
+  replicate.
 - NaN and infinities are recorded as missing values, and orx tells the chat
   waiting on the run that a metric diverged.
 - In Python, save `orx skill metrics/assets/orx_metrics.py` next to the
@@ -34,17 +37,18 @@ Once per optimization, before comparing runs, name the key that defines
 chat's:
 
 ```sh
-orx metric primary <projectId> val_ic --maximize --noise-floor 0.002
-orx metric primary <projectId> val_loss --minimize
+orx metric primary <projectId> val_ic --maximize
+orx metric primary <projectId> val_loss --minimize --noise-floor 0.001
 ```
 
 - Pick a validation metric. Never select on a test split; report test numbers
   only for the final candidate. When runs report the key under several
   splits, orx asks you to choose one: `--split val`.
-- The noise floor is the smallest gain that counts as real. Use the spread
-  between reruns of the baseline with different seeds when it is known; a
-  gain below it does not make a new best. Setting the same key again keeps
-  its noise floor.
+- The noise floor is the smallest gain worth keeping, 0 unless set; a gain
+  no bigger does not make a new best. Set one only when smaller gains
+  wouldn't matter in practice. Seed noise is handled by replicates: each new
+  best is run again with a new seed, and the mean decides. Setting the same
+  key again keeps its noise floor.
 - `orx metric primary <projectId>` with no key shows the current setting and
   the keys runs have reported so far.
 
@@ -55,11 +59,12 @@ orx metric primary <projectId> val_loss --minimize
 - `orx metric runs <projectId>`: every run ranked on the primary metric, with
   the best, the baseline and probe runs marked. To rank by another key, give
   its direction: `--key val_loss --minimize`.
-- `orx metric best <projectId>`: the best finished run against the baseline,
-  and each experiment on the lineage between them (with its id) and its
-  change. The changes add up to the total gain. Probe runs never count as
-  the best; a baseline measured only with probe runs is scored by their mean.
+- `orx metric best <projectId>`: the best experiment, scored by the mean of
+  its runs, against the baseline, and each experiment on the lineage between
+  them (with its id) and its change. The changes add up to the total gain.
+  Probe runs never count as results; a baseline measured only with probe
+  runs is scored by their mean, and an attempt has to beat it.
 
 Each takes `--json`. Before claiming that one experiment beats another, check
-both scores with `orx metric runs` and say whether the gap exceeds the noise
-floor.
+both scores with `orx metric runs`, say how many runs each averages, and
+compare the gap with how far one run of the baseline moves between seeds.

@@ -19,7 +19,7 @@ const CLAUDE_WAIT_SECS: u64 = 100;
 const DEFAULT_WAIT_SECS: u64 = 1800;
 
 fn auto_wake_enabled() -> bool {
-    super::settings::switch_on(super::settings::current(AUTO_WAKE_ENV).as_deref())
+    super::settings::switch_on(super::settings::current(AUTO_WAKE_ENV).as_deref(), true)
 }
 
 fn in_claude_chat() -> bool {
@@ -33,7 +33,10 @@ pub(crate) fn register_on_submit(store: &Store, run_id: &str, chat_session_id: O
     let Some(session) = chat_session_id else {
         return;
     };
-    if !super::settings::switch_on(super::settings::value(store, AUTO_WAKE_ENV).as_deref()) {
+    if !super::settings::switch_on(
+        super::settings::value(store, AUTO_WAKE_ENV).as_deref(),
+        true,
+    ) {
         return;
     }
     let registered = store.get_chat_session(session).and_then(|chat| match chat {

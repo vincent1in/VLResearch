@@ -22,7 +22,7 @@ const CHECKLIST_ENV_DEFAULTS: &[(&str, &str)] = &[
 
 /// Adds [`CHECKLIST_ENV_DEFAULTS`] to a coding-agent process.
 pub(crate) fn apply_agent_env_defaults(cmd: &mut tokio::process::Command) {
-    if !super::settings::switch_on(super::settings::current(CHECKLIST_ENV).as_deref()) {
+    if !super::settings::switch_on(super::settings::current(CHECKLIST_ENV).as_deref(), true) {
         return;
     }
     super::set_env_defaults(cmd, CHECKLIST_ENV_DEFAULTS);

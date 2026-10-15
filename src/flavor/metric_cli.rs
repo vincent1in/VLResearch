@@ -264,7 +264,12 @@ fn runs(
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => b.created_at.cmp(&a.created_at),
     });
-    let best_id = standing.best.as_ref().map(|run| run.run_id.clone());
+    // The best is an experiment, scored by the mean of its runs: mark them all.
+    let best_experiment = standing
+        .best
+        .as_ref()
+        .map(|best| best.experiment_id.clone());
+    let best_id = standing.best.as_ref().map(|best| best.run_id.clone());
     let baseline_id = standing
         .baseline
         .as_ref()
@@ -274,6 +279,7 @@ fn runs(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "metric": metric,
+                "best": standing.best,
                 "bestRunId": best_id,
                 "baseline": standing.baseline,
                 "runs": runs,
@@ -289,7 +295,7 @@ fn runs(
     let rows: Vec<Vec<String>> = runs
         .iter()
         .map(|run| {
-            let mark = if Some(&run.run_id) == best_id.as_ref() {
+            let mark = if run.counts() && Some(&run.experiment_id) == best_experiment.as_ref() {
                 "best"
             } else if Some(&run.run_id) == baseline_id.as_ref() {
                 "baseline"
@@ -413,26 +419,31 @@ fn best(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Resul
         );
         return Ok(());
     };
-    let score = best.score.unwrap_or_default();
+    let score = best.score;
+    let source = match (best.probe, best.runs) {
+        (true, runs) => format!("mean of {runs} probe run{}", plural(runs)),
+        (false, 1) => format!("run {}", best.run_id),
+        (false, runs) => format!("mean of {runs} runs"),
+    };
     let best_text = format!(
-        "Best {} is {} (run {}, experiment {} [{}])",
+        "Best {} is {} ({source}, experiment {} [{}])",
         metric.key,
         metrics::format_value(Some(score)),
-        best.run_id,
         best.experiment,
         best.experiment_id
     );
     match &standing.baseline {
-        Some(baseline) if baseline.run_id.as_ref() == Some(&best.run_id) => {
-            println!("{best_text}, and it is the baseline.")
+        Some(baseline) if baseline.experiment_id == best.experiment_id => {
+            println!("{best_text}, and it is the baseline: nothing has beaten it yet.")
         }
         Some(baseline) => {
-            let source = match &baseline.run_id {
-                Some(run) => format!("run {run}"),
-                None => format!(
+            let source = match (&baseline.run_id, baseline.runs) {
+                (Some(run), 1) => format!("run {run}"),
+                (Some(_), runs) => format!("mean of {runs} runs"),
+                (None, _) => format!(
                     "mean of {} probe run{}",
                     baseline.probe_runs,
-                    if baseline.probe_runs == 1 { "" } else { "s" }
+                    plural(baseline.probe_runs)
                 ),
             };
             println!(
@@ -466,10 +477,11 @@ fn best(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Resul
                     row.push(step.idea.clone().unwrap_or_default());
                 }
                 row.extend([
-                    match (&step.run_id, step.probe_runs) {
-                        (Some(run), _) => run.clone(),
-                        (None, 0) => "—".to_string(),
-                        (None, probes) => format!("mean of {probes} probes"),
+                    match (&step.run_id, step.runs, step.probe_runs) {
+                        (Some(run), 1, _) => run.clone(),
+                        (Some(_), runs, _) => format!("mean of {runs} runs"),
+                        (None, _, 0) => "—".to_string(),
+                        (None, _, probes) => format!("mean of {probes} probes"),
                     },
                     step.score.map_or_else(
                         || "—".to_string(),
@@ -488,4 +500,12 @@ fn best(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Resul
         print_table(&headers, &rows);
     }
     Ok(())
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
