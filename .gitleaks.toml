@@ -1,0 +1,18 @@
+# VLResearch secret-scan rules: gitleaks' defaults, minus generated bundles,
+# binary assets, lockfiles and known test fixtures. Used by the pre-commit hook
+# (flavor/scripts/install-hooks.sh) and by CI (flavor/scripts/secret-scan.sh).
+title = "VLResearch"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated or binary files and known non-secret fixtures"
+paths = [
+  '''(^|/)ui/dist/''',
+  '''\.(bcmap|woff2?|ttf|otf|png|jpe?g|gif|svg|ico|icns|pt|pkl|pdf)$''',
+  '''(^|/)(Cargo\.lock|pnpm-lock\.yaml)$''',
+]
+regexes = [
+  '''or304-fixture-secret-never-print-me''',
+]

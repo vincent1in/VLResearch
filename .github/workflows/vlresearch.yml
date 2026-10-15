@@ -1,0 +1,36 @@
+# VLResearch's own checks, alongside upstream's ci.yml: no secrets in what
+# this repository adds, and no new network call sites outside the egress gate.
+name: VLResearch
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream release tags
+        run: git fetch --quiet --tags https://github.com/alphaXiv/OpenResearch.git
+
+      - name: Scan files VLResearch added or changed
+        run: flavor/scripts/secret-scan.sh
+
+  egress:
+    name: egress audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No new network call sites outside the egress gate
+        run: python3 flavor/scripts/egress_audit.py

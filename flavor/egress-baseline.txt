@@ -1,0 +1,15 @@
+# Accepted network call sites outside the egress gate; see flavor/scripts/egress_audit.py.
+# label<TAB>path<TAB>count
+network command	src/jobs/kubernetes.rs	3
+network command	src/local/github.rs	1
+piped installer	src/commands/up/harness_setup.rs	5
+piped installer	src/commands/up_remote.rs	1
+piped installer	src/local/bash.rs	1
+piped installer	src/local/demo.rs	2
+piped installer	src/local/harness/antigravity.rs	2
+piped installer	src/local/harness/cursor.rs	1
+piped installer	src/local/harness/opencode.rs	2
+piped installer	src/local/opencode.rs	1
+piped installer	src/updates.rs	2
+raw socket	src/commands/app.rs	1
+websocket client	src/local/overleaf_live.rs	1
