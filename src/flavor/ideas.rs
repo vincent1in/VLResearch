@@ -691,6 +691,32 @@ fn measured_change(
     })
 }
 
+/// The ablation check queued for each lineage step, by the step's experiment.
+pub(crate) fn ablations_by_step(
+    store: &Store,
+    project_id: &str,
+) -> Result<std::collections::HashMap<String, Idea>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT a.step_experiment_id, a.idea_id FROM vlr_ablations a
+         JOIN vlr_ideas i ON i.id = a.idea_id WHERE i.project_id = ?1",
+    )?;
+    let pairs = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ideas: std::collections::HashMap<String, Idea> = list(store, project_id)?
+        .into_iter()
+        .map(|idea| (idea.id.clone(), idea))
+        .collect();
+    Ok(pairs
+        .into_iter()
+        .filter_map(|(step, idea)| Some((step, ideas.get(&idea)?.clone())))
+        .collect())
+}
+
 /// The idea titles behind experiments, for labeling the lineage path.
 pub(crate) fn titles_by_experiment(
     store: &Store,
@@ -1441,6 +1467,11 @@ mod tests {
         assert_eq!(checked.idea.status, Status::Kept);
         assert_eq!(checked.idea.status_label(), "confirmed");
         assert!(checked.ablations.is_empty());
+        // The dashboard finds each step's check by the step's experiment.
+        let by_step = ablations_by_step(&store, "p").unwrap();
+        assert_eq!(by_step.len(), 2);
+        assert_eq!(by_step["wide"].status_label(), "confirmed");
+        assert_eq!(by_step["lags"].status, Status::Open);
 
         // A later best doesn't ablate the same steps again.
         experiment(&store, "better", Some("best"));

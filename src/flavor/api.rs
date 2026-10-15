@@ -33,7 +33,8 @@ where
         .route("/api/vlresearch/findings/{id}", get(finding_detail))
 }
 
-/// The project's findings with their evidence counts, for the ledger table.
+/// The project's findings with their evidence counts and latest verdict, for
+/// the ledger table.
 async fn project_findings(Path(project_id): Path<String>) -> ApiResult {
     let body = tokio::task::spawn_blocking(move || -> crate::error::Result<Option<Value>> {
         let store = Store::open()?;
@@ -43,10 +44,12 @@ async fn project_findings(Path(project_id): Path<String>) -> ApiResult {
         let mut rows = Vec::new();
         for finding in super::findings::list(&store, &project.id)? {
             let (supporting, against) = super::findings::evidence_counts(&store, &finding.id)?;
+            let latest = super::findings::assessments(&store, &finding.id)?.pop();
             rows.push(json!({
                 "finding": finding,
                 "supporting": supporting,
                 "against": against,
+                "latest": latest,
             }));
         }
         Ok(Some(json!({ "findings": rows })))
@@ -131,11 +134,26 @@ async fn project_ideas(Path(project_id): Path<String>) -> ApiResult {
         let ideas = super::ideas::list(&store, &project.id)?;
         let direction = super::metrics::primary(&store, &project.id)?
             .map_or(super::metrics::Direction::Max, |metric| metric.direction);
+        // Each idea also carries its status as people read it ("resolved",
+        // "confirmed"), so the dashboard doesn't restate the rule.
+        let labeled = |idea: &super::ideas::Idea| -> crate::error::Result<Value> {
+            let mut value = serde_json::to_value(idea)?;
+            value["statusLabel"] = json!(idea.status_label());
+            Ok(value)
+        };
+        let next = match super::ideas::next(&store, &project.id)? {
+            Some(pick) => json!({
+                "idea": labeled(&pick.idea)?,
+                "reason": pick.reason,
+                "score": pick.score,
+            }),
+            None => Value::Null,
+        };
         Ok(Some(json!({
-            "next": super::ideas::next(&store, &project.id)?,
+            "next": next,
             "calibration": super::ideas::calibration(&ideas),
             "byClass": super::ideas::scoreboard(&ideas, direction),
-            "ideas": ideas,
+            "ideas": ideas.iter().map(labeled).collect::<crate::error::Result<Vec<_>>>()?,
         })))
     })
     .await
@@ -175,13 +193,27 @@ async fn project_metrics(Path(project_id): Path<String>) -> ApiResult {
         let body = match &primary {
             Some(metric) => {
                 let (standing, path, runs) = super::metrics::standing(&store, &project.id, metric)?;
+                // Each step carries its ablation check, when one was queued.
+                let ablations = super::ideas::ablations_by_step(&store, &project.id)?;
+                let mut steps = Vec::with_capacity(path.len());
+                for step in &path {
+                    let mut value = serde_json::to_value(step)?;
+                    if let Some(check) = ablations.get(&step.experiment_id) {
+                        value["ablation"] = json!({
+                            "status": check.status_label(),
+                            "forecast": check.forecast,
+                            "outcome": check.outcome,
+                        });
+                    }
+                    steps.push(value);
+                }
                 json!({
                     "primary": metric,
                     "keys": super::metrics::project_keys(&store, &project.id)?,
                     "best": standing.best,
                     "baseline": standing.baseline,
                     "history": standing.history,
-                    "path": path,
+                    "path": steps,
                     "trials": super::ideas::trials(&store, &project.id, &runs)?,
                     "runs": runs,
                 })
