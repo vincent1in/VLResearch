@@ -14,7 +14,7 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
 - **Long chats keep going.** When a chat's context window is 80% full, orx compacts it as soon as the turn that filled it ends, so a long research loop doesn't run out of room in the middle of a task. The metrics, ideas, brief and findings live outside the chat, so compacting loses none of them.
 
-In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows an optimization's running best against the baseline, what moved the score, its idea queue and its brief with its budget, then the project's findings; a switcher moves between a project's optimizations, starting with the open chat's, and New optimization starts another from a form. Its Side chat button, and the ask buttons beside the next idea, each step that moved the score, each idea and each finding, open a side chat off the chat that runs the loop, so you can ask about the work without stopping it.
+In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows an optimization's running best against the baseline, what moved the score, its idea queue and its brief with its budget, then the project's findings; a switcher moves between a project's optimizations, starting with the open chat's, and New optimization starts another from a form. Its Side chat button, and the ask buttons beside the next idea, each step that moved the score, each idea and each finding, open a side chat off the chat that runs the loop, so you can ask about the work without stopping it. The Settings page's Research section sets how the loop runs on this machine, without commands or variables (see [Settings](#settings)).
 
 ## Scoring runs
 
@@ -50,7 +50,7 @@ orx idea calibration <projectId>        # how well forecasts have held up, and w
 
 Forecasts are changes in the primary metric, in its units and sign. Once five ideas have been tested, orx also reads each new forecast in the light of past ones: shifted by the mean error, with its interval stretched until 80% of past outcomes would have landed inside. Agents follow the same steps through the `orx-ideas` skill.
 
-The per-step gains in `orx metric best` assume the steps add up. To check that, when a kept idea makes a new best, orx queues up to two ablation ideas for the biggest earlier steps behind it: take that step's change back out of the best and see whether the metric loses what the step gained. A check is confirmed when the loss lands in its forecast interval, and refuted when it is far smaller or larger: then the steps interact, and the per-step split is off. `orx idea next` takes these checks, and replicates, before new ideas (`VLR_AUTO_ABLATE=0` stops the automatic ablations).
+The per-step gains in `orx metric best` assume the steps add up. To check that, when a kept idea makes a new best, orx queues up to two ablation ideas for the biggest earlier steps behind it: take that step's change back out of the best and see whether the metric loses what the step gained. A check is confirmed when the loss lands in its forecast interval, and refuted when it is far smaller or larger: then the steps interact, and the per-step split is off. `orx idea next` takes these checks, and replicates, before new ideas. The automatic ablations can be turned off in Settings.
 
 ## Scoping and the improvement loop
 
@@ -82,7 +82,7 @@ The `orx-improve` skill then runs the loop: pick the next idea, check its foreca
 
 ## Long chats
 
-When a chat's context window is 80% full (`VLR_AUTO_COMPACT`), orx compacts the chat as soon as the turn that filled it ends and nothing else is waiting to run. It uses the agent's own compaction where there is one (Claude Code, Codex), and otherwise a summary that the next turn starts from. It shows in the chat like a manual compaction, Stop cancels it, and messages you send meanwhile run after it.
+When a chat's context window is 80% full (the share is set in Settings), orx compacts the chat as soon as the turn that filled it ends and nothing else is waiting to run. It uses the agent's own compaction where there is one (Claude Code, Codex), and otherwise a summary that the next turn starts from. It shows in the chat like a manual compaction, Stop cancels it, and messages you send meanwhile run after it.
 
 orx has to know how full the window is. Claude Code and Codex report it. OpenCode reports only how many tokens are in use, so orx knows its window for a local model (the one you entered when connecting it) but not for a cloud model; OpenResearch turns OpenCode's own compaction off, so this is the only compaction those local-model chats get. Cursor and Antigravity report no usage, and aren't compacted automatically.
 
@@ -117,7 +117,20 @@ orx also can't police what the agent runs in its own shell. To make the policy h
 
 ## Settings
 
-All optional. Set them in the environment `orx up` starts from.
+All optional. The dashboard's Settings page has a Research section for how the research loop runs on this machine, for every project; the Research view's Settings button opens it. Each setting is also a variable, and one set in the environment `orx up` starts from (or on the Environment page) wins over the page, which says so. Settings change only from the dashboard itself: the same request from anything else, such as an agent's `curl`, is refused. So is confirming a brief, which an agent does with `orx brief confirm` once you agree in the chat.
+
+| In Settings | Variable | Default | Effect |
+| --- | --- | --- | --- |
+| Compact chats automatically | `VLR_AUTO_COMPACT` | 80% | How full a chat's context window gets before orx compacts it, from 20% to 95%. As a variable, a fraction (`0.8`) or a percentage (`80`, `80%`); `0` or `off` turns autocompaction off |
+| Flag stalled runs | `VLR_STALL_MINUTES` | 30 | Minutes a running job may print nothing before its chat is told; `0` turns stall alerts off |
+| Wake the chat when its runs finish | `VLR_AUTO_WAKE` | on | Off keeps OpenResearch's opt-in wake-ups |
+| Check each new best with ablations | `VLR_AUTO_ABLATE` | on | Off stops orx from queueing ablation checks when a kept idea makes a new best |
+| Hold runs to their brief | `VLR_SCOPE_GATE` | `scoped` | `scoped` holds each optimization's runs to its brief; `strict` also refuses runs outside any optimization; `off` turns the gate off |
+| Show the agent's checklist | `VLR_AGENT_CHECKLIST` | on | Off leaves Claude Code's task tools as Claude Code configures them |
+
+As variables, switches take `on` or `off` (also `1`/`0`, `true`/`false`, `yes`/`no`).
+
+The network policy changes only in the environment `orx up` starts from, so that letting orx reach more of the internet is a deliberate step; the Settings page shows what is in effect.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -125,14 +138,8 @@ All optional. Set them in the environment `orx up` starts from.
 | `VLR_GIT_PROTOCOLS` | `file` | Git transports orx may use; `file:ssh` adds an internal git server over SSH |
 | `VLR_ALLOW_GITHUB` | off | Turns GitHub integration (repo creation, branch pushes) back on |
 | `VLR_ALLOW_INSTALLERS` | off | Lets the dashboard install or update coding agents |
-| `VLR_AUTO_WAKE` | on | `0` keeps OpenResearch's opt-in wake-ups |
 | `VLR_AGENT_ENV_DEFAULTS` | on | `0` stops orx adding the no-telemetry settings to agent processes |
-| `VLR_AGENT_CHECKLIST` | on | `0` leaves Claude Code's task tools as Claude Code configures them |
-| `VLR_STALL_MINUTES` | `30` | Minutes a running job may print nothing before its chat is told; `0` turns stall alerts off |
-| `VLR_SCOPE_GATE` | on | Holds each optimization's runs to its brief; `strict` also refuses runs outside any optimization; `0` turns the gate off |
 | `VLR_PROBE` | off | Set to `1` on a single launch to run it as a probe |
-| `VLR_AUTO_ABLATE` | on | `0` stops orx from queueing ablation checks when a kept idea makes a new best |
-| `VLR_AUTO_COMPACT` | `0.8` | How full a chat's context window gets before orx compacts it, as a fraction (`0.8`) or a percentage (`80`, `80%`); `0` turns autocompaction off |
 
 ## Keys and secrets
 

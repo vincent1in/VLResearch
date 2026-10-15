@@ -65,10 +65,15 @@ impl AlertKind {
     }
 }
 
-/// The stall window in minutes (`VLR_STALL_MINUTES`, default 30; 0 is off).
-pub(crate) fn stall_minutes() -> i64 {
-    std::env::var(STALL_MINUTES_ENV)
-        .ok()
+/// The stall window in minutes (`VLR_STALL_MINUTES` or the Settings page,
+/// default 30; 0 is off).
+pub(crate) fn stall_minutes(store: &Store) -> i64 {
+    parse_minutes(super::settings::value(store, STALL_MINUTES_ENV).as_deref())
+}
+
+/// Whole minutes, at least 0; anything else, or unset, gives the default.
+pub(crate) fn parse_minutes(value: Option<&str>) -> i64 {
+    value
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|minutes| *minutes >= 0)
         .unwrap_or(DEFAULT_STALL_MINUTES)
@@ -226,7 +231,7 @@ fn unmonitored(run: &StoredRun) -> bool {
 
 /// Updates the alerts for the live runs these wake-ups wait on.
 pub(crate) fn scan(store: &Store, wakeups: &[RunWakeup], now: i64) -> Result<()> {
-    let minutes = stall_minutes();
+    let minutes = stall_minutes(store);
     if minutes == 0 {
         return Ok(());
     }

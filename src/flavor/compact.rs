@@ -37,16 +37,16 @@ const MIN_TURNS_BETWEEN: i64 = 3;
 /// How long a chat is left alone after its compaction failed or was stopped.
 const RETRY_AFTER_MS: i64 = 30 * 60_000;
 
-/// The threshold from `VLR_AUTO_COMPACT`, or `None` when autocompaction is
-/// off.
-pub(crate) fn threshold() -> Option<f64> {
-    parse_threshold(std::env::var(AUTO_COMPACT_ENV).ok().as_deref())
+/// The threshold from `VLR_AUTO_COMPACT` or the Settings page, or `None` when
+/// autocompaction is off.
+pub(crate) fn threshold(store: &Store) -> Option<f64> {
+    parse_threshold(super::settings::value(store, AUTO_COMPACT_ENV).as_deref())
 }
 
 /// A fraction (`0.8`) or a percentage (`80`, `80%`) of the context window;
 /// `0` or `off` turns autocompaction off. Unset, `on`, or anything else gives
 /// the default, 80%.
-fn parse_threshold(value: Option<&str>) -> Option<f64> {
+pub(crate) fn parse_threshold(value: Option<&str>) -> Option<f64> {
     let value = value.unwrap_or_default().trim().to_ascii_lowercase();
     if matches!(value.as_str(), "off" | "false" | "no") {
         return None;
@@ -71,11 +71,12 @@ fn parse_threshold(value: Option<&str>) -> Option<f64> {
 /// Compacts the chat if its context is at least the threshold full, it is
 /// idle, and no card is waiting for the user's answer.
 pub(crate) async fn after_turn(host: &Arc<ChatHost>, session_id: &str) {
-    let Some(threshold) = threshold() else {
-        return;
-    };
     let now = crate::store::now_ms();
-    let due = match Store::open().and_then(|store| due(&store, session_id, threshold, now)) {
+    let checked = Store::open().and_then(|store| match threshold(&store) {
+        Some(threshold) => due(&store, session_id, threshold, now),
+        None => Ok(None),
+    });
+    let due = match checked {
         Ok(Some(due)) => due,
         Ok(None) => return,
         Err(err) => {

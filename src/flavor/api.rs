@@ -2,10 +2,13 @@
 //! behind the same loopback guard and remote-auth layers as upstream's routes.
 //!
 //! A project lists its optimizations; each optimization has its own brief,
-//! metrics and ideas. Findings are the project's.
+//! metrics and ideas. Findings are the project's. The research settings are
+//! the machine's.
+
+use std::collections::BTreeMap;
 
 use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -55,7 +58,38 @@ where
             get(project_findings),
         )
         .route("/api/vlresearch/findings/{id}", get(finding_detail))
+        .route(
+            "/api/vlresearch/settings",
+            get(research_settings).put(save_settings),
+        )
 }
+
+/// Changing settings and confirming briefs are the person's to do, so these
+/// requests are taken only from the dashboard page itself, which the browser
+/// marks as same-origin. A coding agent's `curl` gets a refusal saying where
+/// the person does it.
+fn from_dashboard(headers: &HeaderMap, refusal: &str) -> Result<(), (StatusCode, String)> {
+    let get = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let same_site =
+        get("sec-fetch-site").is_some_and(|site| site.eq_ignore_ascii_case("same-origin"));
+    let same_origin = match (get(header::ORIGIN.as_str()), get(header::HOST.as_str())) {
+        (Some(origin), Some(host)) => {
+            origin == format!("http://{host}") || origin == format!("https://{host}")
+        }
+        _ => false,
+    };
+    if same_site || same_origin {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, refusal.to_string()))
+    }
+}
+
+const SETTINGS_REFUSED: &str =
+    "Research settings change on the dashboard's Settings page, by the person.";
+const CONFIRM_REFUSED: &str =
+    "The person confirms a brief on the dashboard's Research view. Once they agree in the chat, \
+     confirm it with `orx brief confirm`.";
 
 /// Runs a read on a blocking thread: 404 with `missing` when it finds nothing.
 async fn read(
@@ -177,7 +211,8 @@ async fn save_brief(
 }
 
 /// The user confirms the brief from the Research view.
-async fn confirm_brief(Path(optimization_id): Path<String>) -> ApiResult {
+async fn confirm_brief(headers: HeaderMap, Path(optimization_id): Path<String>) -> ApiResult {
+    from_dashboard(&headers, CONFIRM_REFUSED)?;
     write(move |store| {
         let Some((brief, project)) = load(store, &optimization_id)? else {
             return Ok(None);
@@ -384,6 +419,65 @@ async fn finding_detail(Path(finding_id): Path<String>) -> ApiResult {
     .await
 }
 
+/// The research settings with where each value comes from, and the network
+/// policy, for the Settings page.
+async fn research_settings() -> ApiResult {
+    read("settings not found", |store| {
+        Ok(Some(serde_json::to_value(super::settings::report(store)?)?))
+    })
+    .await
+}
+
+/// Saves settings from the Settings page: each key with its new value, or
+/// `null` to return it to its default.
+async fn save_settings(
+    headers: HeaderMap,
+    Json(changes): Json<BTreeMap<String, Option<String>>>,
+) -> ApiResult {
+    from_dashboard(&headers, SETTINGS_REFUSED)?;
+    write(move |store| {
+        super::settings::save(store, &changes)?;
+        Ok(Some(serde_json::to_value(super::settings::report(store)?)?))
+    })
+    .await
+}
+
 fn internal(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn only_the_dashboard_page_may_change_settings_or_confirm() {
+        let host = ("host", "127.0.0.1:4791");
+        for allowed in [
+            headers(&[host, ("sec-fetch-site", "same-origin")]),
+            headers(&[host, ("origin", "http://127.0.0.1:4791")]),
+            headers(&[host, ("origin", "https://127.0.0.1:4791")]),
+        ] {
+            assert!(from_dashboard(&allowed, "no").is_ok(), "{allowed:?}");
+        }
+        for refused in [
+            headers(&[host]),
+            headers(&[host, ("sec-fetch-site", "none")]),
+            headers(&[host, ("sec-fetch-site", "cross-site")]),
+            headers(&[host, ("origin", "http://localhost:5173")]),
+            headers(&[("origin", "http://127.0.0.1:4791")]),
+        ] {
+            let (status, message) = from_dashboard(&refused, "refused here").unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{refused:?}");
+            assert_eq!(message, "refused here");
+        }
+    }
 }

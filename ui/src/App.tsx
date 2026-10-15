@@ -2004,6 +2004,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       activeSessionId={activeSessionId}
                       onSideChat={(sessionId, question) => void openResearchSideChat(sessionId, question)}
                       onOpenChat={(sessionId) => onActiveSessionChange(sessionId)}
+                      onOpenSettings={() => selectMainView("research")}
                     />
                   ) : view === "tree" ? (
                     activeProject && (

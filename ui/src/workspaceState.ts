@@ -40,7 +40,8 @@ export interface GlobalWorkspace {
   experimentsView: "tree" | "table";
 }
 
-export const settingsTabs = ["settings", "harnesses", "projects", "compute", "instances", "environment", "git", "storage"] as const;
+// VLResearch: "research", the Research settings section.
+export const settingsTabs = ["settings", "harnesses", "projects", "compute", "instances", "environment", "git", "storage", "research"] as const;
 export type SettingsSection = typeof settingsTabs[number];
 export const isSettingsSection = (value: unknown): value is SettingsSection =>
   settingsTabs.some((tab) => tab === value);

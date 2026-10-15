@@ -5,7 +5,7 @@
 // project's findings ledger. The user starts optimizations here (the setup
 // form) and confirms their briefs here; the agent and `orx` write the rest.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessageSquare, MessagesSquare, Play, Plus, Target, TriangleAlert } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessageSquare, MessagesSquare, Play, Plus, Settings2, Target, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { sendChatMessage } from "../api";
 import { Button, IconButton } from "../components/ui";
@@ -558,7 +558,16 @@ function ConfirmBar({ data, onEdit }: { data: BriefPayload; onEdit: () => void }
   );
 }
 
-function StartCard({ onStart }: { onStart: () => void }) {
+function SettingsButton({ onOpen }: { onOpen?: () => void }) {
+  if (!onOpen) return null;
+  return (
+    <Button variant="ghost" size="small" title="Autocompaction, stall alerts, wake-ups, the brief gate and more" onClick={onOpen}>
+      <Settings2 size={13} /> Settings
+    </Button>
+  );
+}
+
+function StartCard({ onStart, onOpenSettings }: { onStart: () => void; onOpenSettings?: () => void }) {
   return (
     <div className="flex flex-col gap-2 mb-5 py-3.5 px-4 rounded-md border border-border bg-surface">
       <div className="flex items-center gap-2 text-sm font-semibold text-text">
@@ -570,10 +579,11 @@ function StartCard({ onStart }: { onStart: () => void }) {
         baseline, asks about anything missing, and waits for you to confirm before it runs the improvement loop. Each
         optimization runs in its own chat, so you can run several at once, on the whole system or on parts of it.
       </p>
-      <div>
+      <div className="flex flex-wrap items-center gap-2">
         <Button variant="primary" size="small" onClick={onStart}>
           Set up research
         </Button>
+        <SettingsButton onOpen={onOpenSettings} />
       </div>
     </div>
   );
@@ -724,6 +734,7 @@ function OptimizationBar({
   onSelect,
   onNew,
   onOpenChat,
+  onOpenSettings,
 }: {
   list: readonly BriefPayload[];
   selectedId: string | null;
@@ -731,6 +742,7 @@ function OptimizationBar({
   onSelect: (id: string) => void;
   onNew: () => void;
   onOpenChat?: (sessionId: string) => void;
+  onOpenSettings?: () => void;
 }) {
   const selected = list.find((entry) => entry.brief?.id === selectedId);
   const chat = selected?.brief?.chatSessionId ?? null;
@@ -761,6 +773,7 @@ function OptimizationBar({
       <Button variant="ghost" size="small" title="Start another optimization in its own chat" onClick={onNew}>
         <Plus size={13} /> New optimization
       </Button>
+      <SettingsButton onOpen={onOpenSettings} />
     </div>
   );
 }
@@ -770,6 +783,7 @@ export function ResearchView({
   activeSessionId = null,
   onSideChat,
   onOpenChat,
+  onOpenSettings,
 }: {
   projectId: string;
   /** The chat open beside the view; its optimization is shown first. */
@@ -778,6 +792,8 @@ export function ResearchView({
   onSideChat?: (parentSessionId: string, question: string) => void;
   /** Brings a chat to the front. */
   onOpenChat?: (sessionId: string) => void;
+  /** Opens the Research section of the Settings page. */
+  onOpenSettings?: () => void;
 }) {
   const list = useProjectData(projectId, "vlresearchOptimizations", "optimizations", parseOptimizations);
   const findings = useProjectData(projectId, "vlresearchFindings", "findings", parseFindings);
@@ -824,7 +840,7 @@ export function ResearchView({
     <div className="vlr-research absolute inset-0 overflow-y-auto bg-background">
       <div className="w-full max-w-230 mx-auto pt-5 px-5 pb-10">
         {!list.data && <Loading error={list.error} />}
-        {list.data && optimizations.length === 0 && <StartCard onStart={() => setSetup("start")} />}
+        {list.data && optimizations.length === 0 && <StartCard onStart={() => setSetup("start")} onOpenSettings={onOpenSettings} />}
         {optimizations.length > 0 && (
           <OptimizationBar
             list={optimizations}
@@ -833,6 +849,7 @@ export function ResearchView({
             onSelect={setPicked}
             onNew={() => setSetup("start")}
             onOpenChat={onOpenChat}
+            onOpenSettings={onOpenSettings}
           />
         )}
         {unconfirmed && (

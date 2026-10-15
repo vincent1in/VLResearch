@@ -43,12 +43,15 @@ fn forget_failures(session_id: &str) {
 /// the user straight away either way.
 pub(super) async fn process_stall_alerts(chat: &Arc<ChatHost>) {
     let now = crate::store::now_ms();
-    if stall::stall_minutes() == 0 || !stall::due(now) {
+    if !stall::due(now) {
         return;
     }
     let Ok(store) = Store::open() else {
         return;
     };
+    if stall::stall_minutes(&store) == 0 {
+        return;
+    }
     if let Err(err) = deliver_stall_alerts(chat, store, now).await {
         eprintln!("vlresearch: stall check: {err}");
     }
@@ -76,7 +79,7 @@ async fn deliver_stall_alerts(
         let Some(guard) = TurnGuard::claim_hidden(chat, &session_id).await else {
             continue;
         };
-        let text = stall::agent_text(&pending, stall::stall_minutes());
+        let text = stall::agent_text(&pending, stall::stall_minutes(&store));
         let delivered = match chat.send_hidden_message(&session_id, text, guard).await {
             Ok(TurnSubmission::Started(_)) => {
                 forget_failures(&session_id);

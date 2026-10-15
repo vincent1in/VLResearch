@@ -19,6 +19,7 @@ pub(crate) mod ideas;
 pub(crate) mod metric_cli;
 pub(crate) mod metrics;
 pub(crate) mod scope;
+pub(crate) mod settings;
 pub(crate) mod skills;
 pub(crate) mod stall;
 pub(crate) mod start;

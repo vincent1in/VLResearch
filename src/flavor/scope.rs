@@ -31,6 +31,7 @@ use crate::local::model::{LocalExperiment, LocalProject};
 use crate::store::Store;
 
 /// `strict` also refuses runs outside any optimization; `0` turns the gate off.
+/// Also on the Settings page.
 pub(crate) const GATE_ENV: &str = "VLR_SCOPE_GATE";
 /// Set to `1` on a launch to mark it a probe.
 pub(crate) const PROBE_ENV: &str = "VLR_PROBE";
@@ -40,7 +41,7 @@ const PROBE_REQUEST_TTL_MS: i64 = 120_000;
 const MIGRATED_KEY: &str = "optimizations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateMode {
+pub(crate) enum GateMode {
     Off,
     /// Enforce briefs on the runs of optimizations.
     Scoped,
@@ -48,8 +49,23 @@ enum GateMode {
     Strict,
 }
 
-fn gate_mode() -> GateMode {
-    match std::env::var(GATE_ENV)
+impl GateMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GateMode::Off => "off",
+            GateMode::Scoped => "scoped",
+            GateMode::Strict => "strict",
+        }
+    }
+}
+
+fn gate_mode(store: &Store) -> GateMode {
+    parse_gate(super::settings::value(store, GATE_ENV).as_deref())
+}
+
+/// `strict`, or `0`/`off`; anything else, or unset, is `scoped`.
+pub(crate) fn parse_gate(value: Option<&str>) -> GateMode {
+    match value
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -621,7 +637,7 @@ fn save(store: &Store, brief: &Brief) -> Result<()> {
 /// limits, a budget, a stop rule and ideas to start from, agreed with the
 /// user. Even where launches are allowed without one. Off with the gate.
 pub(crate) fn require_confirmed(store: &Store, brief: &Brief) -> Result<()> {
-    if gate_mode() == GateMode::Off || brief.confirmed_at.is_some() {
+    if gate_mode(store) == GateMode::Off || brief.confirmed_at.is_some() {
         return Ok(());
     }
     let missing = missing(store, brief)?;
@@ -914,7 +930,7 @@ pub(crate) fn before_launch(experiment_id: &str) -> LaunchRequest {
         }
         return request;
     }
-    if gate_mode() != GateMode::Scoped {
+    if gate_mode(&store) != GateMode::Scoped {
         return request;
     }
     let Ok(Some(experiment)) = store.get_local_experiment(experiment_id) else {
@@ -972,7 +988,7 @@ pub(crate) fn check_launch(
         optimization_id: brief.as_ref().map(|brief| brief.id.clone()),
         check_snapshot: false,
     };
-    let mode = gate_mode();
+    let mode = gate_mode(store);
     if probe || mode == GateMode::Off {
         return Ok(launch);
     }

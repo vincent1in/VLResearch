@@ -1,5 +1,6 @@
 // VLResearch: what the Research view shows, worked out from the
-// /api/vlresearch/projects/{id}/* payloads. Kept free of React and the message
+// /api/vlresearch/projects/{id}/* and /api/vlresearch/optimizations/{id}/*
+// payloads. Kept free of React and the message
 // catalog so node's test runner can import it directly
 // (ui/tests/vlresearchResearch.test.mjs). The view shows idea titles, never
 // idea ids.
@@ -871,7 +872,7 @@ const value = (parsed: Parsed) => (parsed.ok ? parsed.value : null);
 const textOrNull = (text: string) => (text.trim() ? text.trim() : null);
 const paths = (text: string) => text.split(/[\n,]/).map((path) => path.trim()).filter(Boolean);
 
-/** The body for PUT /api/vlresearch/projects/{id}/brief. */
+/** The body for PUT /api/vlresearch/optimizations/{id}/brief, or POST .../projects/{id}/optimizations. */
 export function briefPayload(draft: SetupDraft) {
   return {
     objective: textOrNull(draft.objective),
@@ -896,13 +897,13 @@ export function briefPayload(draft: SetupDraft) {
   };
 }
 
-/** The body for POST /api/vlresearch/projects/{id}/ideas, or null for a blank row. */
+/** The body for POST /api/vlresearch/optimizations/{id}/ideas, or null for a blank row. */
 export function ideaPayload(idea: SetupIdea) {
   const title = idea.title.trim();
   return title ? { title, forecast: value(parseNumber(idea.forecast, () => true)) } : null;
 }
 
-/** The bodies for POST /api/vlresearch/projects/{id}/ideas, one per typed idea. */
+/** The bodies for POST /api/vlresearch/optimizations/{id}/ideas, one per typed idea. */
 export function ideaPayloads(draft: SetupDraft) {
   return draft.ideas.flatMap((idea) => {
     const body = ideaPayload(idea);

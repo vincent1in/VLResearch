@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use crate::local::chat::TurnCtx;
 
-/// Set to `0` to leave Claude Code's task tools as they come.
+/// Set to `0` (or turn it off on the Settings page) to leave Claude Code's
+/// task tools as they come.
 pub(crate) const CHECKLIST_ENV: &str = "VLR_AGENT_CHECKLIST";
 
 /// Claude Code (2.1) gives its task-tracking tools only to some models, and
@@ -21,7 +22,7 @@ const CHECKLIST_ENV_DEFAULTS: &[(&str, &str)] = &[
 
 /// Adds [`CHECKLIST_ENV_DEFAULTS`] to a coding-agent process.
 pub(crate) fn apply_agent_env_defaults(cmd: &mut tokio::process::Command) {
-    if std::env::var(CHECKLIST_ENV).is_ok_and(|value| value.trim() == "0") {
+    if !super::settings::switch_on(super::settings::current(CHECKLIST_ENV).as_deref()) {
         return;
     }
     super::set_env_defaults(cmd, CHECKLIST_ENV_DEFAULTS);

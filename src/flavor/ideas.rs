@@ -629,7 +629,7 @@ pub(crate) fn close(
             if idea.status == Status::Kept
                 && !idea.kind.is_blocker()
                 && !idea.is_check()
-                && auto_ablate() =>
+                && auto_ablate(store) =>
         {
             // The close has landed; a failure here only costs the checks.
             super::scope::require(store, &idea.optimization_id)
@@ -644,14 +644,14 @@ pub(crate) fn close(
     Ok(Closed { idea, ablations })
 }
 
-/// Turns the automatic ablation checks on or off (`VLR_AUTO_ABLATE`, on
-/// unless `0`).
+/// Turns the automatic ablation checks on or off (`VLR_AUTO_ABLATE` or the
+/// Settings page; on unless `0`).
 pub(crate) const AUTO_ABLATE_ENV: &str = "VLR_AUTO_ABLATE";
 /// Ablation checks queued for one new best at most.
 const ABLATIONS_PER_BEST: usize = 2;
 
-fn auto_ablate() -> bool {
-    std::env::var(AUTO_ABLATE_ENV).map_or(true, |value| value.trim() != "0")
+fn auto_ablate(store: &Store) -> bool {
+    super::settings::switch_on(super::settings::value(store, AUTO_ABLATE_ENV).as_deref())
 }
 
 /// When `experiment_id` holds the optimization's best, queues a leave-one-out check

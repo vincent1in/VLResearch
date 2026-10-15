@@ -9,7 +9,8 @@
 use crate::error::{anyhow, Result};
 use crate::store::Store;
 
-/// Set to `0` to keep upstream's opt-in wake-ups.
+/// Set to `0` (or turn it off on the Settings page) to keep upstream's opt-in
+/// wake-ups.
 pub(crate) const AUTO_WAKE_ENV: &str = "VLR_AUTO_WAKE";
 
 /// Under Claude Code: return before its default 120 s Bash timeout.
@@ -18,7 +19,7 @@ const CLAUDE_WAIT_SECS: u64 = 100;
 const DEFAULT_WAIT_SECS: u64 = 1800;
 
 fn auto_wake_enabled() -> bool {
-    std::env::var(AUTO_WAKE_ENV).map_or(true, |value| value.trim() != "0")
+    super::settings::switch_on(super::settings::current(AUTO_WAKE_ENV).as_deref())
 }
 
 fn in_claude_chat() -> bool {
@@ -32,7 +33,7 @@ pub(crate) fn register_on_submit(store: &Store, run_id: &str, chat_session_id: O
     let Some(session) = chat_session_id else {
         return;
     };
-    if !auto_wake_enabled() {
+    if !super::settings::switch_on(super::settings::value(store, AUTO_WAKE_ENV).as_deref()) {
         return;
     }
     let registered = store.get_chat_session(session).and_then(|chat| match chat {

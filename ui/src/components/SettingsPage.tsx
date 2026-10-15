@@ -130,6 +130,7 @@ import { StatusBadge } from "./StatusBadge";
 import { OpenResearchSetupTerminal, SettingsCommandTerminal, SshConnectTerminal, SshTerminalTranscript } from "./SshConnectTerminal";
 import { SshExecutionSettings, SshDefaultHost } from "./SshExecutionSettings";
 import { SshConfigDialog } from "./SshConfigDialog";
+import { ResearchSettings } from "../flavor/ResearchSettings"; // VLResearch
 import {
   Badge,
   Button,
@@ -3698,7 +3699,7 @@ type SettingsNavItem = {
   activeTabs: Tab[];
 };
 
-const SETTINGS_SECTIONS: Tab[] = ["projects", "harnesses", "storage"];
+const SETTINGS_SECTIONS: Tab[] = ["projects", "harnesses", "storage", "research"]; // VLResearch: research
 
 /** Primary rail entries. Configuration sections share the Settings entry. */
 export const SETTINGS_NAV: SettingsNavItem[] = [
@@ -3769,6 +3770,10 @@ export function SettingsView({
             </section>
             <section ref={tab === "harnesses" ? sectionRef : undefined} className={SETTINGS_STACK_SECTION_CLASS_NAME}>
               <HarnessesTab remote={remote} />
+            </section>
+            {/* VLResearch: how the research loop runs, and the network policy. */}
+            <section ref={tab === "research" ? sectionRef : undefined} className={SETTINGS_STACK_SECTION_CLASS_NAME}>
+              <ResearchSettings cardClassName={SETTINGS_CARD_CLASS_NAME} rowClassName={PROJECT_DEFAULT_ROW_CLASS_NAME} />
             </section>
             {!remote && (
               <section ref={tab === "storage" ? sectionRef : undefined} className={SETTINGS_STACK_SECTION_CLASS_NAME}>

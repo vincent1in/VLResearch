@@ -278,6 +278,8 @@ fn valid_location(location: &str) -> bool {
                             | "environment"
                             | "git"
                             | "storage"
+                            // VLResearch: the Research settings section.
+                            | "research"
                     )
                 })
         }
