@@ -1,0 +1,16 @@
+VLResearch
+Copyright (c) 2026 Vincent Lin
+
+VLResearch is a distribution of OpenResearch
+(https://github.com/alphaXiv/OpenResearch), Copyright (c) 2026 alphaXiv,
+used under the MIT License. See LICENSE.
+
+Its design draws on these projects; no code from them is included yet. When
+code is ported, its license and notice files are added next to it.
+
+- autoresearcherUI (https://github.com/Fchaubard/autoresearcherUI),
+  MIT License, Copyright (c) 2026 Francois Chaubard and autoresearcherUI contributors
+- RSI-Anything (https://github.com/Gen-Verse/RSI-Anything),
+  Apache License 2.0, Copyright 2026 RSI-Anything contributors
+- openResearch1/openresearch (https://github.com/openResearch1/openresearch),
+  MIT License
