@@ -206,6 +206,12 @@ pub(super) async fn connect(
     {
         return bad_request("Only OpenCode installation supports automatic setup").into_response();
     }
+    // VLResearch: no agent downloads unless VLR_ALLOW_INSTALLERS is set.
+    if matches!(request.action, Action::Install | Action::Update)
+        && !crate::flavor::egress::installers_allowed()
+    {
+        return bad_request(crate::flavor::egress::INSTALLERS_DISABLED).into_response();
+    }
     ws.on_upgrade(move |mut socket| async move {
         let attempt = SetupAttempt::new(
             &request.harness,
