@@ -434,7 +434,32 @@ pub(crate) enum MetricCommand {
         #[arg(long)]
         split: Option<String>,
     },
-    /// The optimization's best finished run against the baseline, and the
+    /// Show the optimization's guards, or set one: bounds an experiment must
+    /// keep on another key to be kept or become the best (say, `output_diff
+    /// --max 0` for a speed-up whose output must not change).
+    Guard {
+        project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
+        /// The key to guard, as printed in `ORX_METRIC` lines.
+        key: Option<String>,
+        /// The experiment's mean on the key may not exceed this.
+        #[arg(long, value_name = "BOUND", allow_hyphen_values = true)]
+        max: Option<f64>,
+        /// Nor fall below this.
+        #[arg(long, value_name = "BOUND", allow_hyphen_values = true)]
+        min: Option<f64>,
+        /// The split to read the key in, when runs report it under several.
+        #[arg(long)]
+        split: Option<String>,
+        /// Remove the guard on the key.
+        #[arg(long, conflicts_with_all = ["max", "min", "split"])]
+        remove: bool,
+    },
+    /// The optimization's best experiment against the baseline, and the
     /// experiments on the path between them with each one's change.
     Best {
         project_id: String,
@@ -471,7 +496,8 @@ pub(crate) fn is_readonly(tokens: &[&str]) -> bool {
                     command: MetricCommand::Show { .. }
                         | MetricCommand::Runs { .. }
                         | MetricCommand::Best { .. }
-                        | MetricCommand::Primary { key: None, .. },
+                        | MetricCommand::Primary { key: None, .. }
+                        | MetricCommand::Guard { key: None, .. },
                 }) | FlavorCommand::Idea(IdeaArgs {
                     command: IdeaCommand::List { .. }
                         | IdeaCommand::Show { .. }
@@ -519,6 +545,7 @@ mod tests {
             "orx metric runs proj_1 --key val_ic",
             "orx metric best proj_1 --json",
             "orx metric primary proj_1",
+            "orx metric guard proj_1",
             "orx metric --help",
             "orx idea list proj_1 --all",
             "orx idea show idea_1",
@@ -535,6 +562,8 @@ mod tests {
         }
         for call in [
             "orx metric primary proj_1 val_ic --maximize",
+            "orx metric guard proj_1 output_diff --max 0",
+            "orx metric guard proj_1 turnover --remove",
             "orx metric bogus",
             "orx exp run exp_1",
             "orx idea add proj_1 Volume",

@@ -30,6 +30,7 @@ import {
   forecastText,
   formatSigned,
   formatValue,
+  guardText,
   groupIdeas,
   insideInterval,
   parseBrief,
@@ -186,6 +187,7 @@ function Headline({ metrics }: { metrics: MetricsPayload }) {
     primary.direction === "max" ? "higher is better" : "lower is better",
     primary.split ? `${primary.split} split` : null,
     primary.noiseFloor !== null ? `noise floor ${formatValue(primary.noiseFloor)}` : null,
+    metrics.guards.length > 0 ? `guards: ${metrics.guards.map(guardText).join("; ")}` : null,
   ].filter(Boolean).join(" · ");
   const best = metrics.best;
   const baseline = metrics.baseline;
@@ -228,6 +230,11 @@ function Headline({ metrics }: { metrics: MetricsPayload }) {
       ) : (
         <Note>No finished run has reported {primary.key} yet.</Note>
       )}
+      {metrics.breaches.map((breach) => (
+        <div key={breach.experimentId} className="text-sm text-accent-amber">
+          Set aside by a guard: {breach.experiment} ({breach.reason})
+        </div>
+      ))}
     </div>
   );
 }

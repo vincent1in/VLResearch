@@ -71,8 +71,25 @@ export interface Trials {
   ideasKept: number;
 }
 
+/** A bound an experiment must keep on another key to be kept or become the best. */
+export interface Guard {
+  key: string;
+  split: string | null;
+  max: number | null;
+  min: number | null;
+}
+
+/** An experiment a guard set aside, and why. */
+export interface Breach {
+  experimentId: string;
+  experiment: string;
+  reason: string;
+}
+
 export interface MetricsPayload {
   primary: PrimaryMetric | null;
+  guards: Guard[];
+  breaches: Breach[];
   keys: string[];
   best: ScoredRun | null;
   baseline: Reference | null;
@@ -271,8 +288,18 @@ export function parseMetrics(value: unknown): MetricsPayload {
   const trials = isObject(body.trials)
     ? { runs: number(body.trials.runs) ?? 0, ideasTested: number(body.trials.ideasTested) ?? 0, ideasKept: number(body.trials.ideasKept) ?? 0 }
     : null;
+  const guards = list(body.guards).flatMap((guard): Guard[] => {
+    if (!isObject(guard) || typeof guard.key !== "string") return [];
+    return [{ key: guard.key, split: text(guard.split), max: number(guard.max), min: number(guard.min) }];
+  });
+  const breaches = list(body.breaches).flatMap((breach): Breach[] => {
+    if (!isObject(breach) || typeof breach.experimentId !== "string") return [];
+    return [{ experimentId: breach.experimentId, experiment: text(breach.experiment) ?? breach.experimentId, reason: text(breach.reason) ?? "" }];
+  });
   return {
     primary: readPrimary(body.primary),
+    guards,
+    breaches,
     keys: list(body.keys).flatMap((key) => (typeof key === "string" ? [key] : [])),
     best: readRun(body.best),
     baseline,
@@ -442,6 +469,19 @@ export function parseFindings(value: unknown): FindingRow[] {
 // --- numbers --------------------------------------------------------------------
 
 /** The metric's value the way `orx metric` prints it: about five significant digits. */
+/** A guard in words: "output_diff at most 0". */
+export function guardText(guard: Guard): string {
+  const bounds =
+    guard.min !== null && guard.max !== null
+      ? `between ${formatValue(guard.min)} and ${formatValue(guard.max)}`
+      : guard.min !== null
+        ? `at least ${formatValue(guard.min)}`
+        : guard.max !== null
+          ? `at most ${formatValue(guard.max)}`
+          : "unbounded";
+  return `${guard.key}${guard.split ? ` (${guard.split})` : ""} ${bounds}`;
+}
+
 export function formatValue(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "–";
   if (value === 0) return "0";

@@ -329,9 +329,12 @@ async fn optimization_metrics(Path(optimization_id): Path<String>) -> ApiResult 
             return Ok(None);
         };
         let keys = super::metrics::project_keys(store, &brief.project_id)?;
+        let guards = super::metrics::guards(store, &brief.id)?;
         let Some(metric) = super::metrics::primary(store, &brief.id)? else {
             return Ok(Some(json!({
                 "primary": null,
+                "guards": guards,
+                "breaches": [],
                 "keys": keys,
                 "best": null,
                 "baseline": null,
@@ -357,6 +360,8 @@ async fn optimization_metrics(Path(optimization_id): Path<String>) -> ApiResult 
         }
         Ok(Some(json!({
             "primary": metric,
+            "guards": guards,
+            "breaches": standing.breaches,
             "keys": keys,
             "best": standing.best,
             "baseline": standing.baseline,

@@ -52,6 +52,24 @@ orx metric primary <projectId> val_loss --minimize --noise-floor 0.001
 - `orx metric primary <projectId>` with no key shows the current setting and
   the keys runs have reported so far.
 
+## Guard what must not change
+
+When work on the primary metric must leave something else alone, guard it:
+a bound the experiment's mean on another key must keep.
+
+```sh
+orx metric guard <projectId> output_diff --max 0   # a speed-up's output matches the baseline's
+orx metric guard <projectId> turnover --max 2.0     # a model change keeps turnover under a cap
+orx metric guard <projectId>                        # list the guards
+orx metric guard <projectId> turnover --remove
+```
+
+An experiment that breaks a guard, or doesn't report its key, can't be kept
+or become the best, whatever it gained; `orx idea done` refutes it and says
+which guard it broke. The baseline is what guards are measured against, so it
+is exempt. To guard that output is unchanged, have the run compare its output
+with the baseline's saved output and report the largest difference.
+
 ## Read results
 
 - `orx metric show <runId>`: each key a run reported, with its last, min and

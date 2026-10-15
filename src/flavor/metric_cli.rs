@@ -50,12 +50,83 @@ pub(crate) fn run(command: MetricCommand) -> Result<()> {
             noise_floor,
             split,
         ),
+        MetricCommand::Guard {
+            project_id,
+            opt,
+            key,
+            max,
+            min,
+            split,
+            remove,
+        } => guard(
+            &store,
+            &project_id,
+            opt.as_deref(),
+            key,
+            metrics::Guard {
+                key: String::new(),
+                split,
+                max,
+                min,
+            },
+            remove,
+        ),
         MetricCommand::Best {
             project_id,
             opt,
             json,
         } => best(&store, &project_id, opt.as_deref(), json),
     }
+}
+
+fn guard(
+    store: &Store,
+    project_id: &str,
+    opt: Option<&str>,
+    key: Option<String>,
+    bounds: metrics::Guard,
+    remove: bool,
+) -> Result<()> {
+    let project = crate::local::resolve::resolve_project(store, project_id)?;
+    let Some(key) = key else {
+        let brief = scope::resolve(store, &project.id, opt, Resolve::Existing)?;
+        print_guards(store, &brief.id)?;
+        return Ok(());
+    };
+    if remove {
+        let brief = scope::resolve(store, &project.id, opt, Resolve::Existing)?;
+        if metrics::remove_guard(store, &brief.id, &key)? {
+            println!("Removed the guard on {key} from optimization {}.", brief.id);
+        } else {
+            println!("Optimization {} has no guard on {key}.", brief.id);
+        }
+        return Ok(());
+    }
+    let brief = scope::resolve(store, &project.id, opt, Resolve::OrCreate)?;
+    let guard = metrics::Guard { key, ..bounds };
+    metrics::set_guard(store, &brief.id, &guard)?;
+    println!(
+        "Optimization {} now guards {}: an experiment that breaks it, or doesn't report {}, \
+         can't be kept or become the best. Baselines are exempt.",
+        brief.id,
+        guard.describe(),
+        guard.key
+    );
+    Ok(())
+}
+
+fn print_guards(store: &Store, optimization_id: &str) -> Result<()> {
+    let guards = metrics::guards(store, optimization_id)?;
+    if guards.is_empty() {
+        println!("Optimization {optimization_id} has no guards.");
+    } else {
+        let described: Vec<String> = guards.iter().map(metrics::Guard::describe).collect();
+        println!(
+            "Guards of optimization {optimization_id}: {}.",
+            described.join("; ")
+        );
+    }
+    Ok(())
 }
 
 fn direction_flag(maximize: bool, minimize: bool) -> Option<Direction> {
@@ -355,6 +426,9 @@ fn primary(
                 reported_keys(store, &project.id)?
             ),
         }
+        if !metrics::guards(store, &brief.id)?.is_empty() {
+            print_guards(store, &brief.id)?;
+        }
         return Ok(());
     };
     let brief = scope::resolve(store, &project.id, opt, Resolve::OrCreate)?;
@@ -408,9 +482,17 @@ fn best(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Resul
                 "path": path,
                 "history": standing.history,
                 "trials": trials,
+                "guards": metrics::guards(store, &brief.id)?,
+                "breaches": standing.breaches,
             }))?
         );
         return Ok(());
+    }
+    for breach in &standing.breaches {
+        println!(
+            "Set aside by a guard: {} [{}]: {}.",
+            breach.experiment, breach.experiment_id, breach.reason
+        );
     }
     let Some(best) = standing.best else {
         println!(

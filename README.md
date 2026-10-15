@@ -32,7 +32,10 @@ orx metric primary <projectId> val_ic --maximize   # once per optimization
 orx metric runs <projectId>     # runs ranked on the primary metric
 orx metric best <projectId>     # best run against the baseline, step by step
 orx metric show <runId>         # everything one run reported
+orx metric guard <projectId> output_diff --max 0   # a bound another key must keep
 ```
+
+A guard holds what must not change while the primary metric improves: a speed-up's output must match the baseline's (`output_diff` at most 0), or turnover must stay under a cap. An experiment that breaks a guard, or doesn't report its key, can't be kept or become the best, whatever it gained.
 
 A run's score is the last value it reported, and an experiment's is the mean of its finished runs, so have each run draw its own seed. A noise floor (`--noise-floor`) is the smallest gain worth keeping; leave it unset unless smaller gains wouldn't matter in practice. Choose a validation metric as primary, and keep test splits for final reports; when a key is reported under several splits, `orx metric primary` asks which one to score (`--split val`). Coding agents in VLResearch chats get these instructions as the `orx-metrics` skill.
 
@@ -81,6 +84,8 @@ orx finding lock <findingId>     # settled; agents can add evidence but not chan
 ```
 
 The `orx-improve` skill then runs the loop: pick the next idea, check its forecast against past calibration, build it on a child of the best experiment, run it, measure it, and build on a new best only once its replicate holds.
+
+The loop can improve the project's own tools the same way: a slow data loader, a flaky download, a backtest that recomputes what it could cache. Run that as its own optimization, scoped to the tool's paths, with the tool's run time (or failures) as the primary metric and a guard that its output is unchanged; the evaluation code stays locked. Procedures that recur across chats can be saved as skills (`orx skills add`) for later chats to start from.
 
 ## Does the loop work?
 

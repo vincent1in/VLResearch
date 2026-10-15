@@ -548,6 +548,8 @@ pub(crate) struct Closed {
     pub ablations: Vec<Idea>,
     /// For a replicate: the attempt it repeated, judged again on the mean.
     pub repeated: Vec<Idea>,
+    /// The guard an attempt broke, which refuted it despite its gain.
+    pub breach: Option<String>,
 }
 
 /// Closes an idea. With an experiment and a primary metric, the outcome is the
@@ -604,6 +606,29 @@ pub(crate) fn close(
             judge(&idea, change, metric)
         }
     };
+    // An attempt kept on the primary metric must also keep the guards.
+    let breach = match (status, &idea.experiment_id) {
+        (Status::Kept, Some(experiment_id))
+            if verdict == Verdict::Measured
+                && !idea.kind.is_blocker()
+                && idea.ablates.is_none() =>
+        {
+            let guards = metrics::guards(store, &idea.optimization_id)?;
+            metrics::guard_breaches(store, &idea.project_id, &guards, [experiment_id.as_str()])?
+                .remove(experiment_id)
+        }
+        _ => None,
+    };
+    let status = if breach.is_some() {
+        Status::Refuted
+    } else {
+        status
+    };
+    let evidence = match (evidence, &breach) {
+        (Some(evidence), Some(breach)) => Some(format!("{evidence} It broke a guard: {breach}.")),
+        (None, Some(breach)) => Some(format!("It broke a guard: {breach}.")),
+        (evidence, None) => evidence,
+    };
     let now = crate::store::now_ms();
     store.flavor_conn().execute(
         "UPDATE vlr_ideas SET status = ?2, evidence = COALESCE(?3, evidence), outcome = ?4,
@@ -653,6 +678,7 @@ pub(crate) fn close(
         replicate,
         ablations,
         repeated,
+        breach,
     })
 }
 
@@ -1873,6 +1899,63 @@ mod tests {
         let solid = tested(&store, "Solid change", "solid", IdeaFields::default());
         assert_eq!(solid.idea.status, Status::Kept);
         assert!(solid.replicate.is_none() && solid.ablations.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_attempt_that_breaks_a_guard_is_refuted_whatever_it_gained() {
+        let (store, dir) = temp_store();
+        val_ic_primary(&store);
+        metrics::set_guard(
+            &store,
+            "p",
+            &metrics::Guard {
+                key: "turnover".into(),
+                split: None,
+                max: Some(2.0),
+                min: None,
+            },
+        )
+        .unwrap();
+        experiment(&store, "base", None);
+        scored_run(&store, "base", 0.020);
+        experiment(&store, "churny", Some("base"));
+        store
+            .upsert_run(&StoredRun {
+                id: "r_churny".into(),
+                experiment_id: "churny".into(),
+                project_id: "p".into(),
+                status: "done".into(),
+                backend_json: "{}".into(),
+                command: "python train.py".into(),
+                created_at: 1,
+                updated_at: 2,
+                ended_at: Some(2),
+                exit_code: Some(0),
+                commit_sha: None,
+                result_markdown: None,
+                cancel_requested: false,
+                cancel_reason: None,
+                chat_session_id: None,
+            })
+            .unwrap();
+        let log = super::super::wake::run_log_path(&store, "r_churny");
+        std::fs::write(log, "ORX_METRIC {\"val_ic\": 0.030, \"turnover\": 3.5}\n").unwrap();
+        crate::flavor::scope::tests::adopt_runs(&store, "p");
+        let closed = tested(
+            &store,
+            "Faster rebalancing",
+            "churny",
+            IdeaFields::default(),
+        );
+        assert_eq!(closed.idea.status, Status::Refuted);
+        assert_eq!(closed.breach.as_deref(), Some("turnover is 3.5, above 2"));
+        assert!(closed
+            .idea
+            .evidence
+            .as_deref()
+            .is_some_and(|evidence| evidence.contains("broke a guard")));
+        assert!(closed.replicate.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

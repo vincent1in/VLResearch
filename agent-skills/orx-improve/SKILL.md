@@ -57,14 +57,31 @@ outcome, kept or refuted, and the best against the baseline.
   milestones, and say so each time you do.
 - Count every trial: close every idea you start, refuted ones included.
 - Process-efficiency ideas optimize wall time or cost, and their output must
-  match the baseline's. Check that before claiming the gain.
+  match the baseline's: guard it (`orx metric guard <projectId> output_diff
+  --max 0`, `orx-metrics`), and orx won't keep one that changes it.
 - Dataset additions get a point-in-time and coverage check before any
   modeling.
 - orx compacts the chat between turns when its context fills up. When
   earlier rounds survive only as a summary, re-read the state before the
   next step: `orx brief show`, `orx metric best`, `orx idea list` and the
   status of runs you launched. The ledgers are the record, not the summary.
+- When a constraint besides the primary metric matters (turnover, latency,
+  memory), guard it rather than trusting yourself to check it each round.
 - Stop when the brief's stop rule fires or its budget runs out. Then report
   the best against the baseline, the ideas that built it (the path in
   `orx metric best`), what was refuted, and how calibrated the forecasts
   were.
+
+## Improving the project's own tools
+
+The loop can improve the scripts it runs on, too: a slow data loader, a
+flaky download, a backtest that recomputes what it could cache. Run that as
+an optimization of its own, in its own chat, scoped to the tool's paths
+(`orx brief set ... --scope <path>`). Its primary metric is what the run
+reports about the tool (its seconds, or its failures over a fixed set of
+inputs), and a guard holds its output to the baseline's. The evaluation code
+stays locked, as in every optimization.
+
+When a procedure recurs across chats (staging data on a host, running the
+backtest), offer the user to save it as a skill (`orx-customize`) so later
+chats start from it.

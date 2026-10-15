@@ -293,6 +293,13 @@ fn report_closed(closed: &ideas::Closed) {
         _ => String::new(),
     };
     println!("Idea {} is {}.{outcome}", idea.id, idea.status_label());
+    if let Some(breach) = &closed.breach {
+        println!(
+            "It gained on the primary metric but broke a guard ({breach}), so it can't be kept. \
+             `orx metric guard {}` lists the guards.",
+            idea.project_id
+        );
+    }
     for attempt in &closed.repeated {
         let change = attempt
             .outcome

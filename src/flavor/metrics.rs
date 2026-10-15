@@ -524,6 +524,180 @@ pub(crate) fn set_primary(
     Ok(())
 }
 
+/// A bound an optimization's experiments must keep on a metric besides the
+/// primary one: a speed-up whose output must still match the baseline's
+/// (`output_diff` at most 0), or a model change that must keep turnover under
+/// a cap. An experiment that breaks a guard, or doesn't report its key, can't
+/// be kept or become the best. Baselines are what guards are measured
+/// against, so they are exempt.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Guard {
+    pub key: String,
+    pub split: Option<String>,
+    pub max: Option<f64>,
+    pub min: Option<f64>,
+}
+
+impl Guard {
+    /// Why a value breaks the guard, or `None` when it keeps it.
+    pub(crate) fn breach(&self, value: Option<f64>) -> Option<String> {
+        let Some(value) = value else {
+            return Some(format!("it didn't report {}", self.key));
+        };
+        let shown = |number: f64| format_value(Some(number));
+        if let Some(max) = self.max.filter(|max| value > *max) {
+            return Some(format!(
+                "{} is {}, above {}",
+                self.key,
+                shown(value),
+                shown(max)
+            ));
+        }
+        if let Some(min) = self.min.filter(|min| value < *min) {
+            return Some(format!(
+                "{} is {}, below {}",
+                self.key,
+                shown(value),
+                shown(min)
+            ));
+        }
+        None
+    }
+
+    /// The guard in words: "output_diff at most 0".
+    pub(crate) fn describe(&self) -> String {
+        let shown = |number: f64| format_value(Some(number));
+        let bounds = match (self.min, self.max) {
+            (Some(min), Some(max)) => format!("between {} and {}", shown(min), shown(max)),
+            (Some(min), None) => format!("at least {}", shown(min)),
+            (None, Some(max)) => format!("at most {}", shown(max)),
+            (None, None) => "unbounded".to_string(),
+        };
+        match &self.split {
+            Some(split) => format!("{} ({split}) {bounds}", self.key),
+            None => format!("{} {bounds}", self.key),
+        }
+    }
+}
+
+fn ensure_guards(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vlr_metric_guards (
+             optimization_id TEXT NOT NULL,
+             key             TEXT NOT NULL,
+             split           TEXT,
+             max             REAL,
+             min             REAL,
+             created_at      INTEGER NOT NULL,
+             PRIMARY KEY (optimization_id, key)
+         );",
+    )?;
+    Ok(())
+}
+
+/// An optimization's guards, in the order they were set.
+pub(crate) fn guards(store: &Store, optimization_id: &str) -> Result<Vec<Guard>> {
+    let conn = store.flavor_conn();
+    ensure_guards(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT key, split, max, min FROM vlr_metric_guards
+         WHERE optimization_id = ?1 ORDER BY created_at, key",
+    )?;
+    let rows = stmt.query_map([optimization_id], |row| {
+        Ok(Guard {
+            key: row.get(0)?,
+            split: row.get(1)?,
+            max: row.get(2)?,
+            min: row.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Sets a guard, replacing one on the same key.
+pub(crate) fn set_guard(store: &Store, optimization_id: &str, guard: &Guard) -> Result<()> {
+    let key = guard.key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("The guard's key can't be empty."));
+    }
+    let bounds = [guard.min, guard.max];
+    if bounds.iter().all(Option::is_none) {
+        return Err(anyhow!("Give the guard a bound: `--max`, `--min` or both."));
+    }
+    if bounds.iter().flatten().any(|bound| !bound.is_finite()) {
+        return Err(anyhow!("A guard's bounds must be numbers."));
+    }
+    if let (Some(min), Some(max)) = (guard.min, guard.max) {
+        if min > max {
+            return Err(anyhow!("The guard's --min is above its --max."));
+        }
+    }
+    if super::scope::get(store, optimization_id)?.is_none() {
+        return Err(anyhow!("Optimization {optimization_id} was not found."));
+    }
+    let conn = store.flavor_conn();
+    ensure_guards(conn)?;
+    conn.execute(
+        "INSERT INTO vlr_metric_guards (optimization_id, key, split, max, min, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(optimization_id, key) DO UPDATE SET split = excluded.split,
+             max = excluded.max, min = excluded.min",
+        params![
+            optimization_id,
+            key,
+            guard
+                .split
+                .as_deref()
+                .map(str::trim)
+                .filter(|split| !split.is_empty()),
+            guard.max,
+            guard.min,
+            crate::store::now_ms(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Removes the guard on `key`; whether there was one.
+pub(crate) fn remove_guard(store: &Store, optimization_id: &str, key: &str) -> Result<bool> {
+    let conn = store.flavor_conn();
+    ensure_guards(conn)?;
+    Ok(conn.execute(
+        "DELETE FROM vlr_metric_guards WHERE optimization_id = ?1 AND key = ?2",
+        params![optimization_id, key.trim()],
+    )? > 0)
+}
+
+/// The experiments that break a guard, each with why: an experiment's value
+/// on a guard's key is the mean of its finished, counted runs.
+pub(crate) fn guard_breaches<'a>(
+    store: &Store,
+    project_id: &str,
+    guards: &[Guard],
+    experiments: impl IntoIterator<Item = &'a str>,
+) -> Result<HashMap<String, String>> {
+    let experiments: Vec<&str> = experiments.into_iter().collect();
+    let mut breaches = HashMap::new();
+    for guard in guards {
+        let runs = scored_runs(store, project_id, &guard.key, guard.split.as_deref())?;
+        let scores = experiment_scores(&runs, &|_| false);
+        for experiment in &experiments {
+            if breaches.contains_key(*experiment) {
+                continue;
+            }
+            let value = scores
+                .iter()
+                .find(|score| score.experiment_id == *experiment)
+                .map(|score| score.score);
+            if let Some(reason) = guard.breach(value) {
+                breaches.insert(experiment.to_string(), reason);
+            }
+        }
+    }
+    Ok(breaches)
+}
+
 /// The splits a key has been reported under across the project's runs
 /// (`None` for points without a split).
 pub(crate) fn key_splits(
@@ -865,6 +1039,16 @@ pub(crate) struct Standing {
     pub best: Option<ExperimentScore>,
     /// Finished, counted runs in the order they ended, with the best so far.
     pub history: Vec<HistoryPoint>,
+    /// Experiments a guard sets aside, with why; none of them can be the best.
+    pub breaches: Vec<Breach>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Breach {
+    pub experiment_id: String,
+    pub experiment: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -881,12 +1065,20 @@ pub(crate) struct HistoryPoint {
 }
 
 /// The running best over the experiments of `runs`. Baselines (`is_baseline`)
-/// measured only by probe runs take part, so an attempt has to beat them.
+/// measured only by probe runs take part, so an attempt has to beat them;
+/// experiments in `set_aside` (a guard's) can't be the best.
 pub(crate) fn running_best(
     runs: &[ScoredRun],
     metric: &PrimaryMetric,
     is_baseline: &dyn Fn(&str) -> bool,
+    set_aside: &std::collections::HashSet<String>,
 ) -> Standing {
+    let eligible = |scores: Vec<ExperimentScore>| -> Vec<ExperimentScore> {
+        scores
+            .into_iter()
+            .filter(|score| !set_aside.contains(&score.experiment_id))
+            .collect()
+    };
     let mut scored: Vec<&ScoredRun> = runs
         .iter()
         .filter(|run| run.status == "done" && run.score.is_some())
@@ -896,7 +1088,10 @@ pub(crate) fn running_best(
     let mut history = Vec::new();
     let mut previous: Option<String> = None;
     for (index, run) in scored.iter().enumerate() {
-        let scores = experiment_scores(scored[..=index].iter().copied(), is_baseline);
+        let scores = eligible(experiment_scores(
+            scored[..=index].iter().copied(),
+            is_baseline,
+        ));
         let best = best_of(&scores, metric);
         let best_id = best.map(|best| best.experiment_id.clone());
         if run.counts() {
@@ -911,11 +1106,12 @@ pub(crate) fn running_best(
         }
         previous = best_id;
     }
-    let scores = experiment_scores(scored.iter().copied(), is_baseline);
+    let scores = eligible(experiment_scores(scored.iter().copied(), is_baseline));
     Standing {
         baseline: None,
         best: best_of(&scores, metric).cloned(),
         history,
+        breaches: Vec::new(),
     }
 }
 
@@ -1037,15 +1233,27 @@ pub(crate) fn standing(
     metric: &PrimaryMetric,
 ) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
     let members = super::scope::run_ids(store, brief)?;
-    standing_among(store, &brief.project_id, metric, Some(&members))
+    let guards = guards(store, &brief.id)?;
+    standing_with(store, &brief.project_id, metric, Some(&members), &guards)
 }
 
-/// The same standing over the project's runs: all of them, or `members`.
+/// The same standing over the project's runs: all of them, or `members`,
+/// with no guards.
 pub(crate) fn standing_among(
     store: &Store,
     project_id: &str,
     metric: &PrimaryMetric,
     members: Option<&std::collections::HashSet<String>>,
+) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
+    standing_with(store, project_id, metric, members, &[])
+}
+
+fn standing_with(
+    store: &Store,
+    project_id: &str,
+    metric: &PrimaryMetric,
+    members: Option<&std::collections::HashSet<String>>,
+    guards: &[Guard],
 ) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
     let all = scored_runs(store, project_id, &metric.key, metric.split.as_deref())?;
     let runs: Vec<ScoredRun> = all
@@ -1082,7 +1290,34 @@ pub(crate) fn standing_among(
             .filter(|run| members.is_some_and(|members| !members.contains(&run.run_id)))
             .cloned(),
     );
-    let mut standing = running_best(&candidates, metric, &is_baseline);
+    // Guards hold attempts, not the baselines they are measured against.
+    let mut attempts: Vec<&str> = candidates
+        .iter()
+        .map(|run| run.experiment_id.as_str())
+        .filter(|id| !is_baseline(id))
+        .collect();
+    attempts.sort_unstable();
+    attempts.dedup();
+    let breaches = if guards.is_empty() {
+        HashMap::new()
+    } else {
+        guard_breaches(store, project_id, guards, attempts)?
+    };
+    let set_aside = breaches.keys().cloned().collect();
+    let mut standing = running_best(&candidates, metric, &is_baseline, &set_aside);
+    let mut breaches: Vec<Breach> = breaches
+        .into_iter()
+        .map(|(experiment_id, reason)| Breach {
+            experiment: experiments
+                .get(&experiment_id)
+                .map(display_name)
+                .unwrap_or_else(|| experiment_id.clone()),
+            experiment_id,
+            reason,
+        })
+        .collect();
+    breaches.sort_by(|a, b| a.experiment_id.cmp(&b.experiment_id));
+    standing.breaches = breaches;
     let mut path = match &standing.best {
         Some(best) => lineage(&experiments, best, &all),
         None => Vec::new(),
@@ -1314,7 +1549,7 @@ mod tests {
             noise_floor: Some(0.001),
             split: None,
         };
-        let standing = running_best(&runs, &metric, &|_| false);
+        let standing = running_best(&runs, &metric, &|_| false, &Default::default());
         assert_eq!(standing.best.unwrap().run_id, "c");
         let marks: Vec<_> = standing.history.iter().map(|h| h.new_best).collect();
         assert_eq!(marks, [true, false, true, false]);
@@ -1326,7 +1561,10 @@ mod tests {
             ..metric
         };
         assert_eq!(
-            running_best(&runs, &lower, &|_| false).best.unwrap().run_id,
+            running_best(&runs, &lower, &|_| false, &Default::default())
+                .best
+                .unwrap()
+                .run_id,
             "d"
         );
     }
@@ -1354,7 +1592,7 @@ mod tests {
             // Worse than the baseline: it doesn't become the best.
             scored("a", "e1", 4, 0.0180),
         ];
-        let standing = running_best(&runs, &metric, &is_baseline);
+        let standing = running_best(&runs, &metric, &is_baseline, &Default::default());
         let best = standing.best.unwrap();
         assert_eq!((best.experiment_id.as_str(), best.probe), ("base", true));
         assert!((best.score - 0.020).abs() < 1e-12);
@@ -1365,11 +1603,11 @@ mod tests {
         // experiment's mean back under the floor, and the baseline is the
         // best again.
         runs.push(scored("b", "e2", 5, 0.0260));
-        let lucky = running_best(&runs, &metric, &is_baseline);
+        let lucky = running_best(&runs, &metric, &is_baseline, &Default::default());
         assert_eq!(lucky.best.unwrap().experiment_id, "e2");
         assert!(lucky.history.last().unwrap().new_best);
         runs.push(scored("b2", "e2", 6, 0.0180));
-        let replicated = running_best(&runs, &metric, &is_baseline);
+        let replicated = running_best(&runs, &metric, &is_baseline, &Default::default());
         let best = replicated.best.unwrap();
         assert_eq!(best.experiment_id, "base");
         let point = replicated.history.last().unwrap();
@@ -1535,6 +1773,144 @@ mod tests {
                 .runs,
             1
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guards_say_why_a_value_breaks_them() {
+        let diff = Guard {
+            key: "output_diff".into(),
+            split: None,
+            max: Some(0.0),
+            min: None,
+        };
+        assert_eq!(diff.breach(Some(0.0)), None);
+        assert_eq!(
+            diff.breach(Some(0.03)).as_deref(),
+            Some("output_diff is 0.03, above 0")
+        );
+        assert_eq!(
+            diff.breach(None).as_deref(),
+            Some("it didn't report output_diff")
+        );
+        assert_eq!(diff.describe(), "output_diff at most 0");
+        let band = Guard {
+            key: "turnover".into(),
+            split: Some("val".into()),
+            max: Some(2.0),
+            min: Some(0.5),
+        };
+        assert_eq!(
+            band.breach(Some(0.25)).as_deref(),
+            Some("turnover is 0.25, below 0.5")
+        );
+        assert_eq!(band.describe(), "turnover (val) between 0.5 and 2");
+    }
+
+    #[test]
+    fn a_guard_sets_aside_an_attempt_that_breaks_it_but_never_the_baseline() {
+        let (store, dir) = temp_store();
+        let opt = crate::flavor::scope::tests::named(&store, "opt_fast");
+        for (id, parent) in [
+            ("base", None),
+            ("fast", Some("base")),
+            ("faster", Some("base")),
+        ] {
+            store
+                .create_local_experiment(&LocalExperiment {
+                    id: id.into(),
+                    project_id: "p".into(),
+                    parent_experiment_id: parent.map(Into::into),
+                    slug: id.into(),
+                    branch_name: format!("orx/{id}"),
+                    title: None,
+                    description: None,
+                    run_command: "python train.py".into(),
+                    agent_status: "idle".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    chat_session_id: None,
+                    archived: false,
+                })
+                .unwrap();
+        }
+        // Lower seconds is better. "faster" is quickest, but its output moved;
+        // the baseline reports no output_diff and is exempt.
+        for (run, experiment, report, ended) in [
+            ("r_base", "base", r#"{"seconds": 100}"#, 1),
+            ("r_fast", "fast", r#"{"seconds": 80, "output_diff": 0}"#, 2),
+            (
+                "r_faster",
+                "faster",
+                r#"{"seconds": 50, "output_diff": 0.2}"#,
+                3,
+            ),
+        ] {
+            store
+                .upsert_run(&StoredRun {
+                    id: run.into(),
+                    experiment_id: experiment.into(),
+                    project_id: "p".into(),
+                    status: "done".into(),
+                    backend_json: "{}".into(),
+                    command: "python train.py".into(),
+                    created_at: ended - 1,
+                    updated_at: ended,
+                    ended_at: Some(ended),
+                    exit_code: Some(0),
+                    commit_sha: None,
+                    result_markdown: None,
+                    cancel_requested: false,
+                    cancel_reason: None,
+                    chat_session_id: None,
+                })
+                .unwrap();
+            let log = super::super::wake::run_log_path(&store, run);
+            std::fs::write(log, format!("ORX_METRIC {report}\n")).unwrap();
+        }
+        crate::flavor::scope::tests::adopt_runs(&store, "opt_fast");
+        let metric = PrimaryMetric {
+            key: "seconds".into(),
+            direction: Direction::Min,
+            noise_floor: None,
+            split: None,
+        };
+        set_primary(&store, &opt.id, &metric).unwrap();
+        let (ranked, _, _) = standing(&store, &opt, &metric).unwrap();
+        assert_eq!(ranked.best.unwrap().experiment_id, "faster");
+        assert!(ranked.breaches.is_empty());
+
+        let guard = Guard {
+            key: "output_diff".into(),
+            split: None,
+            max: Some(0.0),
+            min: None,
+        };
+        set_guard(&store, &opt.id, &guard).unwrap();
+        assert_eq!(guards(&store, &opt.id).unwrap(), std::slice::from_ref(&guard));
+        let (ranked, _, _) = standing(&store, &opt, &metric).unwrap();
+        assert_eq!(ranked.best.unwrap().experiment_id, "fast");
+        assert_eq!(ranked.breaches.len(), 1);
+        assert_eq!(ranked.breaches[0].experiment_id, "faster");
+        assert_eq!(ranked.breaches[0].reason, "output_diff is 0.2, above 0");
+
+        // Bad guards are refused; removing one restores the plain ranking.
+        let unbounded = Guard {
+            max: None,
+            ..guard.clone()
+        };
+        assert!(set_guard(&store, &opt.id, &unbounded).is_err());
+        let crossed = Guard {
+            max: Some(0.0),
+            min: Some(1.0),
+            ..guard.clone()
+        };
+        assert!(set_guard(&store, &opt.id, &crossed).is_err());
+        assert!(set_guard(&store, "opt_missing", &guard).is_err());
+        assert!(remove_guard(&store, &opt.id, "output_diff").unwrap());
+        assert!(!remove_guard(&store, &opt.id, "output_diff").unwrap());
+        let (ranked, _, _) = standing(&store, &opt, &metric).unwrap();
+        assert_eq!(ranked.best.unwrap().experiment_id, "faster");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -24,6 +24,7 @@ import {
   formatSigned,
   formatValue,
   groupIdeas,
+  guardText,
   insideInterval,
   niceTicks,
   parseBrief,
@@ -103,6 +104,16 @@ test("the metrics payload is read defensively", () => {
   });
   assert.equal(replicated.best?.runs, 2);
   assert.deepEqual([replicated.baseline?.runs, replicated.baseline?.probeRuns], [0, 3]);
+  // Guards, and what they set aside.
+  assert.deepEqual(metrics.guards, []);
+  const guarded = parseMetrics({
+    ...metricsPayload,
+    guards: [{ key: "output_diff", split: null, max: 0, min: null }, { key: 3 }],
+    breaches: [{ experimentId: "fast", experiment: "Fast loader", reason: "output_diff is 0.2, above 0" }, {}],
+  });
+  assert.deepEqual(guarded.guards.map(guardText), ["output_diff at most 0"]);
+  assert.deepEqual(guarded.breaches, [{ experimentId: "fast", experiment: "Fast loader", reason: "output_diff is 0.2, above 0" }]);
+  assert.equal(guardText({ key: "turnover", split: "val", max: 2, min: 0.5 }), "turnover (val) between 0.5 and 2");
 
   const empty = parseMetrics({ primary: null, keys: ["loss", 3], history: [{ runId: "x" }] });
   assert.equal(empty.primary, null);

@@ -36,6 +36,7 @@ it. Keep going until every field is pinned; don't fill a gap with a guess.
 | --- | --- | --- |
 | Objective and metric | The goal, the one number that measures it, its split and direction | Validation information coefficient of the forecast; maximize |
 | Noise floor | The smallest gain worth keeping; seed noise is handled by replicates | 0, or the smallest gain that would matter in practice |
+| Guards | What must not get worse besides the metric, as bounds on other keys | Turnover at most 2; for a speed-up, output identical to the baseline's |
 | What may change | Code and data runs may touch | Feature code, model code, loaders; new datasets under a named folder |
 | What must not change | Whatever defines the score | Evaluation code, split dates, the out-of-sample window |
 | Scope | When the work is on one part of the system, the paths runs may change | `features/`, `data/loaders.py` |
@@ -90,6 +91,7 @@ edit them. In plan mode, that is the plan you submit. Only after they agree:
 
 ```sh
 orx metric primary <projectId> <key> --maximize
+orx metric guard <projectId> <key> --max <bound>   # one per guard, if any
 orx brief set <projectId> --objective "..." --may-change "..." \
   --must-not-change "..." --lock <evaluation file> --lock <split file> \
   --scope <path> \
