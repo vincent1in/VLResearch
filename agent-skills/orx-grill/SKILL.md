@@ -7,8 +7,8 @@ description: "Scope research work with the user before spending compute: intervi
 
 - Before the first improvement experiment in a project, and whenever the
   goal changes.
-- When the user starts auto-research from the dashboard's Research view.
-  They have already filled in part of the brief, and maybe some ideas.
+- When the user starts auto-research with part of the brief, and maybe
+  some seed ideas, already recorded.
 - When `orx exp run` refuses a launch because the brief is missing or not
   confirmed.
 - Work in plan mode when it is on: the interview and the review only read,
@@ -89,10 +89,9 @@ orx idea add <projectId> "<title>" ...    # one per idea
 orx brief confirm <projectId>
 ```
 
-`orx brief set` changes only the fields you pass. The user can confirm the
-brief in the dashboard's Research view, and this chat is told when they do;
-ask them to if they started there. If they agree in the chat instead,
-confirm it yourself.
+`orx brief set` changes only the fields you pass. The user may confirm the
+brief themselves, outside this chat, and this chat is told when they do. If
+they agree in the chat instead, confirm it yourself.
 
 Never confirm a brief the user has not seen. Confirming needs at least one
 open idea to start from, and the loop (`orx idea next`, `orx idea start`)
