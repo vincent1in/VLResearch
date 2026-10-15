@@ -6,7 +6,8 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 
 | Path | What it holds |
 | --- | --- |
-| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat) |
+| `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `activity.rs` (each chat's last-activity clock), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
+| `src/flavor/chat_host.rs` | Code that starts hidden chat turns. It is compiled as a child module of `src/local/chat/mod.rs` (a `#[path]` declaration there), the only way to reach the chat host's private turn machinery without making upstream's items public |
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
 | `flavor/egress-baseline.txt` | Accepted network call sites outside the egress gate |
 | `.github/workflows/vlresearch.yml` | Secret scan and egress audit; upstream's `ci.yml` still runs fmt, clippy and tests |
@@ -33,7 +34,8 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/local/github.rs`, `src/local/model.rs` | GitHub off unless `VLR_ALLOW_GITHUB` |
 | `src/updates.rs`, `src/commands/update.rs`, `src/commands/version.rs` | No release-feed checks, update warnings or installs from alphaXiv |
 | `src/commands/up/harness_setup.rs` | No agent installs or updates unless `VLR_ALLOW_INSTALLERS` |
-| `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings |
+| `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `watch_runs` runs the stall check; declares the `vlresearch` child module |
+| `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server |
 | `src/compute.rs` | `submit` registers the launching chat's wake-up |
 | `src/commands/exp.rs`, `src/plane/local_plane.rs` | `orx exp wait` timeout under Claude Code; a wait that sees the result settles the wake-up |
 | `src/invocation.rs` | The line printed after a launch mentions the automatic wake-up |
@@ -63,7 +65,6 @@ Upstream merges are never rebased, so `main` is never force-pushed.
 
 ## Next up
 
-1. A progress strip in the chat: the agent's task checklist, "waiting on run" state, time since the last event.
-2. Stall alerts for runs: no new output for a while, non-finite metrics, out-of-memory, the process gone.
-3. A metrics ledger: `ORX_METRIC {json}` lines in run output, stored per run.
-4. An idea queue, a "grill me" scoping gate, a forecast-and-verify loop, and a findings ledger.
+1. The dashboard side of the chat progress strip (the agent's checklist, time since its last update, the runs it waits on). Its data is served by `GET /api/vlresearch/sessions/{id}/progress`.
+2. A metrics ledger: `ORX_METRIC {json}` lines in run output, stored per run.
+3. An idea queue, a "grill me" scoping gate, a forecast-and-verify loop, and a findings ledger.

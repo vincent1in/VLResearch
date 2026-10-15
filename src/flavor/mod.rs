@@ -5,8 +5,11 @@
 //! `VLResearch:`), so merging new alphaXiv/OpenResearch releases stays a
 //! matter of keeping those hooks in place. See `VLRESEARCH.md`.
 
+pub(crate) mod activity;
+pub(crate) mod api;
 pub(crate) mod egress;
 pub(crate) mod harness;
+pub(crate) mod stall;
 pub(crate) mod wake;
 
 /// Environment VLResearch adds to every coding-agent process: the

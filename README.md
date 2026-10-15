@@ -2,10 +2,11 @@
 
 A local-first workspace for research agents, tuned for quantitative research: adding datasets, updating models, and making processes faster, with experiments run on your own machines over SSH.
 
-VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes three things:
+VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes four things:
 
 - **Nothing leaves your machine except SSH and your LLM.** orx itself never calls an LLM; your coding agent does. VLResearch blocks what orx would otherwise send on its own: update checks, accounts and managed compute, literature APIs, GitHub, Overleaf and agent installers. It also turns off the agents' own telemetry and auto-updates.
 - **Chats hear back from their runs.** Every run a chat launches wakes that chat when it finishes, instead of only when the agent remembered to ask.
+- **Stuck runs get noticed.** If a run a chat is waiting on prints nothing for 30 minutes, logs a NaN or infinite metric, or hits an out-of-memory error while still running, orx tells the agent. The agent can then read the log and cancel the run instead of letting it burn compute.
 - **Waiting is visible.** When Claude Code is retrying a failed API call, the chat shows a retry row instead of a silent hang. Claude Code also keeps a checklist of its steps (its TodoWrite tool), whichever model you pick.
 
 Planned next: a metrics ledger, an idea queue, a "grill me" scoping step before any compute is spent, a forecast-and-verify improvement loop, and a findings ledger.
@@ -50,6 +51,7 @@ All optional. Set them in the environment `orx up` starts from.
 | `VLR_AUTO_WAKE` | on | `0` keeps OpenResearch's opt-in wake-ups |
 | `VLR_AGENT_ENV_DEFAULTS` | on | `0` stops orx adding the no-telemetry settings to agent processes |
 | `VLR_AGENT_CHECKLIST` | on | `0` leaves Claude Code's task tools as Claude Code configures them |
+| `VLR_STALL_MINUTES` | `30` | Minutes a running job may print nothing before its chat is told; `0` turns stall alerts off |
 
 ## Keys and secrets
 

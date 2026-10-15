@@ -786,6 +786,8 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/internal/permissions", post(bridge_permission))
         .route("/api/chat/attachments/{name}", get(chat_attachment))
         .route("/api/agent/status", get(agent_status))
+        // VLResearch: this distribution's endpoints, under /api/vlresearch.
+        .merge(crate::flavor::api::router())
         .fallback(spa)
         // Chat attachments (PDFs, images) ride as base64 in the send-message
         // JSON body; the 2 MB axum default rejects any real paper. Cap it well

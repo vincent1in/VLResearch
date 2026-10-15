@@ -30,6 +30,10 @@ use crate::store::{
     StoredChatTurn, StoredQueuedChatMessage,
 };
 
+// VLResearch: flavor code that starts hidden turns (src/flavor/chat_host.rs).
+#[path = "../../flavor/chat_host.rs"]
+mod vlresearch;
+
 /// Min interval between mid-turn persist+broadcast flushes (streaming parts
 /// can update many times a second; the final flush is always unconditional).
 const FLUSH_INTERVAL: Duration = Duration::from_millis(75);
@@ -3623,6 +3627,7 @@ impl ChatHost {
     }
 
     fn emit(&self, name: &'static str, data: Value) {
+        crate::flavor::activity::note(name, &data); // VLResearch: progress strip clock.
         let _ = self.events.send((name, data));
     }
 
@@ -8645,6 +8650,7 @@ pub async fn watch_runs(
         {
             eprintln!("orx up: spawn watcher: {err}");
         }
+        vlresearch::process_stall_alerts(&chat).await; // VLResearch: stall alerts.
     }
 }
 
