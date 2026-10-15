@@ -719,7 +719,7 @@ fn display_name(experiment: &LocalExperiment) -> String {
 /// The one rule for "best": walking finished, counted runs in the order they
 /// ended, a run takes over only when it gains more than the noise floor on the
 /// current best. Used for the project and for each experiment alike.
-fn best_by_rule<'a>(
+pub(crate) fn best_by_rule<'a>(
     runs: impl Iterator<Item = &'a ScoredRun>,
     metric: &PrimaryMetric,
 ) -> Option<&'a ScoredRun> {
@@ -877,25 +877,53 @@ pub(crate) fn lineage(
         .into_iter()
         .map(|experiment| (experiment.id.clone(), experiment))
         .collect();
+    let chain = ancestry(&best.experiment_id, |id| {
+        experiments
+            .get(id)
+            .and_then(|experiment| experiment.parent_experiment_id.clone())
+    });
+    let name = |id: &str| {
+        experiments
+            .get(id)
+            .map(display_name)
+            .unwrap_or_else(|| id.to_string())
+    };
+    Ok(path_steps(&chain, name, best, runs, metric))
+}
+
+/// An experiment and its ancestors, root first.
+pub(crate) fn ancestry(
+    experiment_id: &str,
+    parent: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let mut chain = Vec::new();
-    let mut cursor = Some(best.experiment_id.clone());
+    let mut cursor = Some(experiment_id.to_string());
     while let Some(id) = cursor {
         if chain.contains(&id) || chain.len() > 10_000 {
             break;
         }
-        cursor = experiments
-            .get(&id)
-            .and_then(|experiment| experiment.parent_experiment_id.clone());
+        cursor = parent(&id);
         chain.push(id);
     }
     chain.reverse();
+    chain
+}
+
+/// The scored steps along `chain` (root first), ending at the best run.
+pub(crate) fn path_steps(
+    chain: &[String],
+    name: impl Fn(&str) -> String,
+    best: &ScoredRun,
+    runs: &[ScoredRun],
+    metric: &PrimaryMetric,
+) -> Vec<PathStep> {
     let mut steps = Vec::with_capacity(chain.len());
     let mut previous: Option<f64> = None;
     for id in chain {
-        let (run_id, score, probe_runs) = if id == best.experiment_id {
+        let (run_id, score, probe_runs) = if *id == best.experiment_id {
             (Some(best.run_id.clone()), best.score, 0)
         } else {
-            match experiment_reference(runs, &id, metric, true) {
+            match experiment_reference(runs, id, metric, true) {
                 Some(reference) => (
                     reference.run_id,
                     Some(reference.score),
@@ -912,19 +940,16 @@ pub(crate) fn lineage(
             previous = score;
         }
         steps.push(PathStep {
-            experiment: experiments
-                .get(&id)
-                .map(display_name)
-                .unwrap_or_else(|| id.clone()),
+            experiment: name(id),
             idea: None,
             run_id,
             score,
             probe_runs,
-            experiment_id: id,
+            experiment_id: id.clone(),
             delta,
         });
     }
-    Ok(steps)
+    steps
 }
 
 /// An optimization's standing on its primary metric: the running best among

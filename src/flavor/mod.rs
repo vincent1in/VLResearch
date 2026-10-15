@@ -7,6 +7,8 @@
 
 pub(crate) mod activity;
 pub(crate) mod api;
+#[cfg(test)]
+mod bench;
 pub(crate) mod brief_cli;
 pub(crate) mod cli;
 pub(crate) mod compact;

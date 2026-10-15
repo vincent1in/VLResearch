@@ -588,25 +588,7 @@ pub(crate) fn close(
                     idea.id
                 ));
             };
-            let gain = match metric.direction {
-                Direction::Max => change,
-                Direction::Min => -change,
-            };
-            let floor = metric.noise_floor.unwrap_or(0.0);
-            // An ablation check predicts that taking its step back out loses
-            // about what the step gained: it holds when the change lands in
-            // that forecast's interval. Far less or far more means the steps
-            // interact.
-            let held = match (&idea.ablates, idea.forecast_low, idea.forecast_high) {
-                (Some(_), Some(low), Some(high)) => (low..=high).contains(&change),
-                (Some(_), _, _) => -gain > floor,
-                (None, _, _) => gain > floor,
-            };
-            if held {
-                Status::Kept
-            } else {
-                Status::Refuted
-            }
+            judge(&idea, change, metric)
         }
     };
     let now = crate::store::now_ms();
@@ -644,6 +626,29 @@ pub(crate) fn close(
     Ok(Closed { idea, ablations })
 }
 
+/// The keep rule for an idea measured at `change` against its parent: an
+/// attempt is kept when it gains more than the noise floor. An ablation check
+/// predicts that taking its step back out loses about what the step gained:
+/// it holds when the change lands in that forecast's interval. Far less or
+/// far more means the steps interact.
+pub(crate) fn judge(idea: &Idea, change: f64, metric: &PrimaryMetric) -> Status {
+    let gain = match metric.direction {
+        Direction::Max => change,
+        Direction::Min => -change,
+    };
+    let floor = metric.noise_floor.unwrap_or(0.0);
+    let held = match (&idea.ablates, idea.forecast_low, idea.forecast_high) {
+        (Some(_), Some(low), Some(high)) => (low..=high).contains(&change),
+        (Some(_), _, _) => -gain > floor,
+        (None, _, _) => gain > floor,
+    };
+    if held {
+        Status::Kept
+    } else {
+        Status::Refuted
+    }
+}
+
 /// Turns the automatic ablation checks on or off (`VLR_AUTO_ABLATE` or the
 /// Settings page; on unless `0`).
 pub(crate) const AUTO_ABLATE_ENV: &str = "VLR_AUTO_ABLATE";
@@ -674,33 +679,13 @@ pub(crate) fn queue_ablations(
         return Ok(Vec::new());
     }
     let ideas = list(store, &brief.id)?;
-    let floor = metric.noise_floor.unwrap_or(0.0);
     let best_name = path
         .last()
         .map_or(experiment_id, |step| step.experiment.as_str());
-    let mut steps = Vec::new();
-    for step in &path[1..path.len() - 1] {
-        let Some(delta) = step.delta else {
-            continue;
-        };
-        let gain = match metric.direction {
-            Direction::Max => delta,
-            Direction::Min => -delta,
-        };
-        // Each step is checked once; a dropped check doesn't count.
-        let checked = ideas.iter().any(|idea| {
-            idea.ablates.as_deref() == Some(&step.experiment_id) && idea.status != Status::Dropped
-        });
-        if gain > floor && gain > 0.0 && !checked {
-            steps.push((step, delta, gain));
-        }
-    }
-    steps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     let mut queued = Vec::new();
-    for (step, delta, gain) in steps.into_iter().take(ABLATIONS_PER_BEST) {
+    for target in ablation_targets(&path, &ideas, metric) {
+        let step = target.step;
         let label = step.idea.clone().unwrap_or_else(|| step.experiment.clone());
-        let forecast = -delta;
-        let spread = floor.max(gain / 2.0);
         let key = &metric.key;
         let idea = add(
             store,
@@ -715,16 +700,13 @@ pub(crate) fn queue_ablations(
                      change back out of {best_name} (a child of it) should change {key} by about \
                      {}; a much smaller or larger change means the steps interact, and the \
                      contribution waterfall's split is off.",
-                    super::metric_cli::signed(delta),
-                    super::metric_cli::signed(forecast),
+                    super::metric_cli::signed(target.delta),
+                    super::metric_cli::signed(target.forecast),
                 )),
-                forecast: Some(forecast),
-                forecast_low: Some(forecast - spread),
-                forecast_high: Some(forecast + spread),
-                cost_hours: ideas
-                    .iter()
-                    .find(|idea| idea.experiment_id.as_deref() == Some(&step.experiment_id))
-                    .and_then(|idea| idea.cost_hours),
+                forecast: Some(target.forecast),
+                forecast_low: Some(target.low),
+                forecast_high: Some(target.high),
+                cost_hours: target.cost_hours,
                 author: Some(Author::Review),
                 ..IdeaFields::default()
             },
@@ -736,6 +718,72 @@ pub(crate) fn queue_ablations(
         queued.push(require(store, &idea.id)?);
     }
     Ok(queued)
+}
+
+/// A lineage step an ablation check tests, with that check's forecast.
+#[derive(Debug, Clone)]
+pub(crate) struct AblationTarget<'a> {
+    pub step: &'a metrics::PathStep,
+    /// The step's change on the way to the best.
+    pub delta: f64,
+    /// Taking it back out should undo it: the forecast and its interval.
+    pub forecast: f64,
+    pub low: f64,
+    pub high: f64,
+    /// What the step's own idea cost.
+    pub cost_hours: Option<f64>,
+}
+
+/// The steps behind a new best that ablation checks should test: the biggest
+/// earlier steps on its lineage path that gained more than the noise floor
+/// and haven't been checked (a dropped check doesn't count), at most
+/// [`ABLATIONS_PER_BEST`]. Neither the baseline nor the best's own step is
+/// one: taking the best's step out gives its parent, which is already scored.
+pub(crate) fn ablation_targets<'a>(
+    path: &'a [metrics::PathStep],
+    ideas: &[Idea],
+    metric: &PrimaryMetric,
+) -> Vec<AblationTarget<'a>> {
+    if path.len() < 3 {
+        return Vec::new();
+    }
+    let floor = metric.noise_floor.unwrap_or(0.0);
+    let mut steps = Vec::new();
+    for step in &path[1..path.len() - 1] {
+        let Some(delta) = step.delta else {
+            continue;
+        };
+        let gain = match metric.direction {
+            Direction::Max => delta,
+            Direction::Min => -delta,
+        };
+        let checked = ideas.iter().any(|idea| {
+            idea.ablates.as_deref() == Some(&step.experiment_id) && idea.status != Status::Dropped
+        });
+        if gain > floor && gain > 0.0 && !checked {
+            steps.push((step, delta, gain));
+        }
+    }
+    steps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    steps
+        .into_iter()
+        .take(ABLATIONS_PER_BEST)
+        .map(|(step, delta, gain)| {
+            let forecast = -delta;
+            let spread = floor.max(gain / 2.0);
+            AblationTarget {
+                step,
+                delta,
+                forecast,
+                low: forecast - spread,
+                high: forecast + spread,
+                cost_hours: ideas
+                    .iter()
+                    .find(|idea| idea.experiment_id.as_deref() == Some(&step.experiment_id))
+                    .and_then(|idea| idea.cost_hours),
+            }
+        })
+        .collect()
 }
 
 /// The experiment's best finished score minus its parent's, on the primary
