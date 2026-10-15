@@ -2,7 +2,7 @@
 
 A local-first workspace for research agents, tuned for quantitative research: adding datasets, updating models, and making processes faster, with experiments run on your own machines over SSH.
 
-VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes seven things:
+VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenResearch) by alphaXiv. It keeps OpenResearch's experiment tree, SSH and Slurm compute, and chat with your coding agent (Claude Code, Codex or OpenCode), and changes eight things:
 
 - **Nothing leaves your machine except SSH and your LLM.** orx itself never calls an LLM; your coding agent does. VLResearch blocks what orx would otherwise send on its own: update checks, accounts and managed compute, literature APIs, GitHub, Overleaf and agent installers. It also turns off the agents' own telemetry and auto-updates.
 - **Chats hear back from their runs.** Every run a chat launches wakes that chat when it finishes, instead of only when the agent remembered to ask.
@@ -11,8 +11,9 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **Runs are scored.** Run code prints `ORX_METRIC {json}` lines and orx records them per run. Each project names one primary metric and its direction. `orx metric` then ranks runs on it, tracks the best run against the baseline, and splits the gain across the experiments between them. A noise floor keeps a lucky run from counting as an improvement.
 - **Ideas are work items.** Each idea to try is queued with a forecast, an 80% interval, a GPU-hour cost and a cheap kill test. `orx idea next` picks the next one by expected gain per GPU-hour, with blockers first and a rule that keeps the search from only making small steps. Closing an idea measures what its experiment did against its parent, so forecasts can be checked.
 - **Work is scoped before compute is spent.** The agent interviews you in rounds, each question with its recommended answer, until the objective, metric, limits, budget and stop rule are agreed, then reviews the data for leakage and proposes ideas. Once a project has this brief, orx holds every launch to it.
+- **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
 
-Planned next: dashboard views for chat progress, metrics and ideas, and a findings ledger.
+Planned next: dashboard views for chat progress, metrics, ideas, the brief and findings.
 
 ## Scoring runs
 
@@ -59,6 +60,15 @@ orx brief confirm <projectId>    # only after you have agreed to it
 ```
 
 Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the run would change a locked file, or once the run or day budget is spent. Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder.
+
+Findings record what the loop learns:
+
+```sh
+orx finding add <projectId> "Volume features add IC in high-volatility months" --kind model
+orx finding evidence <findingId> --supports --run <runId> --note "2022 fold: +0.004 IC"
+orx finding assess <findingId> --verdict supported --confidence 0.7 --scope "2016-2023"
+orx finding lock <findingId>     # settled; agents can add evidence but not change it
+```
 
 The `orx-improve` skill then runs the loop: pick the next idea, check its forecast against past calibration, build it on a child of the best experiment, run it, measure it, and keep a new best only past the noise floor, after a replicate with new seeds.
 

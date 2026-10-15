@@ -19,6 +19,99 @@ pub(crate) enum FlavorCommand {
     /// The project's agreed brief: objective, limits, budget and stop rule.
     /// Once a project has one, launches wait for it to be confirmed.
     Brief(BriefArgs),
+    /// Record what the project has learned: claims, the runs that back or
+    /// undercut them, how claims relate, and verdicts over time.
+    Finding(FindingArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct FindingArgs {
+    #[command(subcommand)]
+    pub command: FindingCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum FindingCommand {
+    /// Add a claim.
+    Add {
+        project_id: String,
+        statement: String,
+        /// What the claim is about.
+        #[arg(long, value_enum)]
+        kind: super::findings::Kind,
+        /// The idea whose test produced or tests it.
+        #[arg(long, value_name = "IDEA_ID")]
+        idea: Option<String>,
+    },
+    /// A project's findings, most recently changed first.
+    List {
+        project_id: String,
+        #[arg(long, value_enum)]
+        status: Option<super::findings::Status>,
+        #[arg(long, value_enum)]
+        kind: Option<super::findings::Kind>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One finding with its evidence, links and assessments.
+    Show {
+        finding_id: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record a run, experiment or observation that backs or undercuts a
+    /// claim. A run brings a snapshot of its metrics.
+    Evidence {
+        finding_id: String,
+        #[arg(long, conflicts_with = "refutes", required_unless_present = "refutes")]
+        supports: bool,
+        #[arg(long)]
+        refutes: bool,
+        #[arg(long, value_name = "RUN_ID")]
+        run: Option<String>,
+        #[arg(long, value_name = "EXPERIMENT_ID")]
+        experiment: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Link two findings: `<findingId> <relation> <otherId>`.
+    Relate {
+        finding_id: String,
+        #[arg(value_enum)]
+        relation: super::findings::Relation,
+        other_id: String,
+    },
+    /// Add a verdict. Earlier verdicts stay on record.
+    Assess {
+        finding_id: String,
+        #[arg(long, value_enum)]
+        verdict: super::findings::Verdict,
+        /// From 0 to 1.
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Where the verdict holds: universe, period, regime, model family.
+        #[arg(long)]
+        scope: Option<String>,
+        /// What the evidence doesn't cover yet.
+        #[arg(long)]
+        gaps: Option<String>,
+        /// The evidence that would settle it.
+        #[arg(long)]
+        next: Option<String>,
+    },
+    /// Reword a claim.
+    Edit {
+        finding_id: String,
+        #[arg(long)]
+        statement: String,
+    },
+    /// Mark a finding settled: agents can still add evidence, but can't
+    /// reword or re-judge it.
+    Lock { finding_id: String },
+    /// Reopen a locked finding. Only the user can, from a terminal.
+    Unlock { finding_id: String },
 }
 
 #[derive(Args, Debug)]
@@ -90,6 +183,7 @@ impl FlavorCommand {
             FlavorCommand::Metric(_) => "metric",
             FlavorCommand::Idea(_) => "idea",
             FlavorCommand::Brief(_) => "brief",
+            FlavorCommand::Finding(_) => "finding",
         }
     }
 }
@@ -267,15 +361,15 @@ pub(crate) enum MetricCommand {
     },
 }
 
+/// Runs a command. They only read and write the local store, so they run in
+/// place, like upstream's `orx runs`.
 pub(crate) async fn run(command: FlavorCommand) -> Result<()> {
-    let name = command.name();
-    tokio::task::spawn_blocking(move || match command {
+    match command {
         FlavorCommand::Metric(args) => metric(args.command),
         FlavorCommand::Idea(args) => super::idea_cli::run(args.command),
         FlavorCommand::Brief(args) => super::brief_cli::run(args.command),
-    })
-    .await
-    .map_err(|error| anyhow!("orx {name} stopped unexpectedly: {error}"))?
+        FlavorCommand::Finding(args) => super::finding_cli::run(args.command),
+    }
 }
 
 /// Whether a tokenized `orx …` call only reads, for Claude's plan-mode gate.
@@ -297,6 +391,8 @@ pub(crate) fn is_readonly(tokens: &[&str]) -> bool {
                         | IdeaCommand::Calibration { .. },
                 }) | FlavorCommand::Brief(BriefArgs {
                     command: BriefCommand::Show { .. },
+                }) | FlavorCommand::Finding(FindingArgs {
+                    command: FindingCommand::List { .. } | FindingCommand::Show { .. },
                 })
             ))
         ),
@@ -548,7 +644,8 @@ fn best(store: &Store, project_id: &str, json: bool) -> Result<()> {
     let Some(metric) = metrics::primary(store, &project.id)? else {
         return Err(no_primary(store, &project.id)?);
     };
-    let (standing, path, _) = metrics::standing(store, &project.id, &metric)?;
+    let (standing, path, runs) = metrics::standing(store, &project.id, &metric)?;
+    let trials = super::ideas::trials(store, &project.id, &runs)?;
     if json {
         println!(
             "{}",
@@ -558,6 +655,7 @@ fn best(store: &Store, project_id: &str, json: bool) -> Result<()> {
                 "baseline": standing.baseline,
                 "path": path,
                 "history": standing.history,
+                "trials": trials,
             }))?
         );
         return Ok(());
@@ -594,6 +692,14 @@ fn best(store: &Store, project_id: &str, json: bool) -> Result<()> {
             best.experiment
         ),
     }
+    println!(
+        "Trials behind it: {} finished run{}, {} tested idea{} ({} kept).",
+        trials.runs,
+        if trials.runs == 1 { "" } else { "s" },
+        trials.ideas_tested,
+        if trials.ideas_tested == 1 { "" } else { "s" },
+        trials.ideas_kept
+    );
     if path.len() > 1 {
         println!("\nPath from the baseline:");
         let column = metric.key.to_uppercase();
@@ -652,6 +758,8 @@ mod tests {
             "orx idea next proj_1",
             "orx idea calibration proj_1 --json",
             "orx brief show proj_1",
+            "orx finding list proj_1 --status supported",
+            "orx finding show fnd_1 --json",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();
             assert!(is_readonly(&tokens), "{call}");
@@ -665,6 +773,7 @@ mod tests {
             "orx idea start idea_1 exp_1",
             "orx brief confirm proj_1",
             "orx brief set proj_1 --objective x",
+            "orx finding unlock fnd_1",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();
             assert!(!is_readonly(&tokens), "{call}");

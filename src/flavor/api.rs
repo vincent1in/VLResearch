@@ -26,6 +26,68 @@ where
         )
         .route("/api/vlresearch/projects/{id}/ideas", get(project_ideas))
         .route("/api/vlresearch/projects/{id}/brief", get(project_brief))
+        .route(
+            "/api/vlresearch/projects/{id}/findings",
+            get(project_findings),
+        )
+        .route("/api/vlresearch/findings/{id}", get(finding_detail))
+}
+
+/// The project's findings with their evidence counts, for the ledger table.
+async fn project_findings(Path(project_id): Path<String>) -> ApiResult {
+    let body = tokio::task::spawn_blocking(move || -> crate::error::Result<Option<Value>> {
+        let store = Store::open()?;
+        let Some(project) = store.get_local_project(&project_id)? else {
+            return Ok(None);
+        };
+        let mut rows = Vec::new();
+        for finding in super::findings::list(&store, &project.id)? {
+            let (supporting, against) = super::findings::evidence_counts(&store, &finding.id)?;
+            rows.push(json!({
+                "finding": finding,
+                "supporting": supporting,
+                "against": against,
+            }));
+        }
+        Ok(Some(json!({ "findings": rows })))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    body.map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))
+}
+
+/// One finding's page: the claim, its evidence, its one-hop links (with the
+/// linked claims' statements) and its assessments.
+async fn finding_detail(Path(finding_id): Path<String>) -> ApiResult {
+    let body = tokio::task::spawn_blocking(move || -> crate::error::Result<Option<Value>> {
+        let store = Store::open()?;
+        let Some(finding) = super::findings::get(&store, &finding_id)? else {
+            return Ok(None);
+        };
+        let mut neighbors = Vec::new();
+        for link in super::findings::links(&store, &finding.id)? {
+            let other = if link.from_id == finding.id {
+                &link.to_id
+            } else {
+                &link.from_id
+            };
+            let statement = super::findings::get(&store, other)?.map(|other| other.statement);
+            neighbors.push(json!({ "link": link, "statement": statement }));
+        }
+        Ok(Some(json!({
+            "evidence": super::findings::evidence(&store, &finding.id)?,
+            "assessments": super::findings::assessments(&store, &finding.id)?,
+            "links": neighbors,
+            "finding": finding,
+        })))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    body.map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "finding not found".to_string()))
 }
 
 /// The project's brief, what it still lacks, and the budget used so far.
@@ -116,6 +178,7 @@ async fn project_metrics(Path(project_id): Path<String>) -> ApiResult {
                     "baseline": standing.baseline,
                     "history": standing.history,
                     "path": path,
+                    "trials": super::ideas::trials(&store, &project.id, &runs)?,
                     "runs": runs,
                 })
             }

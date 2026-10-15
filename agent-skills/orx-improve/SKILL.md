@@ -24,10 +24,13 @@ one, scope the work first with `orx-grill`.
 4. **Run.** `orx idea start <ideaId> <expId>`, then launch. When the full
    idea is expensive, run its kill test first. The chat is woken when runs
    finish, and told if one stalls or diverges.
-5. **Verify.** `orx idea done <ideaId> --evidence "<runs, numbers, and one
-   sentence on what this taught>"`. orx measures the change against the
-   parent, compares it with the noise floor, and keeps or refutes the idea.
-6. **Retain.** A new best counts only past the noise floor
+5. **Verify.** `orx idea done <ideaId> --evidence "<runs and numbers>"`.
+   orx measures the change against the parent, compares it with the noise
+   floor, and keeps or refutes the idea.
+6. **Learn.** Record what the result says beyond this one idea as a finding,
+   with the runs as evidence (`orx-findings`), whether the idea was kept or
+   refuted.
+7. **Retain.** A new best counts only past the noise floor
    (`orx metric best`). Before building on it, queue a replicate
    (`orx idea add <projectId> "Replicate <idea>" --kind replicate`) with new
    seeds, and keep it as the incumbent only if the gain holds.

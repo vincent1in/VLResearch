@@ -35,8 +35,15 @@ pub(crate) const IMPROVE: AgentSkill = AgentSkill {
     resources: &[],
 };
 
+pub(crate) const FINDINGS: AgentSkill = AgentSkill {
+    name: "orx-findings",
+    description: "Record what the project has learned as claims with evidence using `orx finding`: back or undercut a claim with runs, link related claims, and add verdicts with confidence and scope. Use after an idea closes, when a result changes what you believe about the data, model or pipeline, and before summarizing what is known.",
+    content: include_str!("../../agent-skills/orx-findings/SKILL.md"),
+    resources: &[],
+};
+
 /// VLResearch's skills, in the order they are listed.
-const SKILLS: [&AgentSkill; 4] = [&METRICS, &IDEAS, &GRILL, &IMPROVE];
+const SKILLS: [&AgentSkill; 5] = [&METRICS, &IDEAS, &FINDINGS, &GRILL, &IMPROVE];
 
 /// Adds VLResearch's skills to an upstream skill list, right after
 /// `orx-results` (or at the end if upstream renames it).
@@ -65,8 +72,14 @@ mod tests {
                 .position(|name| *name == "orx-results")
                 .unwrap();
             assert_eq!(
-                names[results + 1..results + 5],
-                ["orx-metrics", "orx-ideas", "orx-grill", "orx-improve"]
+                names[results + 1..results + 6],
+                [
+                    "orx-metrics",
+                    "orx-ideas",
+                    "orx-findings",
+                    "orx-grill",
+                    "orx-improve"
+                ]
             );
         }
     }

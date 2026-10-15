@@ -729,6 +729,29 @@ pub(crate) struct Calibration {
     pub kept: usize,
 }
 
+/// The attempts behind a project's best result, for discounting it: every
+/// finished non-probe run, and every tested idea.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Trials {
+    pub runs: usize,
+    pub ideas_tested: usize,
+    pub ideas_kept: usize,
+}
+
+pub(crate) fn trials(
+    store: &Store,
+    project_id: &str,
+    runs: &[metrics::ScoredRun],
+) -> Result<Trials> {
+    let report = calibration(&list(store, project_id)?);
+    Ok(Trials {
+        runs: runs.iter().filter(|run| run.counts()).count(),
+        ideas_tested: report.tested,
+        ideas_kept: report.kept,
+    })
+}
+
 pub(crate) fn calibration(ideas: &[Idea]) -> Calibration {
     let mut result = Calibration::default();
     let mut errors = Vec::new();
