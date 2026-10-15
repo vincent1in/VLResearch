@@ -881,15 +881,16 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
                 .max(MIN_COST_HOURS)
         })
     };
+    // A forecast with no upside says no more for an idea than no forecast.
+    let promising = |rate: &Option<f64>| rate.is_some_and(|value| value > 0.0);
     let best_of = |pool: &[&Idea]| -> Option<(Idea, Option<f64>)> {
         pool.iter()
             .map(|idea| (*idea, rate(idea)))
             .max_by(|(a, rate_a), (b, rate_b)| {
-                // Forecast ideas beat unforecast ones; then by rate; then by
+                // Ideas forecast to gain beat the rest; then by rate; then by
                 // priority and age.
-                rate_a
-                    .is_some()
-                    .cmp(&rate_b.is_some())
+                promising(rate_a)
+                    .cmp(&promising(rate_b))
                     .then(
                         rate_a
                             .unwrap_or(0.0)
@@ -929,13 +930,17 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
             score,
         }));
     }
+    let forecast_any = candidates.iter().any(|idea| idea.forecast.is_some());
     Ok(best_of(&candidates).map(|(idea, score)| {
         let reason = match score {
-            Some(score) => format!(
+            Some(score) if score > 0.0 => format!(
                 "highest expected gain per GPU-hour ({}) among open ideas",
                 metrics::format_value(Some(score))
             ),
-            None => "no open idea has a forecast yet, so the most urgent goes first".to_string(),
+            _ if forecast_any => "no open idea is forecast to improve the metric, so the most \
+                                  urgent goes first"
+                .to_string(),
+            _ => "no open idea has a forecast yet, so the most urgent goes first".to_string(),
         };
         Pick {
             idea,
@@ -1306,6 +1311,52 @@ mod tests {
         let pick = next(&store, "p").unwrap().unwrap();
         assert_eq!(pick.idea.id, costly.id);
         assert!(pick.reason.contains("orthogonal"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forecast_with_no_upside_ranks_with_the_unforecast_ideas() {
+        let (store, dir) = temp_store();
+        // No primary metric yet, so higher is better: this forecast only hurts.
+        add(
+            &store,
+            "p",
+            IdeaFields {
+                forecast: Some(-0.002),
+                priority: Some(3),
+                ..fields("Smaller model")
+            },
+        )
+        .unwrap();
+        let unforecast = add(
+            &store,
+            "p",
+            IdeaFields {
+                priority: Some(1),
+                ..fields("Lagged returns")
+            },
+        )
+        .unwrap();
+        let pick = next(&store, "p").unwrap().unwrap();
+        assert_eq!(pick.idea.id, unforecast.id);
+        assert!(
+            pick.reason.contains("no open idea is forecast to improve"),
+            "{}",
+            pick.reason
+        );
+        // An idea with upside goes ahead of both.
+        let gain = add(
+            &store,
+            "p",
+            IdeaFields {
+                forecast: Some(0.001),
+                ..fields("Volume features")
+            },
+        )
+        .unwrap();
+        let pick = next(&store, "p").unwrap().unwrap();
+        assert_eq!(pick.idea.id, gain.id);
+        assert!(pick.reason.contains("highest expected gain"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
