@@ -1,12 +1,14 @@
 //! The scoping gate. Before compute is spent on improvement work, a brief is
 //! agreed with the user: the objective and primary metric, what may and must
-//! not change, a budget, and a stop rule. Once a project has a brief, launches
-//! are refused until it is confirmed, while an open blocker idea stands, when
-//! the snapshot about to run changes a locked file, or once the budget is
-//! spent. Projects without a brief launch as upstream does, with a reminder,
-//! unless `VLR_SCOPE_GATE=strict`. Probe runs (`VLR_PROBE=1`: smoke tests,
-//! baseline reproductions, noise-floor seeds) pass the gate and never count as
-//! a best result.
+//! not change, a budget, a stop rule, and at least one idea to start from.
+//! Once a project has a brief, launches are refused until it is confirmed,
+//! while an open blocker idea stands, when the snapshot about to run changes a
+//! locked file, or once the budget is spent. Projects without a brief launch
+//! as upstream does, with a reminder, unless `VLR_SCOPE_GATE=strict`; but the
+//! improvement loop itself (`orx idea next`, `orx idea start`) waits for a
+//! confirmed brief either way. Probe runs (`VLR_PROBE=1`: smoke tests, baseline
+//! reproductions, noise-floor seeds) pass the gate and never count as a best
+//! result.
 //!
 //! Inside a chat, `orx exp run` is forwarded to the `orx up` server, whose
 //! environment is not the agent's. So the launching command records a probe
@@ -76,6 +78,9 @@ pub(crate) struct Brief {
     /// later edits and confirmations until the user asks for a fresh budget.
     pub budget_since: Option<i64>,
     pub updated_at: i64,
+    /// The chat the user started this research in from the dashboard, which
+    /// is told when they confirm the brief there.
+    pub chat_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
@@ -98,6 +103,8 @@ pub(crate) struct BriefFields {
     pub budget_runs: Option<i64>,
     pub budget_gpu_hours: Option<f64>,
     pub budget_days: Option<f64>,
+    /// Clear all three budgets before applying the ones given.
+    pub clear_budget: bool,
     /// Start the budget over at the next confirmation.
     pub reset_budget: bool,
     pub pointers: Option<String>,
@@ -142,6 +149,7 @@ fn ensure_tables(conn: &Connection) -> Result<()> {
              UPDATE vlr_briefs SET budget_since = confirmed_at;",
         )?;
     }
+    super::metrics::add_column(conn, "vlr_briefs", "chat_session_id", "TEXT")?;
     Ok(())
 }
 
@@ -152,7 +160,7 @@ pub(crate) fn get(store: &Store, project_id: &str) -> Result<Option<Brief>> {
         .query_row(
             "SELECT project_id, objective, may_change, must_not_change, locked_json, budget_runs,
                     budget_gpu_hours, budget_days, pointers, sources, stop_rule, confirmed_at,
-                    confirmed_by, updated_at, budget_since
+                    confirmed_by, updated_at, budget_since, chat_session_id
              FROM vlr_briefs WHERE project_id = ?1",
             [project_id],
             |row| {
@@ -173,6 +181,7 @@ pub(crate) fn get(store: &Store, project_id: &str) -> Result<Option<Brief>> {
                     confirmed_by: row.get(12)?,
                     updated_at: row.get(13)?,
                     budget_since: row.get(14)?,
+                    chat_session_id: row.get(15)?,
                 })
             },
         )
@@ -222,6 +231,11 @@ pub(crate) fn set(store: &Store, project_id: &str, fields: BriefFields) -> Resul
     brief.pointers = text(fields.pointers, brief.pointers);
     brief.sources = text(fields.sources, brief.sources);
     brief.stop_rule = text(fields.stop_rule, brief.stop_rule);
+    if fields.clear_budget {
+        brief.budget_runs = None;
+        brief.budget_gpu_hours = None;
+        brief.budget_days = None;
+    }
     if let Some(runs) = fields.budget_runs {
         if runs < 1 {
             return Err(anyhow!("A run budget is at least 1."));
@@ -269,8 +283,8 @@ fn save(store: &Store, brief: &Brief) -> Result<()> {
     conn.execute(
         "INSERT INTO vlr_briefs (project_id, objective, may_change, must_not_change, locked_json,
              budget_runs, budget_gpu_hours, budget_days, pointers, sources, stop_rule,
-             confirmed_at, confirmed_by, updated_at, budget_since)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             confirmed_at, confirmed_by, updated_at, budget_since, chat_session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(project_id) DO UPDATE SET objective = excluded.objective,
              may_change = excluded.may_change, must_not_change = excluded.must_not_change,
              locked_json = excluded.locked_json, budget_runs = excluded.budget_runs,
@@ -278,7 +292,7 @@ fn save(store: &Store, brief: &Brief) -> Result<()> {
              pointers = excluded.pointers, sources = excluded.sources,
              stop_rule = excluded.stop_rule, confirmed_at = excluded.confirmed_at,
              confirmed_by = excluded.confirmed_by, updated_at = excluded.updated_at,
-             budget_since = excluded.budget_since",
+             budget_since = excluded.budget_since, chat_session_id = excluded.chat_session_id",
         params![
             brief.project_id,
             brief.objective,
@@ -295,9 +309,53 @@ fn save(store: &Store, brief: &Brief) -> Result<()> {
             brief.confirmed_by,
             brief.updated_at,
             brief.budget_since,
+            brief.chat_session_id,
         ],
     )?;
     Ok(())
+}
+
+/// Links the brief to the chat the user started the research in.
+pub(crate) fn set_chat(store: &Store, project_id: &str, session_id: &str) -> Result<Brief> {
+    let mut brief =
+        get(store, project_id)?.ok_or_else(|| anyhow!("Project {project_id} has no brief yet."))?;
+    brief.chat_session_id = Some(session_id.to_owned());
+    save(store, &brief)?;
+    Ok(brief)
+}
+
+/// The improvement loop's entry points (`orx idea next`, `orx idea start`)
+/// wait for a confirmed brief: what to improve and how it is measured, its
+/// limits, a budget, a stop rule and ideas to start from, agreed with the
+/// user. Even where launches are allowed without one. Off with the gate.
+pub(crate) fn require_confirmed(store: &Store, project_id: &str) -> Result<()> {
+    if gate_mode() == GateMode::Off {
+        return Ok(());
+    }
+    match get(store, project_id)? {
+        Some(brief) if brief.confirmed_at.is_some() => Ok(()),
+        Some(brief) => {
+            let missing = missing(store, &brief)?;
+            let next_step = if missing.is_empty() {
+                format!(
+                    "Show it to the user; they confirm it in the Research view, or once they \
+                     agree, run `orx brief confirm {project_id}`."
+                )
+            } else {
+                format!("It still needs {}.", missing.join("; "))
+            };
+            Err(anyhow!(
+                "The improvement loop starts from a confirmed brief, and project {project_id}'s \
+                 isn't confirmed yet. {next_step}"
+            ))
+        }
+        None => Err(anyhow!(
+            "The improvement loop starts from a confirmed brief: what to improve and how it is \
+             measured, what may and must not change, a budget, a stop rule and ideas to start \
+             from. Project {project_id} has none yet. Scope it with the user first (`orx skill \
+             grill`), or ask them to start it from the Research view in the Experiments tab."
+        )),
+    }
 }
 
 /// What a brief still lacks before it can be confirmed.
@@ -321,6 +379,17 @@ pub(crate) fn missing(store: &Store, brief: &Brief) -> Result<Vec<&'static str>>
     }
     if brief.stop_rule.is_none() {
         missing.push("a stop rule (--stop-rule)");
+    }
+    // The loop needs somewhere to start: the user's pointers and the
+    // interview's proposals, queued as ideas.
+    let queued = ideas::list(store, &brief.project_id)?
+        .into_iter()
+        .any(|idea| {
+            matches!(idea.status, ideas::Status::Open | ideas::Status::Running)
+                && !idea.is_blocker()
+        });
+    if !queued {
+        missing.push("at least one idea to start from (orx idea add)");
     }
     Ok(missing)
 }
@@ -705,6 +774,19 @@ mod tests {
         }
     }
 
+    /// An idea to start the loop from.
+    fn seed(store: &Store) {
+        ideas::add(
+            store,
+            "p",
+            ideas::IdeaFields {
+                title: Some("Volume features".into()),
+                ..ideas::IdeaFields::default()
+            },
+        )
+        .unwrap();
+    }
+
     fn primary(store: &Store) {
         metrics::set_primary(
             store,
@@ -756,9 +838,26 @@ mod tests {
         let refused = launch(true).unwrap_err().to_string();
         assert!(refused.contains("not confirmed"), "{refused}");
         assert!(refused.contains("a primary metric"), "{refused}");
+        assert!(refused.contains("at least one idea"), "{refused}");
         assert!(refused.contains("VLR_PROBE=1 orx exp run e"), "{refused}");
         assert!(confirm(&store, &project, "user").is_err());
         primary(&store);
+        // A blocker isn't an idea to start from.
+        ideas::add(
+            &store,
+            "p",
+            ideas::IdeaFields {
+                title: Some("Check the label join".into()),
+                kind: Some(ideas::Kind::EvalBlocker),
+                ..ideas::IdeaFields::default()
+            },
+        )
+        .map(|blocker| ideas::close(&store, &blocker.id, ideas::Verdict::Dropped, None))
+        .unwrap()
+        .unwrap();
+        let still = confirm(&store, &project, "user").unwrap_err().to_string();
+        assert!(still.contains("at least one idea"), "{still}");
+        seed(&store);
         let confirmed = confirm(&store, &project, "user").unwrap();
         assert_eq!(confirmed.locked[0].path, "eval");
         assert!(confirmed.locked[0].object.is_some());
@@ -851,6 +950,7 @@ mod tests {
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
         let project = project(&repo);
         primary(&store);
+        seed(&store);
         set(
             &store,
             "p",
@@ -885,6 +985,59 @@ mod tests {
         )
         .unwrap();
         assert!(get(&store, "p").unwrap().unwrap().budget_since.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_loop_waits_for_a_confirmed_brief() {
+        let (store, dir) = temp_store();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let project = project(&repo);
+
+        let none = require_confirmed(&store, "p").unwrap_err().to_string();
+        assert!(none.contains("has none yet"), "{none}");
+        assert!(none.contains("Research view"), "{none}");
+
+        primary(&store);
+        set(
+            &store,
+            "p",
+            BriefFields {
+                objective: Some("Raise validation IC".into()),
+                must_not_change: Some("eval".into()),
+                budget_runs: Some(5),
+                stop_rule: Some("No gain in 3 runs".into()),
+                ..BriefFields::default()
+            },
+        )
+        .unwrap();
+        let unseeded = require_confirmed(&store, "p").unwrap_err().to_string();
+        assert!(unseeded.contains("at least one idea"), "{unseeded}");
+        seed(&store);
+        let unconfirmed = require_confirmed(&store, "p").unwrap_err().to_string();
+        assert!(unconfirmed.contains("confirm"), "{unconfirmed}");
+        confirm(&store, &project, "user").unwrap();
+        require_confirmed(&store, "p").unwrap();
+
+        // The dashboard links the chat it started, and the link survives edits.
+        set_chat(&store, "p", "chat_research").unwrap();
+        let edited = set(
+            &store,
+            "p",
+            BriefFields {
+                clear_budget: true,
+                budget_days: Some(7.0),
+                ..BriefFields::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(edited.chat_session_id.as_deref(), Some("chat_research"));
+        assert_eq!((edited.budget_runs, edited.budget_days), (None, Some(7.0)));
+        assert!(edited.confirmed_at.is_none());
+        assert!(set_chat(&store, "other", "chat_x").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

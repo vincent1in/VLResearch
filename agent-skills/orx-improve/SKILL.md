@@ -6,7 +6,8 @@ description: "Run the forecast-and-verify improvement loop on a scoped project: 
 ## Before the loop
 
 The project needs a confirmed brief: `orx brief show <projectId>`. Without
-one, scope the work first with `orx-grill`.
+one, scope the work first with `orx-grill`; `orx idea next` and
+`orx idea start` refuse until the user has confirmed it.
 
 ## One round
 

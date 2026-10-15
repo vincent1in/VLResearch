@@ -21,6 +21,7 @@ pub(crate) mod metrics;
 pub(crate) mod scope;
 pub(crate) mod skills;
 pub(crate) mod stall;
+pub(crate) mod start;
 pub(crate) mod wake;
 
 /// Environment VLResearch adds to every coding-agent process: the

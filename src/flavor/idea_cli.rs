@@ -55,7 +55,13 @@ pub(crate) fn run(command: IdeaCommand) -> Result<()> {
             idea_id,
             experiment_id,
         } => {
-            let idea = ideas::start(&store, &idea_id, &experiment_id)?;
+            // Testing ideas is the improvement loop, which waits for a
+            // confirmed brief; fixing a blocker can come before.
+            let idea = ideas::require(&store, &idea_id)?;
+            if !idea.is_blocker() {
+                super::scope::require_confirmed(&store, &idea.project_id)?;
+            }
+            let idea = ideas::start(&store, &idea.id, &experiment_id)?;
             println!(
                 "Idea {} is now tested by experiment {}. Close it with `orx idea done {}` once \
                  its runs have finished.",
@@ -274,6 +280,7 @@ fn report_closed(closed: &ideas::Closed) {
 
 fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
     let project = crate::local::resolve::resolve_project(store, project_id)?;
+    super::scope::require_confirmed(store, &project.id)?;
     let pick = ideas::next(store, &project.id)?;
     let learned = ideas::adjustment(&ideas::list(store, &project.id)?);
     let adjusted = pick

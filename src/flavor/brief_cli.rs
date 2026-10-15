@@ -40,6 +40,7 @@ pub(crate) fn run(command: BriefCommand) -> Result<()> {
                     budget_runs,
                     budget_gpu_hours,
                     budget_days,
+                    clear_budget: false,
                     reset_budget,
                     pointers,
                     sources,

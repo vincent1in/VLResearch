@@ -62,7 +62,7 @@ orx brief set <projectId> --objective "..." --lock eval/score.py --budget-runs 2
 orx brief confirm <projectId>    # only after you have agreed to it
 ```
 
-Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the commit about to run changes a locked file or folder, or once the run or day budget is spent. The budget counts from the first confirmation; editing and reconfirming the brief doesn't reset it unless you ask (`--reset-budget`). Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder.
+Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the commit about to run changes a locked file or folder, or once the run or day budget is spent. The budget counts from the first confirmation; editing and reconfirming the brief doesn't reset it unless you ask (`--reset-budget`). Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder, but the improvement loop itself (`orx idea next`, `orx idea start`) waits for a confirmed brief, and confirming needs at least one idea to start from.
 
 Findings record what the loop learns:
 

@@ -3,10 +3,12 @@
 
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
+use super::start::{BriefDraft, IdeaDraft};
+use crate::local::model::LocalProject;
 use crate::store::Store;
 
 type ApiResult = std::result::Result<Json<Value>, (StatusCode, String)>;
@@ -24,8 +26,19 @@ where
             "/api/vlresearch/projects/{id}/metrics",
             get(project_metrics),
         )
-        .route("/api/vlresearch/projects/{id}/ideas", get(project_ideas))
-        .route("/api/vlresearch/projects/{id}/brief", get(project_brief))
+        .route(
+            "/api/vlresearch/projects/{id}/ideas",
+            get(project_ideas).post(add_idea),
+        )
+        .route(
+            "/api/vlresearch/projects/{id}/brief",
+            get(project_brief).put(save_brief),
+        )
+        .route(
+            "/api/vlresearch/projects/{id}/brief/confirm",
+            post(confirm_brief),
+        )
+        .route("/api/vlresearch/projects/{id}/brief/chat", put(link_chat))
         .route(
             "/api/vlresearch/projects/{id}/findings",
             get(project_findings),
@@ -100,26 +113,93 @@ async fn project_brief(Path(project_id): Path<String>) -> ApiResult {
         let Some(project) = store.get_local_project(&project_id)? else {
             return Ok(None);
         };
-        let brief = super::scope::get(&store, &project.id)?;
-        let (usage, missing) = match &brief {
-            Some(brief) => (
-                Some(super::scope::usage(&store, brief)?),
-                super::scope::missing(&store, brief)?,
-            ),
-            None => (None, Vec::new()),
-        };
-        Ok(Some(json!({
-            "brief": brief,
-            "primary": super::metrics::primary(&store, &project.id)?,
-            "usage": usage,
-            "missing": missing,
-        })))
+        brief_body(&store, &project).map(Some)
     })
     .await
     .map_err(internal)?
     .map_err(internal)?;
     body.map(Json)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))
+}
+
+fn brief_body(store: &Store, project: &LocalProject) -> crate::error::Result<Value> {
+    let brief = super::scope::get(store, &project.id)?;
+    let (usage, missing) = match &brief {
+        Some(brief) => (
+            Some(super::scope::usage(store, brief)?),
+            super::scope::missing(store, brief)?,
+        ),
+        None => (None, Vec::new()),
+    };
+    Ok(json!({
+        "brief": brief,
+        "primary": super::metrics::primary(store, &project.id)?,
+        "usage": usage,
+        "missing": missing,
+    }))
+}
+
+/// Runs a dashboard write for a project: 404 when the project is gone, 400
+/// with the reason when the write is refused (a missing field, a bad value).
+async fn write_for_project(
+    project_id: String,
+    write: impl FnOnce(&Store, &LocalProject) -> crate::error::Result<Value> + Send + 'static,
+) -> ApiResult {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let store = Store::open().map_err(internal)?;
+        let project = store
+            .get_local_project(&project_id)
+            .map_err(internal)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))?;
+        write(&store, &project).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+    })
+    .await
+    .map_err(internal)?;
+    outcome.map(Json)
+}
+
+/// Saves the brief from the Research view's form, with its primary metric.
+async fn save_brief(Path(project_id): Path<String>, Json(draft): Json<BriefDraft>) -> ApiResult {
+    write_for_project(project_id, move |store, project| {
+        super::start::save_brief(store, &project.id, draft)?;
+        brief_body(store, project)
+    })
+    .await
+}
+
+/// The user confirms the brief from the Research view.
+async fn confirm_brief(Path(project_id): Path<String>) -> ApiResult {
+    write_for_project(project_id, |store, project| {
+        super::scope::confirm(store, project, "user")?;
+        brief_body(store, project)
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatLink {
+    session_id: String,
+}
+
+/// Links the brief to the chat the Research view started for it.
+async fn link_chat(Path(project_id): Path<String>, Json(link): Json<ChatLink>) -> ApiResult {
+    write_for_project(project_id, move |store, project| {
+        super::start::link_chat(store, &project.id, &link.session_id)?;
+        brief_body(store, project)
+    })
+    .await
+}
+
+/// Adds an idea typed into the Research view, as the user's.
+async fn add_idea(Path(project_id): Path<String>, Json(draft): Json<IdeaDraft>) -> ApiResult {
+    write_for_project(project_id, move |store, project| {
+        let idea = super::start::add_idea(store, &project.id, draft)?;
+        let mut value = serde_json::to_value(&idea)?;
+        value["statusLabel"] = json!(idea.status_label());
+        Ok(value)
+    })
+    .await
 }
 
 /// The project's idea queue, the selector's next pick, how well forecasts

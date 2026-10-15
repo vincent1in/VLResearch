@@ -83,7 +83,9 @@ orx idea add <projectId> "<title>" ...    # one per idea
 orx brief confirm <projectId>
 ```
 
-Never confirm a brief the user has not seen. Any later `orx brief set`
-reopens it until they agree again; the budget keeps counting from the first
-confirmation unless the user asks for a fresh one (`--reset-budget`). Literature is optional: with no papers,
-the brief is built from the code, the data and the user's pointers.
+Never confirm a brief the user has not seen. Confirming needs at least one
+open idea to start from, and the loop (`orx idea next`, `orx idea start`)
+waits for the confirmation. Any later `orx brief set` reopens it until they
+agree again; the budget keeps counting from the first confirmation unless the
+user asks for a fresh one (`--reset-budget`). Literature is optional: with no
+papers, the brief is built from the code, the data and the user's pointers.

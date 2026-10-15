@@ -91,6 +91,13 @@ text_enum!(Class { Incremental => "incremental", Orthogonal => "orthogonal", Rep
 text_enum!(Status { Open => "open", Running => "running", Kept => "kept", Refuted => "refuted", Dropped => "dropped" });
 text_enum!(Author { Scope => "scope", Agent => "agent", Review => "review", User => "user" });
 
+impl Class {
+    /// The class a name like `incremental` or `data` stands for.
+    pub(crate) fn from_text(text: &str) -> Option<Self> {
+        Self::parse(text)
+    }
+}
+
 impl Kind {
     fn is_blocker(self) -> bool {
         matches!(self, Kind::InfraBlocker | Kind::EvalBlocker | Kind::Halt)
@@ -112,6 +119,11 @@ impl Idea {
             Status::Kept if self.ablates.is_some() => "confirmed",
             status => status.as_str(),
         }
+    }
+
+    /// An infrastructure or evaluation blocker, or a halt.
+    pub(crate) fn is_blocker(&self) -> bool {
+        self.kind.is_blocker()
     }
 
     /// A check on the current best rather than an attempt to beat it: a
