@@ -774,8 +774,13 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         .get_local_project(&experiment.project_id)?
         .ok_or_else(|| anyhow!("Local project {} not found.", experiment.project_id))?;
     // VLResearch: the scoping gate, before any compute is spent.
-    let vlr_launch =
-        crate::flavor::scope::check_launch(&store, &project, &experiment, args.forwarded)?;
+    let vlr_launch = crate::flavor::scope::check_launch(
+        &store,
+        &project,
+        &experiment,
+        args.forwarded,
+        args.launching_chat_session().as_deref(),
+    )?;
     let preflight = backend.preflight(args).await?;
     if !preflight.ready {
         return Err(anyhow!(

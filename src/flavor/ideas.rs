@@ -140,6 +140,8 @@ impl Idea {
 pub(crate) struct Idea {
     pub id: String,
     pub project_id: String,
+    /// The optimization whose queue it is in.
+    pub optimization_id: String,
     pub title: String,
     pub kind: Kind,
     pub class: Option<Class>,
@@ -192,6 +194,12 @@ pub(crate) struct IdeaFields {
 }
 
 pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
+    create_tables(conn)?;
+    super::scope::ensure_tables(conn)
+}
+
+/// The queue's table, without the move of older data into optimizations.
+pub(crate) fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS vlr_ideas (
              id            TEXT PRIMARY KEY,
@@ -235,12 +243,17 @@ pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
              DROP TABLE vlr_ablations;",
         )?;
     }
+    metrics::add_column(conn, "vlr_ideas", "optimization_id", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_vlr_ideas_optimization ON vlr_ideas(optimization_id);",
+    )?;
     Ok(())
 }
 
 const IDEA_COLUMNS: &str = "id, project_id, title, kind, class, priority, hypothesis, kill_test,
     forecast, forecast_low, forecast_high, cost_hours, status, blocked_by, author, evidence,
-    experiment_id, outcome, outcome_key, created_at, started_at, closed_at, ablates";
+    experiment_id, outcome, outcome_key, created_at, started_at, closed_at, ablates,
+    optimization_id";
 
 fn from_row(row: &Row) -> rusqlite::Result<Idea> {
     let text = |index: usize| row.get::<_, String>(index);
@@ -271,6 +284,7 @@ fn from_row(row: &Row) -> rusqlite::Result<Idea> {
         started_at: row.get(20)?,
         closed_at: row.get(21)?,
         ablates: row.get(22)?,
+        optimization_id: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
     })
 }
 
@@ -327,8 +341,21 @@ pub(crate) fn require(store: &Store, id: &str) -> Result<Idea> {
     })
 }
 
-/// Every idea in the project, oldest first.
-pub(crate) fn list(store: &Store, project_id: &str) -> Result<Vec<Idea>> {
+/// Every idea in an optimization's queue, oldest first.
+pub(crate) fn list(store: &Store, optimization_id: &str) -> Result<Vec<Idea>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {IDEA_COLUMNS} FROM vlr_ideas WHERE optimization_id = ?1 ORDER BY created_at, id"
+    ))?;
+    let ideas = stmt
+        .query_map([optimization_id], from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ideas)
+}
+
+/// Every idea in the project, across its optimizations, oldest first.
+pub(crate) fn list_project(store: &Store, project_id: &str) -> Result<Vec<Idea>> {
     let conn = store.flavor_conn();
     ensure_tables(conn)?;
     let mut stmt = conn.prepare(&format!(
@@ -340,16 +367,38 @@ pub(crate) fn list(store: &Store, project_id: &str) -> Result<Vec<Idea>> {
     Ok(ideas)
 }
 
-pub(crate) fn add(store: &Store, project_id: &str, fields: IdeaFields) -> Result<Idea> {
+/// The optimization of the idea an experiment tests, if one does.
+pub(crate) fn optimization_of_experiment(
+    store: &Store,
+    experiment_id: &str,
+) -> Result<Option<String>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    Ok(conn
+        .query_row(
+            "SELECT optimization_id FROM vlr_ideas
+             WHERE experiment_id = ?1 AND optimization_id IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1",
+            [experiment_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub(crate) fn add(store: &Store, optimization_id: &str, fields: IdeaFields) -> Result<Idea> {
     let title = fields
         .title
         .clone()
         .ok_or_else(|| anyhow!("An idea needs a title."))?;
     validate(&fields)?;
+    let brief = super::scope::require(store, optimization_id)?;
     if let Some(blocker) = &fields.blocked_by {
         let blocker = require(store, blocker)?;
-        if blocker.project_id != project_id {
-            return Err(anyhow!("Idea {} belongs to another project.", blocker.id));
+        if blocker.optimization_id != brief.id {
+            return Err(anyhow!(
+                "Idea {} is in another optimization's queue.",
+                blocker.id
+            ));
         }
     }
     let conn = store.flavor_conn();
@@ -359,11 +408,12 @@ pub(crate) fn add(store: &Store, project_id: &str, fields: IdeaFields) -> Result
     conn.execute(
         "INSERT INTO vlr_ideas (id, project_id, title, kind, class, priority, hypothesis,
              kill_test, forecast, forecast_low, forecast_high, cost_hours, status, blocked_by,
-             author, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', ?13, ?14, ?15, ?15)",
+             author, created_at, updated_at, optimization_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', ?13, ?14, ?15, ?15,
+             ?16)",
         params![
             id,
-            project_id,
+            brief.project_id,
             title.trim(),
             fields.kind.unwrap_or(Kind::Science).as_str(),
             fields.class.map(Class::as_str),
@@ -377,17 +427,21 @@ pub(crate) fn add(store: &Store, project_id: &str, fields: IdeaFields) -> Result
             fields.blocked_by,
             fields.author.unwrap_or(Author::User).as_str(),
             now,
+            brief.id,
         ],
     )?;
     require(store, &id)
 }
 
-/// A blocker must be another idea in the same project that doesn't wait on
+/// A blocker must be another idea in the same queue that doesn't wait on
 /// this one, directly or through others.
 fn check_blocker(store: &Store, idea: &Idea, blocker_id: &str) -> Result<()> {
     let blocker = require(store, blocker_id)?;
-    if blocker.project_id != idea.project_id {
-        return Err(anyhow!("Idea {} belongs to another project.", blocker.id));
+    if blocker.optimization_id != idea.optimization_id {
+        return Err(anyhow!(
+            "Idea {} is in another optimization's queue.",
+            blocker.id
+        ));
     }
     let mut cursor = Some(blocker);
     let mut seen = std::collections::HashSet::new();
@@ -509,7 +563,7 @@ pub(crate) fn close(
             idea.status.as_str()
         ));
     }
-    let primary = metrics::primary(store, &idea.project_id)?;
+    let primary = metrics::primary(store, &idea.optimization_id)?;
     let measured = match (&idea.experiment_id, &primary) {
         (Some(experiment_id), Some(metric)) if verdict != Verdict::Dropped => {
             measured_change(store, &idea.project_id, experiment_id, metric)?
@@ -578,10 +632,12 @@ pub(crate) fn close(
                 && auto_ablate() =>
         {
             // The close has landed; a failure here only costs the checks.
-            queue_ablations(store, &idea.project_id, experiment_id, metric).unwrap_or_else(|err| {
-                eprintln!("vlresearch: could not queue ablation checks: {err}");
-                Vec::new()
-            })
+            super::scope::require(store, &idea.optimization_id)
+                .and_then(|brief| queue_ablations(store, &brief, experiment_id, metric))
+                .unwrap_or_else(|err| {
+                    eprintln!("vlresearch: could not queue ablation checks: {err}");
+                    Vec::new()
+                })
         }
         _ => Vec::new(),
     };
@@ -598,7 +654,7 @@ fn auto_ablate() -> bool {
     std::env::var(AUTO_ABLATE_ENV).map_or(true, |value| value.trim() != "0")
 }
 
-/// When `experiment_id` holds the project's best, queues a leave-one-out check
+/// When `experiment_id` holds the optimization's best, queues a leave-one-out check
 /// for each of the biggest earlier steps on its lineage path that hasn't had
 /// one: take that step's change back out of the best and see whether the
 /// metric loses what the step gained. The contribution waterfall assumes the
@@ -606,18 +662,18 @@ fn auto_ablate() -> bool {
 /// taking it out gives its parent, which is already scored.
 pub(crate) fn queue_ablations(
     store: &Store,
-    project_id: &str,
+    brief: &super::scope::Brief,
     experiment_id: &str,
     metric: &PrimaryMetric,
 ) -> Result<Vec<Idea>> {
-    let (standing, path, _) = metrics::standing(store, project_id, metric)?;
+    let (standing, path, _) = metrics::standing(store, brief, metric)?;
     let Some(best) = &standing.best else {
         return Ok(Vec::new());
     };
     if best.experiment_id != experiment_id || path.len() < 3 {
         return Ok(Vec::new());
     }
-    let ideas = list(store, project_id)?;
+    let ideas = list(store, &brief.id)?;
     let floor = metric.noise_floor.unwrap_or(0.0);
     let best_name = path
         .last()
@@ -648,7 +704,7 @@ pub(crate) fn queue_ablations(
         let key = &metric.key;
         let idea = add(
             store,
-            project_id,
+            &brief.id,
             IdeaFields {
                 title: Some(format!("Ablate \"{label}\" from the best")),
                 kind: Some(Kind::Science),
@@ -708,12 +764,12 @@ fn measured_change(
 /// The ablation check queued for each lineage step, by the step's experiment.
 pub(crate) fn ablations_by_step(
     store: &Store,
-    project_id: &str,
+    optimization_id: &str,
 ) -> Result<std::collections::HashMap<String, Idea>> {
     // In creation order, so a step's newest check wins, unless it was dropped
     // and an earlier one wasn't.
     let mut by_step = std::collections::HashMap::<String, Idea>::new();
-    for idea in list(store, project_id)? {
+    for idea in list(store, optimization_id)? {
         let Some(step) = idea.ablates.clone() else {
             continue;
         };
@@ -732,7 +788,7 @@ pub(crate) fn titles_by_experiment(
     store: &Store,
     project_id: &str,
 ) -> Result<std::collections::HashMap<String, String>> {
-    Ok(list(store, project_id)?
+    Ok(list_project(store, project_id)?
         .into_iter()
         .filter_map(|idea| Some((idea.experiment_id?, idea.title)))
         .collect())
@@ -798,8 +854,15 @@ const MIN_COST_HOURS: f64 = 0.1;
 /// highest expected gain per GPU-hour wins, except that after three
 /// incremental ideas in a row, or three tested ideas that kept nothing, an
 /// orthogonal idea is preferred when there is one.
-pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
-    let ideas = list(store, project_id)?;
+pub(crate) fn next(store: &Store, optimization_id: &str) -> Result<Option<Pick>> {
+    let ideas = list(store, optimization_id)?;
+    let direction =
+        metrics::primary(store, optimization_id)?.map_or(Direction::Max, |metric| metric.direction);
+    Ok(pick(&ideas, direction))
+}
+
+/// The selector itself, over one queue's ideas: see [`next`].
+pub(crate) fn pick(ideas: &[Idea], direction: Direction) -> Option<Pick> {
     let closed: std::collections::HashSet<&str> = ideas
         .iter()
         .filter(|idea| idea.status.is_closed())
@@ -819,14 +882,14 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
         .filter(|idea| idea.kind.is_blocker())
         .min_by_key(|idea| (idea.priority, idea.created_at))
     {
-        return Ok(Some(Pick {
+        return Some(Pick {
             idea: (*blocker).clone(),
             reason: format!(
                 "it is an open {} and blockers come before other ideas",
                 blocker.kind.as_str()
             ),
             score: None,
-        }));
+        });
     }
     // Then checks on the current best, replicates before ablations: whether
     // the best stands decides what else is worth building on it.
@@ -841,14 +904,12 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
         } else {
             "it checks a step behind the current best, and checks come before new ideas"
         };
-        return Ok(Some(Pick {
+        return Some(Pick {
             idea: (*check).clone(),
             reason: reason.to_string(),
             score: None,
-        }));
+        });
     }
-    let direction =
-        metrics::primary(store, project_id)?.map_or(Direction::Max, |metric| metric.direction);
     // Started attempts, newest first, for the diversity rules. Checks on the
     // best and blockers say nothing about how the search is going.
     let attempt = |idea: &&Idea| !idea.is_check() && !idea.kind.is_blocker();
@@ -924,14 +985,14 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
         None
     };
     if let (Some(reason), Some((idea, score))) = (widen, best_of(&orthogonal)) {
-        return Ok(Some(Pick {
+        return Some(Pick {
             idea,
             reason,
             score,
-        }));
+        });
     }
     let forecast_any = candidates.iter().any(|idea| idea.forecast.is_some());
-    Ok(best_of(&candidates).map(|(idea, score)| {
+    best_of(&candidates).map(|(idea, score)| {
         let reason = match score {
             Some(score) if score > 0.0 => format!(
                 "highest expected gain per GPU-hour ({}) among open ideas",
@@ -947,7 +1008,7 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
             reason,
             score,
         }
-    }))
+    })
 }
 
 /// How well the forecasts of tested ideas held up.
@@ -968,8 +1029,8 @@ pub(crate) struct Calibration {
     pub kept: usize,
 }
 
-/// The attempts behind a project's best result, for discounting it: every
-/// finished non-probe run, and every tested idea.
+/// The attempts behind an optimization's best result, for discounting it:
+/// every finished non-probe run, and every tested idea.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Trials {
@@ -980,10 +1041,10 @@ pub(crate) struct Trials {
 
 pub(crate) fn trials(
     store: &Store,
-    project_id: &str,
+    optimization_id: &str,
     runs: &[metrics::ScoredRun],
 ) -> Result<Trials> {
-    let report = calibration(&list(store, project_id)?);
+    let report = calibration(&list(store, optimization_id)?);
     Ok(Trials {
         runs: runs.iter().filter(|run| run.counts()).count(),
         ideas_tested: report.tested,
@@ -1181,9 +1242,12 @@ mod tests {
     use crate::local::model::LocalExperiment;
     use crate::store::StoredRun;
 
+    /// A store with one optimization, `p`, in project `p`.
     fn temp_store() -> (Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vlr-ideas-{}", uuid::Uuid::new_v4()));
-        (Store::open_at(dir.clone()).unwrap(), dir)
+        let store = Store::open_at(dir.clone()).unwrap();
+        crate::flavor::scope::tests::named(&store, "p");
+        (store, dir)
     }
 
     fn fields(title: &str) -> IdeaFields {
@@ -1198,6 +1262,7 @@ mod tests {
         let idea = |forecast: f64, low: f64, high: f64| Idea {
             id: "i".into(),
             project_id: "p".into(),
+            optimization_id: "p".into(),
             title: "t".into(),
             kind: Kind::Science,
             class: None,
@@ -1406,6 +1471,7 @@ mod tests {
             let log = super::super::wake::run_log_path(&store, run_id);
             std::fs::write(log, format!("ORX_METRIC {{\"val_ic\": {value}}}\n")).unwrap();
         }
+        crate::flavor::scope::tests::adopt_runs(&store, "p");
         metrics::set_primary(
             &store,
             "p",
@@ -1502,6 +1568,8 @@ mod tests {
             .unwrap();
         let log = super::super::wake::run_log_path(store, &run_id);
         std::fs::write(log, format!("ORX_METRIC {{\"val_ic\": {value}}}\n")).unwrap();
+        // As if launched for optimization `p`.
+        crate::flavor::scope::tests::adopt_runs(store, "p");
     }
 
     /// A tested idea on `experiment`, closed from its measured change.
@@ -1776,6 +1844,7 @@ mod tests {
         let scored = |forecast: f64, low: f64, high: f64, outcome: f64| Idea {
             id: "i".into(),
             project_id: "p".into(),
+            optimization_id: "p".into(),
             title: "t".into(),
             kind: Kind::Science,
             class: None,
@@ -1860,6 +1929,7 @@ mod tests {
             |class: Option<Class>, status: Status, outcome: Option<f64>, cost: Option<f64>| Idea {
                 id: "i".into(),
                 project_id: "p".into(),
+                optimization_id: "p".into(),
                 title: "t".into(),
                 kind: Kind::Science,
                 class,

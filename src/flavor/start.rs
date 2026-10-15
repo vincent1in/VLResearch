@@ -1,15 +1,15 @@
-//! Starting auto-research from the dashboard. The Research view's form saves
-//! the whole brief at once (with the primary metric), adds the seed ideas,
-//! links the chat it starts, and lets the user confirm the brief with a
-//! button. The rules are the CLI's: any change reopens a confirmed brief,
-//! confirming needs everything `scope::missing` lists, and nothing here
-//! launches compute.
+//! Starting auto-research from the dashboard. The Research view's form starts
+//! an optimization with its whole brief at once (with the primary metric),
+//! adds the seed ideas, links the chat it starts, and lets the user confirm
+//! the brief with a button; it edits an optimization's brief the same way.
+//! The rules are the CLI's: any change reopens a confirmed brief, confirming
+//! needs everything `scope::missing` lists, and nothing here launches compute.
 
 use serde::Deserialize;
 
 use super::ideas::{self, Author, Class, Idea, IdeaFields, Kind};
 use super::metrics::{self, Direction, PrimaryMetric};
-use super::scope::{self, BriefFields};
+use super::scope::{self, Brief, BriefFields};
 use crate::error::{anyhow, Result};
 use crate::store::Store;
 
@@ -23,6 +23,9 @@ pub(crate) struct BriefDraft {
     pub must_not_change: Option<String>,
     #[serde(default)]
     pub locked: Vec<String>,
+    /// The only paths runs may change; empty for the whole repository.
+    #[serde(default)]
+    pub scope: Vec<String>,
     pub budget_runs: Option<i64>,
     pub budget_gpu_hours: Option<f64>,
     pub budget_days: Option<f64>,
@@ -56,32 +59,76 @@ pub(crate) struct IdeaDraft {
     pub kill_test: Option<String>,
 }
 
-/// Saves the brief as the form holds it, and its primary metric. The metric
-/// is checked first, so a refused one saves nothing.
-pub(crate) fn save_brief(store: &Store, project_id: &str, draft: BriefDraft) -> Result<()> {
-    let metric = draft
+/// Starts an optimization in the project with the brief the form holds. The
+/// draft is checked first, so a refused one starts nothing.
+pub(crate) fn create(store: &Store, project_id: &str, draft: BriefDraft) -> Result<Brief> {
+    let metric = check(store, project_id, &draft, None)?;
+    let brief = scope::create(store, project_id, None)?;
+    apply(store, &brief, draft, metric)
+}
+
+/// Saves an optimization's brief as the form holds it, and its primary metric.
+/// The draft is checked first, so a refused one saves nothing.
+pub(crate) fn save_brief(store: &Store, optimization_id: &str, draft: BriefDraft) -> Result<Brief> {
+    let brief = scope::require(store, optimization_id)?;
+    let metric = check(store, &brief.project_id, &draft, Some(&brief))?;
+    apply(store, &brief, draft, metric)
+}
+
+/// The draft's metric, checked, and its budgets and paths checked before
+/// anything is written.
+fn check(
+    store: &Store,
+    project_id: &str,
+    draft: &BriefDraft,
+    current: Option<&Brief>,
+) -> Result<Option<PrimaryMetric>> {
+    if draft.budget_runs.is_some_and(|runs| runs < 1) {
+        return Err(anyhow!("A run budget is at least 1."));
+    }
+    for (value, name) in [
+        (draft.budget_gpu_hours, "GPU-hour"),
+        (draft.budget_days, "day"),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+            return Err(anyhow!("A {name} budget must be a positive number."));
+        }
+    }
+    draft
         .metric
         .as_ref()
-        .map(|metric| primary_metric(store, project_id, metric))
-        .transpose()?;
-    let current = scope::get(store, project_id)?;
-    let unlock = current
-        .map(|brief| brief.locked.into_iter().map(|locked| locked.path).collect())
-        .unwrap_or_default();
+        .map(|metric| primary_metric(store, project_id, metric, current))
+        .transpose()
+}
+
+fn apply(
+    store: &Store,
+    brief: &Brief,
+    draft: BriefDraft,
+    metric: Option<PrimaryMetric>,
+) -> Result<Brief> {
     let blank = |value: Option<String>| Some(value.unwrap_or_default());
-    scope::set(
+    let paths = |paths: Vec<String>| -> Vec<String> {
+        paths
+            .into_iter()
+            .filter(|path| !path.trim().is_empty())
+            .collect()
+    };
+    let saved = scope::set(
         store,
-        project_id,
+        &brief.id,
         BriefFields {
             objective: blank(draft.objective),
             may_change: blank(draft.may_change),
             must_not_change: blank(draft.must_not_change),
-            lock: draft
+            lock: paths(draft.locked),
+            unlock: brief
                 .locked
-                .into_iter()
-                .filter(|path| !path.trim().is_empty())
+                .iter()
+                .map(|locked| locked.path.clone())
                 .collect(),
-            unlock,
+            scope: paths(draft.scope),
+            unscope: brief.scope.clone(),
             budget_runs: draft.budget_runs,
             budget_gpu_hours: draft.budget_gpu_hours,
             budget_days: draft.budget_days,
@@ -93,14 +140,19 @@ pub(crate) fn save_brief(store: &Store, project_id: &str, draft: BriefDraft) -> 
         },
     )?;
     if let Some(metric) = metric {
-        metrics::set_primary(store, project_id, &metric)?;
+        metrics::set_primary(store, &brief.id, &metric)?;
     }
-    Ok(())
+    Ok(saved)
 }
 
 /// The primary metric a draft names, checked the way `orx metric primary`
 /// checks it.
-fn primary_metric(store: &Store, project_id: &str, draft: &MetricDraft) -> Result<PrimaryMetric> {
+fn primary_metric(
+    store: &Store,
+    project_id: &str,
+    draft: &MetricDraft,
+    current: Option<&Brief>,
+) -> Result<PrimaryMetric> {
     let key = draft.key.trim();
     if key.is_empty() {
         return Err(anyhow!("Name the metric that measures the goal."));
@@ -143,7 +195,10 @@ fn primary_metric(store: &Store, project_id: &str, draft: &MetricDraft) -> Resul
         }
     }
     // Saving the same key again keeps its measured noise floor.
-    let current = metrics::primary(store, project_id)?;
+    let current = match current {
+        Some(brief) => metrics::primary(store, &brief.id)?,
+        None => None,
+    };
     let noise_floor = draft.noise_floor.or_else(|| {
         current
             .filter(|current| current.key == key)
@@ -157,8 +212,8 @@ fn primary_metric(store: &Store, project_id: &str, draft: &MetricDraft) -> Resul
     })
 }
 
-/// Adds an idea the user typed, as theirs.
-pub(crate) fn add_idea(store: &Store, project_id: &str, draft: IdeaDraft) -> Result<Idea> {
+/// Adds an idea the user typed to an optimization's queue, as theirs.
+pub(crate) fn add_idea(store: &Store, optimization_id: &str, draft: IdeaDraft) -> Result<Idea> {
     let class = match draft
         .class
         .as_deref()
@@ -172,7 +227,7 @@ pub(crate) fn add_idea(store: &Store, project_id: &str, draft: IdeaDraft) -> Res
     };
     ideas::add(
         store,
-        project_id,
+        optimization_id,
         IdeaFields {
             title: Some(draft.title),
             kind: Some(Kind::Science),
@@ -189,20 +244,20 @@ pub(crate) fn add_idea(store: &Store, project_id: &str, draft: IdeaDraft) -> Res
     )
 }
 
-/// Links the brief to the chat the dashboard started for it, which is told
-/// when the user confirms the brief there.
-pub(crate) fn link_chat(store: &Store, project_id: &str, session_id: &str) -> Result<()> {
+/// Hands the optimization to the chat the dashboard started for it, which is
+/// told when the user confirms the brief there.
+pub(crate) fn link_chat(store: &Store, optimization_id: &str, session_id: &str) -> Result<Brief> {
+    let brief = scope::require(store, optimization_id)?;
     let session = store
         .get_chat_session(session_id)?
-        .filter(|session| session.project_id == project_id)
+        .filter(|session| session.project_id == brief.project_id)
         .ok_or_else(|| anyhow!("Chat {session_id} isn't one of this project's."))?;
-    scope::set_chat(store, project_id, &session.id)?;
-    Ok(())
+    scope::set_chat(store, &brief.id, &session.id)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{add_idea, link_chat, save_brief, BriefDraft, IdeaDraft, MetricDraft};
+    use super::{add_idea, create, link_chat, save_brief, BriefDraft, IdeaDraft, MetricDraft};
     use crate::flavor::{ideas, metrics, scope};
     use crate::store::{Store, StoredChatSession, StoredRun};
 
@@ -223,7 +278,7 @@ mod tests {
     #[test]
     fn the_form_saves_the_whole_brief_and_its_metric() {
         let (store, dir) = temp_store();
-        save_brief(
+        let opt = create(
             &store,
             "p",
             BriefDraft {
@@ -234,28 +289,30 @@ mod tests {
                 budget_days: Some(14.0),
                 stop_rule: Some("No gain in 5 runs".into()),
                 pointers: Some("Volume features first".into()),
+                scope: vec!["features/".into()],
                 metric: metric("val_ic", "max"),
                 ..BriefDraft::default()
             },
         )
         .unwrap();
-        let brief = scope::get(&store, "p").unwrap().unwrap();
+        let brief = scope::get(&store, &opt.id).unwrap().unwrap();
         assert_eq!(brief.objective.as_deref(), Some("Raise validation IC"));
         assert_eq!(brief.locked.len(), 1);
+        assert_eq!(brief.scope, ["features"]);
         assert_eq!(
             (brief.budget_runs, brief.budget_days),
             (Some(20), Some(14.0))
         );
-        let primary = metrics::primary(&store, "p").unwrap().unwrap();
+        let primary = metrics::primary(&store, &opt.id).unwrap().unwrap();
         assert_eq!(
             (primary.key.as_str(), primary.direction),
             ("val_ic", metrics::Direction::Max)
         );
 
-        // Saving again replaces the brief: cleared fields and locks go away.
+        // Saving again replaces the brief: cleared fields, locks and scope go.
         metrics::set_primary(
             &store,
-            "p",
+            &opt.id,
             &metrics::PrimaryMetric {
                 noise_floor: Some(0.002),
                 ..primary
@@ -264,7 +321,7 @@ mod tests {
         .unwrap();
         save_brief(
             &store,
-            "p",
+            &opt.id,
             BriefDraft {
                 objective: Some("Raise validation IC".into()),
                 locked: vec!["eval/score.py".into()],
@@ -274,9 +331,10 @@ mod tests {
             },
         )
         .unwrap();
-        let brief = scope::get(&store, "p").unwrap().unwrap();
+        let brief = scope::get(&store, &opt.id).unwrap().unwrap();
         assert_eq!(brief.must_not_change, None);
         assert_eq!(brief.pointers, None);
+        assert!(brief.scope.is_empty());
         let paths: Vec<&str> = brief
             .locked
             .iter()
@@ -288,8 +346,30 @@ mod tests {
             (None, Some(40.0), None)
         );
         // The measured noise floor stays with the same key.
-        let primary = metrics::primary(&store, "p").unwrap().unwrap();
+        let primary = metrics::primary(&store, &opt.id).unwrap().unwrap();
         assert_eq!(primary.noise_floor, Some(0.002));
+
+        // A second optimization has its own brief and metric.
+        let speed = create(
+            &store,
+            "p",
+            BriefDraft {
+                objective: Some("Cut backtest time".into()),
+                metric: metric("backtest_seconds", "min"),
+                ..BriefDraft::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(speed.id, opt.id);
+        assert_eq!(scope::list(&store, "p").unwrap().len(), 2);
+        assert_eq!(
+            metrics::primary(&store, &speed.id).unwrap().unwrap().key,
+            "backtest_seconds"
+        );
+        assert_eq!(
+            metrics::primary(&store, &opt.id).unwrap().unwrap().key,
+            "val_ic"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -302,11 +382,11 @@ mod tests {
             metric,
             ..BriefDraft::default()
         };
-        assert!(save_brief(&store, "p", draft(metric("val_ic", "up"), None)).is_err());
-        assert!(save_brief(&store, "p", draft(metric(" ", "max"), None)).is_err());
-        assert!(save_brief(&store, "p", draft(metric("val_ic", "max"), Some(0))).is_err());
-        // A refused metric saves nothing.
-        assert!(scope::get(&store, "p").unwrap().is_none());
+        assert!(create(&store, "p", draft(metric("val_ic", "up"), None)).is_err());
+        assert!(create(&store, "p", draft(metric(" ", "max"), None)).is_err());
+        assert!(create(&store, "p", draft(metric("val_ic", "max"), Some(0))).is_err());
+        // A refused draft starts nothing.
+        assert!(scope::list(&store, "p").unwrap().is_empty());
 
         // A key reported under two splits needs one chosen.
         store
@@ -335,7 +415,7 @@ mod tests {
              ORX_METRIC {\"key\": \"ic\", \"value\": 0.02, \"split\": \"test\"}\n",
         )
         .unwrap();
-        let refused = save_brief(&store, "p", draft(metric("ic", "max"), None))
+        let refused = create(&store, "p", draft(metric("ic", "max"), None))
             .unwrap_err()
             .to_string();
         assert!(refused.contains("several splits"), "{refused}");
@@ -343,16 +423,35 @@ mod tests {
             split: Some("val".into()),
             ..metric("ic", "max").unwrap()
         });
-        save_brief(&store, "p", draft(chosen, None)).unwrap();
+        let opt = create(&store, "p", draft(chosen, None)).unwrap();
+        // An edit is checked the same way, and a refused one changes nothing.
+        assert!(save_brief(&store, &opt.id, draft(metric("ic", "max"), None)).is_err());
+        assert_eq!(
+            metrics::primary(&store, &opt.id)
+                .unwrap()
+                .unwrap()
+                .split
+                .as_deref(),
+            Some("val")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn typed_ideas_are_the_users_and_the_chat_link_stays_in_the_project() {
         let (store, dir) = temp_store();
-        let idea = add_idea(
+        let opt = create(
             &store,
             "p",
+            BriefDraft {
+                objective: Some("x".into()),
+                ..BriefDraft::default()
+            },
+        )
+        .unwrap();
+        let idea = add_idea(
+            &store,
+            &opt.id,
             IdeaDraft {
                 title: "Volume features".into(),
                 class: Some("data".into()),
@@ -370,17 +469,9 @@ mod tests {
             class: Some("magic".into()),
             ..IdeaDraft::default()
         };
-        assert!(add_idea(&store, "p", wrong_class).is_err());
+        assert!(add_idea(&store, &opt.id, wrong_class).is_err());
+        assert_eq!(idea.optimization_id, opt.id);
 
-        save_brief(
-            &store,
-            "p",
-            BriefDraft {
-                objective: Some("x".into()),
-                ..BriefDraft::default()
-            },
-        )
-        .unwrap();
         let mut session = StoredChatSession {
             id: "chat_1".into(),
             project_id: "p".into(),
@@ -409,17 +500,17 @@ mod tests {
         session.id = "chat_elsewhere".into();
         session.project_id = "other".into();
         store.create_chat_session(&session).unwrap();
-        link_chat(&store, "p", "chat_1").unwrap();
+        link_chat(&store, &opt.id, "chat_1").unwrap();
         assert_eq!(
-            scope::get(&store, "p")
+            scope::get(&store, &opt.id)
                 .unwrap()
                 .unwrap()
                 .chat_session_id
                 .as_deref(),
             Some("chat_1")
         );
-        assert!(link_chat(&store, "p", "chat_elsewhere").is_err());
-        assert!(link_chat(&store, "p", "chat_missing").is_err());
+        assert!(link_chat(&store, &opt.id, "chat_elsewhere").is_err());
+        assert!(link_chat(&store, &opt.id, "chat_missing").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

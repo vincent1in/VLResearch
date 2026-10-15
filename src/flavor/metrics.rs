@@ -444,7 +444,7 @@ impl Direction {
     }
 }
 
-/// The metric a project optimizes.
+/// The metric an optimization improves.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PrimaryMetric {
@@ -456,18 +456,19 @@ pub(crate) struct PrimaryMetric {
     pub split: Option<String>,
 }
 
-pub(crate) fn primary(store: &Store, project_id: &str) -> Result<Option<PrimaryMetric>> {
+/// An optimization's primary metric, once it has one.
+pub(crate) fn primary(store: &Store, optimization_id: &str) -> Result<Option<PrimaryMetric>> {
     let conn = store.flavor_conn();
-    ensure_tables(conn)?;
+    super::scope::ensure_tables(conn)?;
     let row = conn
         .query_row(
-            "SELECT key, direction, noise_floor, split FROM vlr_project_metric
-             WHERE project_id = ?1",
-            [project_id],
+            "SELECT metric_key, metric_direction, noise_floor, metric_split
+             FROM vlr_optimizations WHERE id = ?1",
+            [optimization_id],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<f64>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                 ))
@@ -476,15 +477,19 @@ pub(crate) fn primary(store: &Store, project_id: &str) -> Result<Option<PrimaryM
         .optional()?;
     Ok(row.and_then(|(key, direction, noise_floor, split)| {
         Some(PrimaryMetric {
-            key,
-            direction: Direction::parse(&direction)?,
+            key: key?,
+            direction: Direction::parse(&direction?)?,
             noise_floor,
             split,
         })
     }))
 }
 
-pub(crate) fn set_primary(store: &Store, project_id: &str, metric: &PrimaryMetric) -> Result<()> {
+pub(crate) fn set_primary(
+    store: &Store,
+    optimization_id: &str,
+    metric: &PrimaryMetric,
+) -> Result<()> {
     if metric.key.trim().is_empty() {
         return Err(anyhow!("The metric key can't be empty."));
     }
@@ -495,22 +500,27 @@ pub(crate) fn set_primary(store: &Store, project_id: &str, metric: &PrimaryMetri
         return Err(anyhow!("The noise floor must be a non-negative number."));
     }
     let conn = store.flavor_conn();
-    ensure_tables(conn)?;
-    conn.execute(
-        "INSERT INTO vlr_project_metric (project_id, key, direction, noise_floor, updated_at, split)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(project_id) DO UPDATE SET key = excluded.key,
-             direction = excluded.direction, noise_floor = excluded.noise_floor,
-             updated_at = excluded.updated_at, split = excluded.split",
+    super::scope::ensure_tables(conn)?;
+    let updated = conn.execute(
+        "UPDATE vlr_optimizations SET metric_key = ?2, metric_direction = ?3, noise_floor = ?4,
+             metric_split = ?5, updated_at = ?6
+         WHERE id = ?1",
         params![
-            project_id,
+            optimization_id,
             metric.key.trim(),
             metric.direction.as_str(),
             metric.noise_floor,
+            metric
+                .split
+                .as_deref()
+                .map(str::trim)
+                .filter(|split| !split.is_empty()),
             crate::store::now_ms(),
-            metric.split.as_deref().map(str::trim).filter(|split| !split.is_empty()),
         ],
     )?;
+    if updated == 0 {
+        return Err(anyhow!("Optimization {optimization_id} was not found."));
+    }
     Ok(())
 }
 
@@ -917,17 +927,35 @@ pub(crate) fn lineage(
     Ok(steps)
 }
 
-/// The project's standing on its primary metric: the running best, the
-/// baseline it is measured against, and the path between them.
+/// An optimization's standing on its primary metric: the running best among
+/// its own runs, the baseline it is measured against, and the path between
+/// them. Returns the optimization's runs, scored; the baseline and earlier
+/// steps on the path are scored from any of the project's runs.
 pub(crate) fn standing(
+    store: &Store,
+    brief: &super::scope::Brief,
+    metric: &PrimaryMetric,
+) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
+    let members = super::scope::run_ids(store, brief)?;
+    standing_among(store, &brief.project_id, metric, Some(&members))
+}
+
+/// The same standing over the project's runs: all of them, or `members`.
+pub(crate) fn standing_among(
     store: &Store,
     project_id: &str,
     metric: &PrimaryMetric,
+    members: Option<&std::collections::HashSet<String>>,
 ) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
-    let runs = scored_runs(store, project_id, &metric.key, metric.split.as_deref())?;
+    let all = scored_runs(store, project_id, &metric.key, metric.split.as_deref())?;
+    let runs: Vec<ScoredRun> = all
+        .iter()
+        .filter(|run| members.is_none_or(|members| members.contains(&run.run_id)))
+        .cloned()
+        .collect();
     let mut standing = running_best(&runs, metric);
     let mut path = match &standing.best {
-        Some(best) => lineage(store, project_id, best, &runs, metric)?,
+        Some(best) => lineage(store, project_id, best, &all, metric)?,
         None => Vec::new(),
     };
     let ideas = super::ideas::titles_by_experiment(store, project_id)?;
@@ -1228,22 +1256,128 @@ mod tests {
     }
 
     #[test]
+    fn each_optimization_measures_its_best_over_its_own_runs() {
+        let (store, dir) = temp_store();
+        let ic = crate::flavor::scope::create(&store, "p", Some("chat_ic")).unwrap();
+        let speed = crate::flavor::scope::create(&store, "p", Some("chat_speed")).unwrap();
+        for (run_id, experiment, value, chat) in [
+            ("r_base", "base", 0.020, None),
+            ("r_a1", "a1", 0.030, Some(&ic.id)),
+            ("r_a2", "a2", 0.026, Some(&ic.id)),
+            ("r_b1", "b1", 0.025, Some(&speed.id)),
+        ] {
+            store
+                .create_local_experiment(&LocalExperiment {
+                    id: experiment.into(),
+                    project_id: "p".into(),
+                    parent_experiment_id: (experiment != "base").then(|| "base".to_string()),
+                    slug: experiment.into(),
+                    branch_name: format!("orx/{experiment}"),
+                    title: None,
+                    description: None,
+                    run_command: "python train.py".into(),
+                    agent_status: "idle".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                    chat_session_id: None,
+                    archived: false,
+                })
+                .unwrap();
+            store
+                .upsert_run(&StoredRun {
+                    id: run_id.into(),
+                    experiment_id: experiment.into(),
+                    project_id: "p".into(),
+                    status: "done".into(),
+                    backend_json: "{}".into(),
+                    command: "python train.py".into(),
+                    created_at: crate::store::now_ms(),
+                    updated_at: crate::store::now_ms(),
+                    ended_at: Some(crate::store::now_ms()),
+                    exit_code: Some(0),
+                    commit_sha: None,
+                    result_markdown: None,
+                    cancel_requested: false,
+                    cancel_reason: None,
+                    chat_session_id: None,
+                })
+                .unwrap();
+            let log = super::super::wake::run_log_path(&store, run_id);
+            std::fs::write(log, format!("ORX_METRIC {{\"val_ic\": {value}}}\n")).unwrap();
+            if let Some(optimization_id) = chat {
+                crate::flavor::scope::after_launch(
+                    &store,
+                    run_id,
+                    &crate::flavor::scope::Launch {
+                        optimization_id: Some(optimization_id.clone()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let metric = PrimaryMetric {
+            key: "val_ic".into(),
+            direction: Direction::Max,
+            noise_floor: None,
+            split: None,
+        };
+        for brief in [&ic, &speed] {
+            set_primary(&store, &brief.id, &metric).unwrap();
+        }
+        let best = |brief| {
+            let (standing, path, runs) = standing(&store, brief, &metric).unwrap();
+            let best = standing.best.unwrap().run_id;
+            // The baseline is scored from the project's runs either way.
+            assert_eq!(path.first().unwrap().experiment_id, "base");
+            assert_eq!(standing.baseline.unwrap().score, 0.020);
+            (best, runs.len())
+        };
+        assert_eq!(best(&ic), ("r_a1".to_string(), 2));
+        assert_eq!(best(&speed), ("r_b1".to_string(), 1));
+        let (whole, _, _) = standing_among(&store, "p", &metric, None).unwrap();
+        assert_eq!(whole.best.unwrap().run_id, "r_a1");
+        // Each budget counts its own runs.
+        let confirmed = |brief: &crate::flavor::scope::Brief| crate::flavor::scope::Brief {
+            budget_since: Some(0),
+            ..brief.clone()
+        };
+        assert_eq!(
+            crate::flavor::scope::usage(&store, &confirmed(&ic))
+                .unwrap()
+                .runs,
+            2
+        );
+        assert_eq!(
+            crate::flavor::scope::usage(&store, &confirmed(&speed))
+                .unwrap()
+                .runs,
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn primary_metrics_round_trip_and_reject_bad_floors() {
         let (store, dir) = temp_store();
-        assert_eq!(primary(&store, "proj_1").unwrap(), None);
+        let opt = crate::flavor::scope::tests::named(&store, "opt_1");
+        assert_eq!(primary(&store, &opt.id).unwrap(), None);
         let metric = PrimaryMetric {
             key: "val_ic".into(),
             direction: Direction::Max,
             noise_floor: Some(0.002),
             split: Some("val".into()),
         };
-        set_primary(&store, "proj_1", &metric).unwrap();
-        assert_eq!(primary(&store, "proj_1").unwrap(), Some(metric.clone()));
+        set_primary(&store, &opt.id, &metric).unwrap();
+        assert_eq!(primary(&store, &opt.id).unwrap(), Some(metric.clone()));
         let negative = PrimaryMetric {
             noise_floor: Some(-1.0),
-            ..metric
+            ..metric.clone()
         };
-        assert!(set_primary(&store, "proj_1", &negative).is_err());
+        assert!(set_primary(&store, &opt.id, &negative).is_err());
+        // Each optimization keeps its own; a missing one has none to set.
+        let other = crate::flavor::scope::tests::named(&store, "opt_2");
+        assert_eq!(primary(&store, &other.id).unwrap(), None);
+        assert!(set_primary(&store, "opt_missing", &metric).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,8 +1,9 @@
-// VLResearch: the form that starts auto-research from the Research view. It
-// saves the brief (what to improve and how it is measured, the limits, the
-// budget, where to start) and the seed ideas, then opens a chat that scopes
-// the rest with the user and waits for their confirmation before the loop.
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+// VLResearch: the form that starts an optimization from the Research view. It
+// saves the brief (what to improve and how it is measured, the limits and
+// scope, the budget, where to start) and the seed ideas, then opens the chat
+// that runs it, which scopes the rest with the user and waits for their
+// confirmation before the loop. It edits an optimization's brief the same way.
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { Plus, X } from "lucide-react";
 import { useMemo, useRef, useState, type ReactNode } from "react";
@@ -15,6 +16,7 @@ import { taskLocation } from "../workspaceState";
 import {
   briefPayload,
   ideaPayload,
+  parseBrief,
   kickoffMessage,
   setupProblems,
   withoutIdeas,
@@ -28,6 +30,15 @@ const TEXTAREA =
   "w-full min-h-16 rounded-md border border-border bg-background px-2.5 py-1.5 font-sans text-sm text-text outline-none placeholder:text-muted focus:border-text resize-y";
 const SELECT =
   "h-8 w-full rounded-md border border-border bg-background px-2 font-sans text-sm text-text outline-none focus:border-text";
+
+/** Refetches everything the Research view shows about optimizations. */
+export function refreshResearch(queryClient: QueryClient) {
+  return Promise.all(
+    ["vlresearchOptimizations", "vlresearchIdeas", "vlresearchMetrics"].map((family) =>
+      queryClient.invalidateQueries({ queryKey: workspaceKey(family) }),
+    ),
+  );
+}
 
 async function write(method: "PUT" | "POST", url: string, body?: unknown): Promise<unknown> {
   const response = await fetch(url, {
@@ -69,14 +80,18 @@ function readyAgents(harnesses: readonly Harness[] | undefined): Harness[] {
 
 export function ResearchSetup({
   projectId,
+  optimizationId,
   initial,
   editing,
   startable,
   keys,
   queued,
   onClose,
+  onSaved,
 }: {
   projectId: string;
+  /** The optimization being edited; null to start a new one. */
+  optimizationId: string | null;
   initial: SetupDraft;
   /** The project already has a brief; saving changes it and reopens it. */
   editing: boolean;
@@ -87,6 +102,8 @@ export function ResearchSetup({
   /** Ideas already queued, which the form shows but doesn't change. */
   queued: readonly Idea[];
   onClose: () => void;
+  /** Told which optimization was saved, so the view can show it. */
+  onSaved: (optimizationId: string) => void;
 }) {
   const [draft, setDraft] = useState(initial);
   // Problems show once the user has tried to save, and clear as they're fixed.
@@ -97,7 +114,9 @@ export function ResearchSetup({
   const improvementSign = draft.direction === "max" ? "Higher is better, so an improvement is positive." : "Lower is better, so an improvement is negative.";
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // A chat started by an attempt that failed later on, reused by the retry.
+  // What an attempt that failed later on already made, reused by the retry:
+  // the optimization it started, and its chat.
+  const created = useRef<string | null>(optimizationId);
   const started = useRef<string | null>(null);
   const queryClient = useQueryClient();
   const router = useRouter();
@@ -116,12 +135,7 @@ export function ResearchSetup({
       ideas: current.ideas.map((idea, at) => (at === index ? { ...idea, ...change } : idea)),
     }));
 
-  const refresh = () =>
-    Promise.all(
-      ["vlresearchBrief", "vlresearchIdeas", "vlresearchMetrics"].map((family) =>
-        queryClient.invalidateQueries({ queryKey: workspaceKey(family, projectId) }),
-      ),
-    );
+  const refresh = () => refreshResearch(queryClient);
 
   const save = async (start: boolean) => {
     setTried(true);
@@ -132,12 +146,20 @@ export function ResearchSetup({
       return;
     }
     setBusy(true);
-    const base = `/api/vlresearch/projects/${encodeURIComponent(projectId)}`;
     // Rows already queued by this attempt leave the form even if a later step
     // fails, so retrying doesn't queue them twice.
     const saved = new Set<number>();
     try {
-      await write("PUT", `${base}/brief`, briefPayload(draft));
+      let id = created.current;
+      if (id === null) {
+        const made = parseBrief(await write("POST", `/api/vlresearch/projects/${encodeURIComponent(projectId)}/optimizations`, briefPayload(draft)));
+        id = made.brief?.id ?? null;
+        if (!id) throw new Error("The new optimization came back without an id.");
+        created.current = id;
+      } else {
+        await write("PUT", `/api/vlresearch/optimizations/${encodeURIComponent(id)}/brief`, briefPayload(draft));
+      }
+      const base = `/api/vlresearch/optimizations/${encodeURIComponent(id)}`;
       for (const [index, idea] of draft.ideas.entries()) {
         const body = ideaPayload(idea);
         if (!body) continue;
@@ -156,12 +178,14 @@ export function ResearchSetup({
         ).id;
         const sessionId = started.current;
         await write("PUT", `${base}/brief/chat`, { sessionId });
-        await sendChatMessage(sessionId, kickoffMessage(projectId, queued.length + saved.size));
+        await sendChatMessage(sessionId, kickoffMessage(projectId, id, queued.length + saved.size));
         await refresh();
+        onSaved(id);
         const pane = new URLSearchParams(window.location.search).get("pane");
         void router.navigate({ href: `${taskLocation(projectId, sessionId)}${pane ? `?${new URLSearchParams({ pane })}` : ""}` });
       } else {
         await refresh();
+        onSaved(id);
       }
       onClose();
     } catch (failure) {
@@ -177,10 +201,10 @@ export function ResearchSetup({
     <div className="flex flex-col">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h2 className="m-0 text-base font-semibold text-text">{editing ? "Edit the brief" : "Start auto-research"}</h2>
+          <h2 className="m-0 text-base font-semibold text-text">{editing ? "Edit the brief" : "Start an optimization"}</h2>
           <p className="mt-1 mb-0 text-sm text-subtext leading-relaxed">
             {!editing
-              ? "Say what to improve and where to start. The agent checks the data and the baseline, asks about anything missing, and waits for you to confirm before it spends compute."
+              ? "Say what to improve and where to start. It runs in its own chat: the agent checks the data and the baseline, asks about anything missing, and waits for you to confirm before it spends compute."
               : startable
                 ? "Saving reopens the brief until you confirm it again. Save and start also opens a chat in which the agent checks the data and the baseline and asks about anything missing."
                 : "Saving changes reopens the brief: the loop waits until you confirm it again."}
@@ -247,6 +271,12 @@ export function ResearchSetup({
           </Field>
           <Field label="Locked files and folders" hint="One per line, from the repository root. A run whose commit changes one is refused.">
             <textarea className={`${TEXTAREA} font-mono`} rows={2} value={draft.locked} placeholder={"eval/score.py\ndata/splits.yaml"} onChange={(event) => update("locked", event.target.value)} />
+          </Field>
+          <Field
+            label="Only change (optional)"
+            hint="To work on one part of the system: runs may change only files inside these paths, one per line. Leave empty for the whole repository."
+          >
+            <textarea className={`${TEXTAREA} font-mono`} rows={2} value={draft.scope} placeholder={"features/\ndata/loaders.py"} onChange={(event) => update("scope", event.target.value)} />
           </Field>
         </Step>
 

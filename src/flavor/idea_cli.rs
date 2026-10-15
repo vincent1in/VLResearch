@@ -1,10 +1,13 @@
-//! `orx idea`: the idea queue from the command line.
+//! `orx idea`: an optimization's idea queue from the command line. Commands
+//! that name a project act on the optimization named with `--opt`, else the
+//! one this chat runs, else the project's only one.
 
 use serde_json::json;
 
 use super::cli::{IdeaCommand, IdeaFieldArgs};
 use super::ideas::{self, Author, Idea, IdeaFields, Status, Verdict};
 use super::metrics;
+use super::scope::{self, Brief, Resolve};
 use crate::error::{anyhow, Result};
 use crate::output::print_table;
 use crate::store::Store;
@@ -15,14 +18,18 @@ pub(crate) fn run(command: IdeaCommand) -> Result<()> {
         IdeaCommand::Add {
             project_id,
             title,
+            opt,
             fields,
         } => {
-            let project = crate::local::resolve::resolve_project(&store, &project_id)?;
+            let brief = optimization(&store, &project_id, opt.as_deref(), Resolve::OrCreate)?;
             let mut fields = to_fields(fields)?;
             fields.title = Some(title);
             fields.author = fields.author.or(Some(default_author()));
-            let idea = ideas::add(&store, &project.id, fields)?;
-            println!("Added idea {}: {}", idea.id, idea.title);
+            let idea = ideas::add(&store, &brief.id, fields)?;
+            println!(
+                "Added idea {} to optimization {}: {}",
+                idea.id, brief.id, idea.title
+            );
             Ok(())
         }
         IdeaCommand::Edit {
@@ -38,9 +45,10 @@ pub(crate) fn run(command: IdeaCommand) -> Result<()> {
         }
         IdeaCommand::List {
             project_id,
+            opt,
             all,
             json,
-        } => list(&store, &project_id, all, json),
+        } => list(&store, &project_id, opt.as_deref(), all, json),
         IdeaCommand::Show { idea_id, json } => {
             let idea = ideas::require(&store, &idea_id)?;
             if json {
@@ -50,7 +58,11 @@ pub(crate) fn run(command: IdeaCommand) -> Result<()> {
             }
             Ok(())
         }
-        IdeaCommand::Next { project_id, json } => next(&store, &project_id, json),
+        IdeaCommand::Next {
+            project_id,
+            opt,
+            json,
+        } => next(&store, &project_id, opt.as_deref(), json),
         IdeaCommand::Start {
             idea_id,
             experiment_id,
@@ -59,7 +71,7 @@ pub(crate) fn run(command: IdeaCommand) -> Result<()> {
             // confirmed brief; fixing a blocker can come before.
             let idea = ideas::require(&store, &idea_id)?;
             if !idea.is_blocker() {
-                super::scope::require_confirmed(&store, &idea.project_id)?;
+                scope::require_confirmed(&store, &scope::require(&store, &idea.optimization_id)?)?;
             }
             let idea = ideas::start(&store, &idea.id, &experiment_id)?;
             println!(
@@ -96,8 +108,23 @@ pub(crate) fn run(command: IdeaCommand) -> Result<()> {
             report_closed(&ideas::close(&store, &idea_id, Verdict::Dropped, reason)?);
             Ok(())
         }
-        IdeaCommand::Calibration { project_id, json } => calibration(&store, &project_id, json),
+        IdeaCommand::Calibration {
+            project_id,
+            opt,
+            json,
+        } => calibration(&store, &project_id, opt.as_deref(), json),
     }
+}
+
+/// The optimization a command naming `project_id` acts on.
+fn optimization(
+    store: &Store,
+    project_id: &str,
+    opt: Option<&str>,
+    want: Resolve,
+) -> Result<Brief> {
+    let project = crate::local::resolve::resolve_project(store, project_id)?;
+    scope::resolve(store, &project.id, opt, want)
 }
 
 fn default_author() -> Author {
@@ -159,9 +186,9 @@ fn status_order(status: Status) -> u8 {
     }
 }
 
-fn list(store: &Store, project_id: &str, all: bool, json: bool) -> Result<()> {
-    let project = crate::local::resolve::resolve_project(store, project_id)?;
-    let mut ideas: Vec<Idea> = ideas::list(store, &project.id)?
+fn list(store: &Store, project_id: &str, opt: Option<&str>, all: bool, json: bool) -> Result<()> {
+    let brief = optimization(store, project_id, opt, Resolve::Existing)?;
+    let mut ideas: Vec<Idea> = ideas::list(store, &brief.id)?
         .into_iter()
         .filter(|idea| all || !idea.status.is_closed())
         .collect();
@@ -179,10 +206,12 @@ fn list(store: &Store, project_id: &str, all: bool, json: bool) -> Result<()> {
     }
     if ideas.is_empty() {
         println!(
-            "No {}ideas yet. Add one with `orx idea add {} \"<title>\" --forecast <change> \
-             --interval <low> <high> --cost-hours <hours> --kill-test \"<test>\"`.",
+            "No {}ideas yet in optimization {}. Add one with `orx idea add {} \"<title>\" \
+             --forecast <change> --interval <low> <high> --cost-hours <hours> --kill-test \
+             \"<test>\"`.",
             if all { "" } else { "open " },
-            project.id
+            brief.id,
+            brief.project_id
         );
         return Ok(());
     }
@@ -278,11 +307,11 @@ fn report_closed(closed: &ideas::Closed) {
     }
 }
 
-fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
-    let project = crate::local::resolve::resolve_project(store, project_id)?;
-    super::scope::require_confirmed(store, &project.id)?;
-    let pick = ideas::next(store, &project.id)?;
-    let learned = ideas::adjustment(&ideas::list(store, &project.id)?);
+fn next(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Result<()> {
+    let brief = optimization(store, project_id, opt, Resolve::Existing)?;
+    scope::require_confirmed(store, &brief)?;
+    let pick = ideas::next(store, &brief.id)?;
+    let learned = ideas::adjustment(&ideas::list(store, &brief.id)?);
     let adjusted = pick
         .as_ref()
         .zip(learned.as_ref())
@@ -318,17 +347,17 @@ fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
         None => println!(
             "No open idea is ready (none queued, or all are blocked). Add ideas with `orx idea \
              add {} \"<title>\"`.",
-            project.id
+            brief.project_id
         ),
     }
     Ok(())
 }
 
-fn calibration(store: &Store, project_id: &str, json: bool) -> Result<()> {
-    let project = crate::local::resolve::resolve_project(store, project_id)?;
-    let all = ideas::list(store, &project.id)?;
+fn calibration(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Result<()> {
+    let brief = optimization(store, project_id, opt, Resolve::Existing)?;
+    let all = ideas::list(store, &brief.id)?;
     let report = ideas::calibration(&all);
-    let direction = metrics::primary(store, &project.id)?
+    let direction = metrics::primary(store, &brief.id)?
         .map_or(metrics::Direction::Max, |metric| metric.direction);
     let board = ideas::scoreboard(&all, direction);
     let learned = ideas::adjustment(&all);

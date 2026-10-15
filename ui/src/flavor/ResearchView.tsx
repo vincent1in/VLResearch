@@ -1,18 +1,22 @@
-// VLResearch: the Research view of the Experiments tab. The project's
-// optimization surface (the running best against the baseline, and which
-// steps moved the score), the idea queue by title, the brief with its budget,
-// and the findings ledger. The user starts auto-research here (the setup
-// form) and confirms the brief here; the agent and `orx` write the rest.
+// VLResearch: the Research view of the Experiments tab. A project runs one or
+// more optimizations, each in its own chat; the view shows one at a time: its
+// surface (the running best against the baseline, and which steps moved the
+// score), its idea queue by title and its brief with its budget, then the
+// project's findings ledger. The user starts optimizations here (the setup
+// form) and confirms their briefs here; the agent and `orx` write the rest.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessagesSquare, Play, Target, TriangleAlert } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessageSquare, MessagesSquare, Play, Plus, Target, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { sendChatMessage } from "../api";
 import { Button, IconButton } from "../components/ui";
 import { workspaceKey } from "../queries/client";
-import { ResearchSetup } from "./ResearchSetup";
+import { ResearchSetup, refreshResearch } from "./ResearchSetup";
 import {
   CONFIRMED_MESSAGE,
+  defaultOptimization,
   draftFromBrief,
+  optimizationLabel,
+  parseOptimizations,
   emptyDraft,
   isBlocker,
   ablationLine,
@@ -63,6 +67,18 @@ function useProjectData<T>(projectId: string, family: string, path: string, pars
     retry: false,
   });
 }
+
+function useOptimizationData<T>(optimizationId: string | null, family: string, path: string, parse: (value: unknown) => T) {
+  return useQuery({
+    queryKey: workspaceKey(family, optimizationId),
+    queryFn: ({ signal }) =>
+      fetchJson(`/api/vlresearch/optimizations/${encodeURIComponent(optimizationId ?? "")}/${path}`, parse, signal),
+    enabled: optimizationId !== null,
+    refetchInterval: POLL_MS,
+    retry: false,
+  });
+}
+
 
 /** The element's width in pixels, following resizes. */
 function useWidth<E extends HTMLElement>(): [RefObject<E | null>, number] {
@@ -480,8 +496,8 @@ function IdeasPanel({ ideas, onAsk }: { ideas: IdeasPayload; onAsk?: Ask }) {
 
 const BUDGET_TONE = { normal: "bg-accent-blue", warn: "bg-accent-amber", alert: "bg-accent-red" } as const;
 
-/** The user confirms the brief; the chat that was started for it is told. */
-function useConfirmBrief(projectId: string) {
+/** The user confirms the brief; the chat that runs the optimization is told. */
+function useConfirmBrief(optimizationId: string) {
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -489,12 +505,12 @@ function useConfirmBrief(projectId: string) {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch(`/api/vlresearch/projects/${encodeURIComponent(projectId)}/brief/confirm`, { method: "POST" });
+      const response = await fetch(`/api/vlresearch/optimizations/${encodeURIComponent(optimizationId)}/brief/confirm`, { method: "POST" });
       if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
       const confirmed = parseBrief(await response.json());
       const chat = confirmed.brief?.chatSessionId;
       if (chat) await sendChatMessage(chat, CONFIRMED_MESSAGE);
-      await queryClient.invalidateQueries({ queryKey: workspaceKey("vlresearchBrief", projectId) });
+      await refreshResearch(queryClient);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
@@ -504,8 +520,8 @@ function useConfirmBrief(projectId: string) {
   return { confirm, busy, error };
 }
 
-function ConfirmBar({ data, projectId, onEdit }: { data: BriefPayload; projectId: string; onEdit: () => void }) {
-  const { confirm, busy, error } = useConfirmBrief(projectId);
+function ConfirmBar({ data, onEdit }: { data: BriefPayload; onEdit: () => void }) {
+  const { confirm, busy, error } = useConfirmBrief(data.brief?.id ?? "");
   const ready = data.missing.length === 0;
   // No chat is working on the brief: starting one comes first, and the edit
   // form is where it starts.
@@ -551,7 +567,8 @@ function StartCard({ onStart }: { onStart: () => void }) {
       </div>
       <p className="m-0 text-sm text-subtext leading-relaxed">
         Set the goal, the metric that measures it, the limits and where to start. The agent checks the data and the
-        baseline, asks about anything missing, and waits for you to confirm before it runs the improvement loop.
+        baseline, asks about anything missing, and waits for you to confirm before it runs the improvement loop. Each
+        optimization runs in its own chat, so you can run several at once, on the whole system or on parts of it.
       </p>
       <div>
         <Button variant="primary" size="small" onClick={onStart}>
@@ -567,8 +584,8 @@ function BriefPanel({ data, onEdit }: { data: BriefPayload; onEdit: () => void }
   if (!brief) {
     return (
       <Note>
-        No brief yet. Start one above, or the agent writes one with you when it scopes the project; the improvement loop
-        waits until you confirm it.
+        No brief yet. The agent writes one with you when it scopes the work; the improvement loop waits until you
+        confirm it.
       </Note>
     );
   }
@@ -609,6 +626,16 @@ function BriefPanel({ data, onEdit }: { data: BriefPayload; onEdit: () => void }
                   <Lock size={10} className="inline me-1 align-[-1px]" />
                   {entry.path}
                 </Code>
+              ))}
+            </span>
+          </div>
+        )}
+        {brief.scope.length > 0 && (
+          <div className="grid grid-cols-[7.5rem_minmax(0,_1fr)] gap-x-3 py-0.5 text-sm">
+            <span className="text-muted">Only changes</span>
+            <span className="flex flex-wrap gap-1">
+              {brief.scope.map((path) => (
+                <Code key={path}>{path}</Code>
               ))}
             </span>
           </div>
@@ -686,18 +713,83 @@ function Loading({ error }: { error: unknown }) {
   return <Note>{error ? "Couldn't load this section." : "Loading…"}</Note>;
 }
 
+const SELECT =
+  "h-8 min-w-0 max-w-full flex-1 rounded-md border border-border bg-background px-2 font-sans text-sm text-text outline-none focus:border-text";
+
+/** Which optimization the view shows, and a way to start another. */
+function OptimizationBar({
+  list,
+  selectedId,
+  activeSessionId,
+  onSelect,
+  onNew,
+  onOpenChat,
+}: {
+  list: readonly BriefPayload[];
+  selectedId: string | null;
+  activeSessionId: string | null;
+  onSelect: (id: string) => void;
+  onNew: () => void;
+  onOpenChat?: (sessionId: string) => void;
+}) {
+  const selected = list.find((entry) => entry.brief?.id === selectedId);
+  const chat = selected?.brief?.chatSessionId ?? null;
+  const here = (entry: BriefPayload) => activeSessionId !== null && entry.brief?.chatSessionId === activeSessionId;
+  return (
+    <div className="mb-5 flex flex-wrap items-center gap-2">
+      {list.length > 1 ? (
+        <select className={SELECT} value={selectedId ?? ""} aria-label="Optimization" onChange={(event) => onSelect(event.target.value)}>
+          {list.map((entry) => (
+            <option key={entry.brief?.id} value={entry.brief?.id}>
+              {optimizationLabel(entry)}
+              {here(entry) ? " (this chat)" : ""}
+            </option>
+          ))}
+        </select>
+      ) : (
+        selected && (
+          <span dir="auto" className="min-w-0 flex-1 truncate text-sm font-medium text-text" title={selected.brief?.objective ?? undefined}>
+            {optimizationLabel(selected)}
+          </span>
+        )
+      )}
+      {chat && onOpenChat && chat !== activeSessionId && (
+        <Button variant="ghost" size="small" title="Open the chat that runs this optimization" onClick={() => onOpenChat(chat)}>
+          <MessageSquare size={13} /> Open its chat
+        </Button>
+      )}
+      <Button variant="ghost" size="small" title="Start another optimization in its own chat" onClick={onNew}>
+        <Plus size={13} /> New optimization
+      </Button>
+    </div>
+  );
+}
+
 export function ResearchView({
   projectId,
+  activeSessionId = null,
   onSideChat,
+  onOpenChat,
 }: {
   projectId: string;
+  /** The chat open beside the view; its optimization is shown first. */
+  activeSessionId?: string | null;
   /** Opens a side chat off a chat, with a question (empty to just open it). */
   onSideChat?: (parentSessionId: string, question: string) => void;
+  /** Brings a chat to the front. */
+  onOpenChat?: (sessionId: string) => void;
 }) {
-  const metrics = useProjectData(projectId, "vlresearchMetrics", "metrics", parseMetrics);
-  const ideas = useProjectData(projectId, "vlresearchIdeas", "ideas", parseIdeas);
-  const brief = useProjectData(projectId, "vlresearchBrief", "brief", parseBrief);
+  const list = useProjectData(projectId, "vlresearchOptimizations", "optimizations", parseOptimizations);
   const findings = useProjectData(projectId, "vlresearchFindings", "findings", parseFindings);
+  const optimizations = useMemo(() => list.data?.optimizations ?? [], [list.data]);
+  const [picked, setPicked] = useState<string | null>(null);
+  const selectedId =
+    picked !== null && optimizations.some((entry) => entry.brief?.id === picked)
+      ? picked
+      : defaultOptimization(optimizations, activeSessionId);
+  const selected = optimizations.find((entry) => entry.brief?.id === selectedId) ?? null;
+  const metrics = useOptimizationData(selectedId, "vlresearchMetrics", "metrics", parseMetrics);
+  const ideas = useOptimizationData(selectedId, "vlresearchIdeas", "ideas", parseIdeas);
   const [details, setDetails] = useState(true);
   const [setup, setSetup] = useState<"start" | "edit" | null>(null);
   const queued = useMemo(
@@ -705,30 +797,44 @@ export function ResearchView({
     [ideas.data],
   );
   if (setup) {
+    const editing = setup === "edit" && selected !== null;
     return (
       <div className="vlr-research absolute inset-0 overflow-y-auto bg-background">
         <div className="w-full max-w-230 mx-auto pt-5 px-5 pb-10">
           <ResearchSetup
             projectId={projectId}
-            initial={brief.data ? draftFromBrief(brief.data) : emptyDraft()}
-            editing={setup === "edit"}
-            startable={setup === "start" || !brief.data?.brief?.chatSessionId}
-            keys={metrics.data?.keys ?? []}
-            queued={queued}
+            optimizationId={editing ? selectedId : null}
+            initial={editing && selected ? draftFromBrief(selected) : emptyDraft()}
+            editing={editing}
+            startable={!editing || !selected?.brief?.chatSessionId}
+            keys={list.data?.keys ?? []}
+            queued={editing ? queued : []}
             onClose={() => setSetup(null)}
+            onSaved={setPicked}
           />
         </div>
       </div>
     );
   }
-  const unconfirmed = brief.data?.brief && !brief.data.brief.confirmedAt ? brief.data : null;
-  // Side chats branch off the chat that runs the loop, which the brief links.
-  const loopChat = brief.data?.brief?.chatSessionId ?? null;
+  const unconfirmed = selected?.brief && !selected.brief.confirmedAt ? selected : null;
+  // Side chats branch off the chat that runs the loop.
+  const loopChat = selected?.brief?.chatSessionId ?? null;
   const ask: Ask | undefined = loopChat && onSideChat ? (question) => onSideChat(loopChat, question) : undefined;
   return (
     <div className="vlr-research absolute inset-0 overflow-y-auto bg-background">
       <div className="w-full max-w-230 mx-auto pt-5 px-5 pb-10">
-        {brief.data && !brief.data.brief && <StartCard onStart={() => setSetup("start")} />}
+        {!list.data && <Loading error={list.error} />}
+        {list.data && optimizations.length === 0 && <StartCard onStart={() => setSetup("start")} />}
+        {optimizations.length > 0 && (
+          <OptimizationBar
+            list={optimizations}
+            selectedId={selectedId}
+            activeSessionId={activeSessionId}
+            onSelect={setPicked}
+            onNew={() => setSetup("start")}
+            onOpenChat={onOpenChat}
+          />
+        )}
         {unconfirmed && (
           <div className="flex flex-col gap-2 mb-5 py-3 px-4 rounded-md border border-accent-amber bg-accent-amber-subtle">
             <div className="text-sm text-text">
@@ -739,44 +845,48 @@ export function ResearchView({
                   ? "Review it below; confirming starts the improvement loop."
                   : "No agent is working on it yet: start one to check the data and the baseline with you before the loop runs."}
             </div>
-            <ConfirmBar data={unconfirmed} projectId={projectId} onEdit={() => setSetup("edit")} />
+            <ConfirmBar data={unconfirmed} onEdit={() => setSetup("edit")} />
           </div>
         )}
-        <div className="mb-3 flex items-center justify-between gap-2">
-          <h2 className="m-0 flex items-center gap-1.5 text-sm font-semibold text-text [&_svg]:text-muted">
-            <Target size={14} />
-            Optimization
-          </h2>
-          {ask && (
-            <Button variant="ghost" size="small" title="Ask about the optimization in a side chat; the loop keeps running" onClick={() => ask("")}>
-              <MessagesSquare size={13} /> Side chat
-            </Button>
-          )}
-        </div>
-        {metrics.data ? <Headline metrics={metrics.data} /> : <Loading error={metrics.error} />}
-        {metrics.data?.primary && (
+        {selected && (
           <>
-            <div className="mt-4">
-              <RunningBest metrics={metrics.data} />
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h2 className="m-0 flex items-center gap-1.5 text-sm font-semibold text-text [&_svg]:text-muted">
+                <Target size={14} />
+                Optimization
+              </h2>
+              {ask && (
+                <Button variant="ghost" size="small" title="Ask about the optimization in a side chat; the loop keeps running" onClick={() => ask("")}>
+                  <MessagesSquare size={13} /> Side chat
+                </Button>
+              )}
             </div>
-            <button
-              type="button"
-              className="mt-4 mb-2 flex items-center gap-1 p-0 border-0 bg-transparent text-sm font-medium text-text cursor-pointer"
-              aria-expanded={details}
-              onClick={() => setDetails((open) => !open)}
-            >
-              {details ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-              What moved the score
-            </button>
-            {details && <Waterfall metrics={metrics.data} onAsk={ask} />}
+            {metrics.data ? <Headline metrics={metrics.data} /> : <Loading error={metrics.error} />}
+            {metrics.data?.primary && (
+              <>
+                <div className="mt-4">
+                  <RunningBest metrics={metrics.data} />
+                </div>
+                <button
+                  type="button"
+                  className="mt-4 mb-2 flex items-center gap-1 p-0 border-0 bg-transparent text-sm font-medium text-text cursor-pointer"
+                  aria-expanded={details}
+                  onClick={() => setDetails((open) => !open)}
+                >
+                  {details ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  What moved the score
+                </button>
+                {details && <Waterfall metrics={metrics.data} onAsk={ask} />}
+              </>
+            )}
+            <Section icon={<Lightbulb size={14} />} title="Ideas">
+              {ideas.data ? <IdeasPanel ideas={ideas.data} onAsk={ask} /> : <Loading error={ideas.error} />}
+            </Section>
+            <Section icon={<ClipboardList size={14} />} title="Brief">
+              <BriefPanel data={selected} onEdit={() => setSetup("edit")} />
+            </Section>
           </>
         )}
-        <Section icon={<Lightbulb size={14} />} title="Ideas">
-          {ideas.data ? <IdeasPanel ideas={ideas.data} onAsk={ask} /> : <Loading error={ideas.error} />}
-        </Section>
-        <Section icon={<ClipboardList size={14} />} title="Brief">
-          {brief.data ? <BriefPanel data={brief.data} onEdit={() => setSetup("edit")} /> : <Loading error={brief.error} />}
-        </Section>
         <Section icon={<BookOpen size={14} />} title="Findings">
           {findings.data ? <FindingsPanel rows={findings.data} onAsk={ask} /> : <Loading error={findings.error} />}
         </Section>

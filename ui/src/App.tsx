@@ -1999,7 +1999,12 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 </div>
                 <div className="pane-content flex-1 min-h-0 relative bg-background">
                   {vlrResearch && activeProject ? (
-                    <ResearchView projectId={activeProject.id} onSideChat={(sessionId, question) => void openResearchSideChat(sessionId, question)} />
+                    <ResearchView
+                      projectId={activeProject.id}
+                      activeSessionId={activeSessionId}
+                      onSideChat={(sessionId, question) => void openResearchSideChat(sessionId, question)}
+                      onOpenChat={(sessionId) => onActiveSessionChange(sessionId)}
+                    />
                   ) : view === "tree" ? (
                     activeProject && (
                       <TreeView

@@ -17,9 +17,35 @@ pub(crate) fn run(command: FindingCommand) -> Result<()> {
             statement,
             kind,
             idea,
+            opt,
         } => {
             let project = crate::local::resolve::resolve_project(&store, &project_id)?;
-            let finding = findings::add(&store, &project.id, kind, &statement, idea.as_deref())?;
+            // Labelled with the optimization named, else the idea's, else the
+            // one this chat runs; findings stay shared by the whole project.
+            let optimization = match opt {
+                Some(opt) => Some(
+                    super::scope::resolve(
+                        &store,
+                        &project.id,
+                        Some(&opt),
+                        super::scope::Resolve::Existing,
+                    )?
+                    .id,
+                ),
+                None if idea.is_none() => super::scope::current_chat(&store)
+                    .and_then(|chat| super::scope::for_chat(&store, &chat).ok().flatten())
+                    .filter(|brief| brief.project_id == project.id)
+                    .map(|brief| brief.id),
+                None => None,
+            };
+            let finding = findings::add(
+                &store,
+                &project.id,
+                kind,
+                &statement,
+                idea.as_deref(),
+                optimization.as_deref(),
+            )?;
             println!("Added finding {}: {}", finding.id, finding.statement);
             Ok(())
         }

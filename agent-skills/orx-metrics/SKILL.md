@@ -1,6 +1,6 @@
 ---
 name: orx-metrics
-description: "Report run metrics as ORX_METRIC lines and compare runs on the project's primary metric with `orx metric`. Use when writing or editing code that reports losses or scores, before launching a run whose result will be compared, when choosing what to optimize, or before saying which experiment is best."
+description: "Report run metrics as ORX_METRIC lines and compare runs on this chat's optimization's primary metric with `orx metric`. Use when writing or editing code that reports losses or scores, before launching a run whose result will be compared, when choosing what to optimize, or before saying which experiment is best."
 ---
 
 ## Report metrics from run code
@@ -29,7 +29,9 @@ printed no metrics can't be ranked afterwards.
 
 ## Set the primary metric
 
-Once per project, before comparing runs, name the key that defines "best":
+Once per optimization, before comparing runs, name the key that defines
+"best". Each chat's optimization has its own; set in this chat, it is this
+chat's:
 
 ```sh
 orx metric primary <projectId> val_ic --maximize --noise-floor 0.002

@@ -5,7 +5,14 @@ description: "Scope research work with the user before spending compute: intervi
 
 ## When
 
-- Before the first improvement experiment in a project, and whenever the
+Each chat runs its own optimization: its own brief, primary metric, idea
+queue and budget, on the whole system or on one part of it. The `orx brief`,
+`orx metric` and `orx idea` commands you run in this chat act on this chat's
+optimization, and the first that writes one starts it. A project can run
+several; `orx brief list <projectId>` shows them, and `--opt <optId>` names
+another.
+
+- Before the first improvement experiment in this chat, and whenever the
   goal changes.
 - When the user starts auto-research with part of the brief, and maybe
   some seed ideas, already recorded.
@@ -31,6 +38,7 @@ it. Keep going until every field is pinned; don't fill a gap with a guess.
 | Noise floor | How far the metric moves between seeds of the baseline | Spread across three seeds of the baseline |
 | What may change | Code and data runs may touch | Feature code, model code, loaders; new datasets under a named folder |
 | What must not change | Whatever defines the score | Evaluation code, split dates, the out-of-sample window |
+| Scope | When the work is on one part of the system, the paths runs may change | `features/`, `data/loaders.py` |
 | Budget | Runs, GPU-hours, wall-clock days | 20 runs, 40 GPU-hours, two weeks |
 | Starting pointers | Where the user wants to begin | "Look at the volume features first" |
 | Sources | Datasets on the compute host, earlier experiments, papers | The options dataset under `/data/opt` |
@@ -83,13 +91,16 @@ edit them. In plan mode, that is the plan you submit. Only after they agree:
 orx metric primary <projectId> <key> --maximize --noise-floor <spread>
 orx brief set <projectId> --objective "..." --may-change "..." \
   --must-not-change "..." --lock <evaluation file> --lock <split file> \
+  --scope <path> \
   --budget-runs 20 --budget-gpu-hours 40 --budget-days 14 \
   --pointers "..." --sources "..." --stop-rule "..."
 orx idea add <projectId> "<title>" ...    # one per idea
 orx brief confirm <projectId>
 ```
 
-`orx brief set` changes only the fields you pass. The user may confirm the
+Leave out `--scope` when the whole repository is in play; with it, a run may
+change only files inside those paths. `orx brief set` changes only the fields
+you pass. The user may confirm the
 brief themselves, outside this chat, and this chat is told when they do. If
 they agree in the chat instead, confirm it yourself.
 

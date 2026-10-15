@@ -81,6 +81,9 @@ pub(crate) struct Finding {
     pub locked: bool,
     /// The idea whose test produced or tests the claim, if any.
     pub idea_id: Option<String>,
+    /// The optimization whose work produced it. Findings are the project's,
+    /// shared by all its optimizations.
+    pub optimization_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -123,6 +126,12 @@ pub(crate) struct Assessment {
 }
 
 pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
+    create_tables(conn)?;
+    super::scope::ensure_tables(conn)
+}
+
+/// The ledger's tables, without the move of older data into optimizations.
+pub(crate) fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS vlr_findings (
              id         TEXT PRIMARY KEY,
@@ -165,11 +174,13 @@ pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
              created_at    INTEGER NOT NULL
          );",
     )?;
+    super::metrics::add_column(conn, "vlr_findings", "optimization_id", "TEXT")?;
     Ok(())
 }
 
 const FINDING_COLUMNS: &str =
-    "id, project_id, kind, statement, status, locked, idea_id, created_at, updated_at";
+    "id, project_id, kind, statement, status, locked, idea_id, created_at, updated_at,
+     optimization_id";
 
 fn from_row(row: &Row) -> rusqlite::Result<Finding> {
     Ok(Finding {
@@ -182,6 +193,7 @@ fn from_row(row: &Row) -> rusqlite::Result<Finding> {
         idea_id: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
+        optimization_id: row.get(9)?,
     })
 }
 
@@ -228,22 +240,27 @@ fn writable(finding: &Finding) -> Result<()> {
     Ok(())
 }
 
+/// Adds a claim, labelled with the optimization whose work produced it: the
+/// one given, else that of the idea it comes from.
 pub(crate) fn add(
     store: &Store,
     project_id: &str,
     kind: Kind,
     statement: &str,
     idea_id: Option<&str>,
+    optimization_id: Option<&str>,
 ) -> Result<Finding> {
     let statement = statement.trim();
     if statement.is_empty() {
         return Err(anyhow!("A finding needs a statement."));
     }
+    let mut optimization_id = optimization_id.map(str::to_owned);
     if let Some(idea_id) = idea_id {
         let idea = super::ideas::require(store, idea_id)?;
         if idea.project_id != project_id {
             return Err(anyhow!("Idea {} belongs to another project.", idea.id));
         }
+        optimization_id.get_or_insert(idea.optimization_id);
     }
     let conn = store.flavor_conn();
     ensure_tables(conn)?;
@@ -251,9 +268,17 @@ pub(crate) fn add(
     let now = crate::store::now_ms();
     conn.execute(
         "INSERT INTO vlr_findings (id, project_id, kind, statement, status, locked, idea_id,
-             created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'open', 0, ?5, ?6, ?6)",
-        params![id, project_id, kind.as_str(), statement, idea_id, now],
+             created_at, updated_at, optimization_id)
+         VALUES (?1, ?2, ?3, ?4, 'open', 0, ?5, ?6, ?6, ?7)",
+        params![
+            id,
+            project_id,
+            kind.as_str(),
+            statement,
+            idea_id,
+            now,
+            optimization_id
+        ],
     )?;
     require(store, &id)
 }
@@ -573,6 +598,7 @@ mod tests {
             Kind::Model,
             "Volume features add IC in high-volatility months",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(claim.status, Status::Open);
@@ -594,6 +620,7 @@ mod tests {
             "p",
             Kind::Dataset,
             "The vendor's volume has gaps before 2015",
+            None,
             None,
         )
         .unwrap();

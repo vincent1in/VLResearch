@@ -130,10 +130,14 @@ export interface IdeasPayload {
 }
 
 export interface Brief {
+  /** The optimization's id. */
+  id: string;
   objective: string | null;
   mayChange: string | null;
   mustNotChange: string | null;
   locked: { path: string }[];
+  /** The only paths runs may change; empty for the whole repository. */
+  scope: string[];
   budgetRuns: number | null;
   budgetGpuHours: number | null;
   budgetDays: number | null;
@@ -142,8 +146,9 @@ export interface Brief {
   stopRule: string | null;
   confirmedAt: number | null;
   confirmedBy: string | null;
-  /** The chat the Research view started for this brief. */
+  /** The chat that runs this optimization. */
   chatSessionId: string | null;
+  updatedAt: number | null;
 }
 
 export interface Usage {
@@ -335,10 +340,12 @@ export function parseBrief(value: unknown): BriefPayload {
   const body = isObject(value) ? value : {};
   const brief = isObject(body.brief)
     ? {
+        id: text(body.brief.id) ?? "",
         objective: text(body.brief.objective),
         mayChange: text(body.brief.mayChange),
         mustNotChange: text(body.brief.mustNotChange),
         locked: list(body.brief.locked).flatMap((entry) => (isObject(entry) && typeof entry.path === "string" ? [{ path: entry.path }] : [])),
+        scope: list(body.brief.scope).flatMap((path) => (typeof path === "string" ? [path] : [])),
         budgetRuns: number(body.brief.budgetRuns),
         budgetGpuHours: number(body.brief.budgetGpuHours),
         budgetDays: number(body.brief.budgetDays),
@@ -348,6 +355,7 @@ export function parseBrief(value: unknown): BriefPayload {
         confirmedAt: number(body.brief.confirmedAt),
         confirmedBy: text(body.brief.confirmedBy),
         chatSessionId: text(body.brief.chatSessionId),
+        updatedAt: number(body.brief.updatedAt),
       }
     : null;
   const usage = isObject(body.usage)
@@ -359,6 +367,38 @@ export function parseBrief(value: unknown): BriefPayload {
     usage,
     missing: list(body.missing).flatMap((item) => (typeof item === "string" ? [plainMissing(item)] : [])),
   };
+}
+
+/** A project's optimizations, most recently changed first, and the metric
+ * keys its runs have reported. */
+export interface OptimizationList {
+  optimizations: BriefPayload[];
+  keys: string[];
+}
+
+export function parseOptimizations(value: unknown): OptimizationList {
+  const body = isObject(value) ? value : {};
+  return {
+    optimizations: list(body.optimizations)
+      .map(parseBrief)
+      .filter((payload) => payload.brief !== null && payload.brief.id !== ""),
+    keys: list(body.keys).flatMap((key) => (typeof key === "string" ? [key] : [])),
+  };
+}
+
+/** The optimization to show first: the one the open chat runs, else the
+ * most recently changed. */
+export function defaultOptimization(list: readonly BriefPayload[], activeSessionId: string | null): string | null {
+  const running = activeSessionId ? list.find((payload) => payload.brief?.chatSessionId === activeSessionId) : undefined;
+  return (running ?? list[0])?.brief?.id ?? null;
+}
+
+/** How the switcher names an optimization: its objective, else its metric. */
+export function optimizationLabel(payload: BriefPayload): string {
+  const objective = payload.brief?.objective?.trim();
+  if (objective) return objective.length > 60 ? `${objective.slice(0, 57)}…` : objective;
+  if (payload.primary) return `Improve ${payload.primary.key}`;
+  return "New optimization";
 }
 
 /** What a brief still needs, as the dashboard says it: without the
@@ -730,6 +770,8 @@ export interface SetupDraft {
   mustNotChange: string;
   /** One repository path per line. */
   locked: string;
+  /** The only paths runs may change, one per line; blank for all. */
+  scope: string;
   budgetRuns: string;
   budgetGpuHours: string;
   budgetDays: string;
@@ -750,6 +792,7 @@ export function emptyDraft(): SetupDraft {
     mayChange: "",
     mustNotChange: "",
     locked: "",
+    scope: "",
     budgetRuns: "",
     budgetGpuHours: "",
     budgetDays: "",
@@ -775,6 +818,7 @@ export function draftFromBrief(payload: BriefPayload): SetupDraft {
     mayChange: brief?.mayChange ?? "",
     mustNotChange: brief?.mustNotChange ?? "",
     locked: (brief?.locked ?? []).map((entry) => entry.path).join("\n"),
+    scope: (brief?.scope ?? []).join("\n"),
     budgetRuns: shown(brief?.budgetRuns ?? null),
     budgetGpuHours: shown(brief?.budgetGpuHours ?? null),
     budgetDays: shown(brief?.budgetDays ?? null),
@@ -825,6 +869,7 @@ export function setupProblems(draft: SetupDraft): SetupProblems {
 
 const value = (parsed: Parsed) => (parsed.ok ? parsed.value : null);
 const textOrNull = (text: string) => (text.trim() ? text.trim() : null);
+const paths = (text: string) => text.split(/[\n,]/).map((path) => path.trim()).filter(Boolean);
 
 /** The body for PUT /api/vlresearch/projects/{id}/brief. */
 export function briefPayload(draft: SetupDraft) {
@@ -832,7 +877,8 @@ export function briefPayload(draft: SetupDraft) {
     objective: textOrNull(draft.objective),
     mayChange: textOrNull(draft.mayChange),
     mustNotChange: textOrNull(draft.mustNotChange),
-    locked: draft.locked.split(/[\n,]/).map((path) => path.trim()).filter(Boolean),
+    locked: paths(draft.locked),
+    scope: paths(draft.scope),
     budgetRuns: value(parseNumber(draft.budgetRuns, wholePositive)),
     budgetGpuHours: value(parseNumber(draft.budgetGpuHours, positive)),
     budgetDays: value(parseNumber(draft.budgetDays, positive)),
@@ -882,12 +928,12 @@ export function withoutIdeas(draft: SetupDraft, saved: ReadonlySet<number>): Set
 }
 
 /** The first message of the chat the Research view starts. */
-export function kickoffMessage(projectId: string, seedIdeas: number): string {
+export function kickoffMessage(projectId: string, optimizationId: string, seedIdeas: number): string {
   const ideas = seedIdeas === 0
     ? "no seed ideas yet, so propose them from my pointers"
     : `${seedIdeas} seed idea${seedIdeas === 1 ? "" : "s"} (\`orx idea list ${projectId}\`)`;
   return [
-    `Let's run auto-research on this project. I set the goal in the Research view: \`orx brief show ${projectId}\` has it, with ${ideas}.`,
+    `Let's run auto-research on this project. This chat runs optimization ${optimizationId}, and I set its goal in the Research view: \`orx brief show ${projectId}\` has it, with ${ideas}.`,
     "",
     "Scope it with me using the orx-grill skill, starting from what I filled in:",
     "- ask only about what's missing or unclear, each question with your recommended answer;",

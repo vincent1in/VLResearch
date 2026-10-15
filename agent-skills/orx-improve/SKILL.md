@@ -1,11 +1,14 @@
 ---
 name: orx-improve
-description: "Run the forecast-and-verify improvement loop on a scoped project: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on a project with a confirmed brief."
+description: "Run the forecast-and-verify improvement loop on this chat's scoped optimization: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on an optimization with a confirmed brief."
 ---
 
 ## Before the loop
 
-The project needs a confirmed brief: `orx brief show <projectId>`. Without
+The loop runs this chat's optimization, which needs a confirmed brief:
+`orx brief show <projectId>`. Its best, budget and idea queue are its own:
+the best is measured over the runs launched for it, so other chats'
+optimizations in the project don't move it. Without
 one, scope the work first with `orx-grill`; `orx idea next` and
 `orx idea start` refuse until the user has confirmed it.
 

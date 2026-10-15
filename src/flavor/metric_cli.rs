@@ -1,9 +1,13 @@
-//! `orx metric`: the metrics ledger from the command line.
+//! `orx metric`: the metrics ledger from the command line. Run metrics are the
+//! project's; the primary metric, the ranking on it and the best belong to an
+//! optimization: the one named with `--opt`, else the one this chat runs, else
+//! the project's only one.
 
 use serde_json::json;
 
 use super::cli::MetricCommand;
 use super::metrics::{self, Direction, PrimaryMetric};
+use super::scope::{self, Resolve};
 use crate::error::{anyhow, Result};
 use crate::output::print_table;
 use crate::store::Store;
@@ -14,6 +18,7 @@ pub(crate) fn run(command: MetricCommand) -> Result<()> {
         MetricCommand::Show { run_id, json } => show(&store, &run_id, json),
         MetricCommand::Runs {
             project_id,
+            opt,
             key,
             split,
             maximize,
@@ -22,6 +27,7 @@ pub(crate) fn run(command: MetricCommand) -> Result<()> {
         } => runs(
             &store,
             &project_id,
+            opt.as_deref(),
             key,
             split,
             direction_flag(maximize, minimize),
@@ -29,6 +35,7 @@ pub(crate) fn run(command: MetricCommand) -> Result<()> {
         ),
         MetricCommand::Primary {
             project_id,
+            opt,
             key,
             maximize,
             minimize,
@@ -37,12 +44,17 @@ pub(crate) fn run(command: MetricCommand) -> Result<()> {
         } => primary(
             &store,
             &project_id,
+            opt.as_deref(),
             key,
             direction_flag(maximize, minimize),
             noise_floor,
             split,
         ),
-        MetricCommand::Best { project_id, json } => best(&store, &project_id, json),
+        MetricCommand::Best {
+            project_id,
+            opt,
+            json,
+        } => best(&store, &project_id, opt.as_deref(), json),
     }
 }
 
@@ -156,11 +168,13 @@ fn reported_keys(store: &Store, project_id: &str) -> Result<String> {
     })
 }
 
-fn no_primary(store: &Store, project_id: &str) -> Result<anyhow::Error> {
+fn no_primary(store: &Store, brief: &scope::Brief) -> Result<anyhow::Error> {
     Ok(anyhow!(
-        "Project {project_id} has no primary metric yet. Set one with `orx metric primary \
-         {project_id} <key> --maximize` (or `--minimize`). {}",
-        reported_keys(store, project_id)?
+        "Optimization {} has no primary metric yet. Set one with `orx metric primary {} <key> \
+         --maximize` (or `--minimize`). {}",
+        brief.id,
+        brief.project_id,
+        reported_keys(store, &brief.project_id)?
     ))
 }
 
@@ -188,16 +202,29 @@ fn require_split(store: &Store, project_id: &str, key: &str, split: Option<&str>
 fn runs(
     store: &Store,
     project_id: &str,
+    opt: Option<&str>,
     key: Option<String>,
     split: Option<String>,
     direction: Option<Direction>,
     json: bool,
 ) -> Result<()> {
     let project = crate::local::resolve::resolve_project(store, project_id)?;
-    let primary = metrics::primary(store, &project.id)?;
+    // `--key` ranks the whole project's runs; otherwise the optimization's
+    // runs on its primary metric.
+    let brief = match (&key, opt) {
+        (Some(_), None) => None,
+        _ => Some(scope::resolve(store, &project.id, opt, Resolve::Existing)?),
+    };
+    let primary = match &brief {
+        Some(brief) => metrics::primary(store, &brief.id)?,
+        None => None,
+    };
     let metric = match (key, primary) {
         (None, Some(primary)) => primary,
-        (None, None) => return Err(no_primary(store, &project.id)?),
+        (None, None) => match &brief {
+            Some(brief) => return Err(no_primary(store, brief)?),
+            None => unreachable!("a run ranking without --key resolves an optimization"),
+        },
         (Some(key), Some(primary)) if key == primary.key && direction.is_none() => PrimaryMetric {
             split: split.or(primary.split),
             ..primary
@@ -220,7 +247,12 @@ fn runs(
             }
         }
     };
-    let (standing, _, mut runs) = metrics::standing(store, &project.id, &metric)?;
+    let members = match &brief {
+        Some(brief) => Some(scope::run_ids(store, brief)?),
+        None => None,
+    };
+    let (standing, _, mut runs) =
+        metrics::standing_among(store, &project.id, &metric, members.as_ref())?;
     // Scored runs best first, then the rest newest first.
     runs.sort_by(|a, b| match (a.score, b.score) {
         (Some(x), Some(y)) => metric
@@ -290,13 +322,13 @@ fn runs(
 fn primary(
     store: &Store,
     project_id: &str,
+    opt: Option<&str>,
     key: Option<String>,
     direction: Option<Direction>,
     noise_floor: Option<f64>,
     split: Option<String>,
 ) -> Result<()> {
     let project = crate::local::resolve::resolve_project(store, project_id)?;
-    let current = metrics::primary(store, &project.id)?;
     let Some(key) = key else {
         if direction.is_some() || noise_floor.is_some() || split.is_some() {
             return Err(anyhow!(
@@ -304,15 +336,23 @@ fn primary(
                 project.id
             ));
         }
-        match current {
-            Some(metric) => println!("Primary metric: {}", describe(&metric)),
+        let brief = scope::resolve(store, &project.id, opt, Resolve::Existing)?;
+        match metrics::primary(store, &brief.id)? {
+            Some(metric) => println!(
+                "Primary metric of optimization {}: {}",
+                brief.id,
+                describe(&metric)
+            ),
             None => println!(
-                "No primary metric yet. {}",
+                "Optimization {} has no primary metric yet. {}",
+                brief.id,
                 reported_keys(store, &project.id)?
             ),
         }
         return Ok(());
     };
+    let brief = scope::resolve(store, &project.id, opt, Resolve::OrCreate)?;
+    let current = metrics::primary(store, &brief.id)?;
     let Some(direction) = direction else {
         return Err(anyhow!(
             "Say which way is better: add `--maximize` or `--minimize`."
@@ -335,22 +375,23 @@ fn primary(
         noise_floor,
         split,
     };
-    metrics::set_primary(store, &project.id, &metric)?;
+    metrics::set_primary(store, &brief.id, &metric)?;
     println!(
-        "Primary metric for {} is now {}.",
-        project.id,
+        "Primary metric for optimization {} is now {}.",
+        brief.id,
         describe(&metric)
     );
     Ok(())
 }
 
-fn best(store: &Store, project_id: &str, json: bool) -> Result<()> {
+fn best(store: &Store, project_id: &str, opt: Option<&str>, json: bool) -> Result<()> {
     let project = crate::local::resolve::resolve_project(store, project_id)?;
-    let Some(metric) = metrics::primary(store, &project.id)? else {
-        return Err(no_primary(store, &project.id)?);
+    let brief = scope::resolve(store, &project.id, opt, Resolve::Existing)?;
+    let Some(metric) = metrics::primary(store, &brief.id)? else {
+        return Err(no_primary(store, &brief)?);
     };
-    let (standing, path, runs) = metrics::standing(store, &project.id, &metric)?;
-    let trials = super::ideas::trials(store, &project.id, &runs)?;
+    let (standing, path, runs) = metrics::standing(store, &brief, &metric)?;
+    let trials = super::ideas::trials(store, &brief.id, &runs)?;
     if json {
         println!(
             "{}",

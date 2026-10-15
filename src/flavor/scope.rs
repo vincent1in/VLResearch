@@ -1,22 +1,28 @@
-//! The scoping gate. Before compute is spent on improvement work, a brief is
-//! agreed with the user: the objective and primary metric, what may and must
-//! not change, a budget, a stop rule, and at least one idea to start from.
-//! Once a project has a brief, launches are refused until it is confirmed,
-//! while an open blocker idea stands, when the snapshot about to run changes a
-//! locked file, or once the budget is spent. Projects without a brief launch
-//! as upstream does, with a reminder, unless `VLR_SCOPE_GATE=strict`; but the
-//! improvement loop itself (`orx idea next`, `orx idea start`) waits for a
-//! confirmed brief either way. Probe runs (`VLR_PROBE=1`: smoke tests, baseline
-//! reproductions, noise-floor seeds) pass the gate and never count as a best
-//! result.
+//! Optimizations and their scoping gate. Each auto-research chat runs its own
+//! optimization: a brief agreed with the user (the objective and its primary
+//! metric, what may and must not change, the paths the work is confined to, a
+//! budget, a stop rule) with its own queue of ideas. A project can run several
+//! at once, on the whole system or on parts of it.
+//!
+//! A run belongs to the optimization of the idea that tests its experiment,
+//! else of the chat that created the experiment, else of the chat that
+//! launched it. Such runs are refused until the brief is confirmed, while one
+//! of its blocker ideas is open, when the snapshot about to run changes a
+//! locked file or a path outside the brief's scope, or once its budget is
+//! spent. Runs outside any optimization launch as upstream does, with a
+//! reminder, unless `VLR_SCOPE_GATE=strict`; but the improvement loop itself
+//! (`orx idea next`, `orx idea start`) waits for a confirmed brief either way.
+//! Probe runs (`VLR_PROBE=1`: smoke tests, baseline reproductions, noise-floor
+//! seeds) pass the gate and never count as a best result.
 //!
 //! Inside a chat, `orx exp run` is forwarded to the `orx up` server, whose
 //! environment is not the agent's. So the launching command records a probe
 //! request in the store (`before_launch`), and the server's check consumes it.
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 use super::ideas;
@@ -24,19 +30,21 @@ use crate::error::{anyhow, Result};
 use crate::local::model::{LocalExperiment, LocalProject};
 use crate::store::Store;
 
-/// `strict` also refuses projects without a brief; `0` turns the gate off.
+/// `strict` also refuses runs outside any optimization; `0` turns the gate off.
 pub(crate) const GATE_ENV: &str = "VLR_SCOPE_GATE";
 /// Set to `1` on a launch to mark it a probe.
 pub(crate) const PROBE_ENV: &str = "VLR_PROBE";
 /// How long a probe request waits for the launch it was made for.
 const PROBE_REQUEST_TTL_MS: i64 = 120_000;
+/// Marks the one-time move of project-wide briefs into optimizations.
+const MIGRATED_KEY: &str = "optimizations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateMode {
     Off,
-    /// Enforce briefs where a project has one.
+    /// Enforce briefs on the runs of optimizations.
     Scoped,
-    /// Require a confirmed brief everywhere.
+    /// Require a confirmed brief for every run.
     Strict,
 }
 
@@ -53,19 +61,25 @@ fn gate_mode() -> GateMode {
     }
 }
 
-/// What the user and the agent agreed the work is.
+/// One optimization: what the user and the agent agreed to improve, how it is
+/// measured (its primary metric, kept by `metrics`), its limits, and the chat
+/// that runs it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Brief {
+    /// The optimization's id (`opt_…`).
+    pub id: String,
     pub project_id: String,
-    /// The goal in words; the number that measures it is the project's
-    /// primary metric.
+    /// The goal in words; the number that measures it is the primary metric.
     pub objective: Option<String>,
     pub may_change: Option<String>,
     pub must_not_change: Option<String>,
     /// Repository paths (evaluation code, split definitions) that no run may
     /// change, pinned to their git object at confirmation.
     pub locked: Vec<LockedPath>,
+    /// When set, the only repository paths runs may change: the part of the
+    /// system this optimization works on.
+    pub scope: Vec<String>,
     pub budget_runs: Option<i64>,
     pub budget_gpu_hours: Option<f64>,
     pub budget_days: Option<f64>,
@@ -77,9 +91,13 @@ pub(crate) struct Brief {
     /// When the budget started counting: the first confirmation, kept across
     /// later edits and confirmations until the user asks for a fresh budget.
     pub budget_since: Option<i64>,
+    /// The baseline branch's commit at confirmation; the scope check measures
+    /// a run's changes from it.
+    pub base_commit: Option<String>,
+    pub created_at: i64,
     pub updated_at: i64,
-    /// The chat the user started this research in from the dashboard, which
-    /// is told when they confirm the brief there.
+    /// The chat that runs this optimization, told when the user confirms the
+    /// brief in the dashboard.
     pub chat_session_id: Option<String>,
 }
 
@@ -100,6 +118,9 @@ pub(crate) struct BriefFields {
     pub must_not_change: Option<String>,
     pub lock: Vec<String>,
     pub unlock: Vec<String>,
+    /// Paths to add to the scope, and to take out of it.
+    pub scope: Vec<String>,
+    pub unscope: Vec<String>,
     pub budget_runs: Option<i64>,
     pub budget_gpu_hours: Option<f64>,
     pub budget_days: Option<f64>,
@@ -112,14 +133,17 @@ pub(crate) struct BriefFields {
     pub stop_rule: Option<String>,
 }
 
-fn ensure_tables(conn: &Connection) -> Result<()> {
+pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS vlr_briefs (
-             project_id       TEXT PRIMARY KEY,
+        "CREATE TABLE IF NOT EXISTS vlr_optimizations (
+             id               TEXT PRIMARY KEY,
+             project_id       TEXT NOT NULL,
+             chat_session_id  TEXT,
              objective        TEXT,
              may_change       TEXT,
              must_not_change  TEXT,
              locked_json      TEXT NOT NULL DEFAULT '[]',
+             scope_json       TEXT NOT NULL DEFAULT '[]',
              budget_runs      INTEGER,
              budget_gpu_hours REAL,
              budget_days      REAL,
@@ -128,68 +152,343 @@ fn ensure_tables(conn: &Connection) -> Result<()> {
              stop_rule        TEXT,
              confirmed_at     INTEGER,
              confirmed_by     TEXT,
-             updated_at       INTEGER NOT NULL,
-             budget_since     INTEGER
+             budget_since     INTEGER,
+             base_commit      TEXT,
+             metric_key       TEXT,
+             metric_direction TEXT,
+             noise_floor      REAL,
+             metric_split     TEXT,
+             created_at       INTEGER NOT NULL,
+             updated_at       INTEGER NOT NULL
          );
+         CREATE INDEX IF NOT EXISTS idx_vlr_optimizations_project
+             ON vlr_optimizations(project_id, updated_at);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_vlr_optimizations_chat
+             ON vlr_optimizations(chat_session_id) WHERE chat_session_id IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS vlr_optimization_runs (
+             run_id          TEXT PRIMARY KEY,
+             optimization_id TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_vlr_optimization_runs
+             ON vlr_optimization_runs(optimization_id);
          CREATE TABLE IF NOT EXISTS vlr_probe_runs (
              run_id TEXT PRIMARY KEY
          );
          CREATE TABLE IF NOT EXISTS vlr_probe_requests (
              experiment_id TEXT PRIMARY KEY,
              requested_at  INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS vlr_flavor_meta (
+             key   TEXT PRIMARY KEY,
+             value TEXT
          );",
     )?;
-    // Briefs written before the budget clock existed.
-    let has_budget_since = conn
-        .prepare("SELECT 1 FROM pragma_table_info('vlr_briefs') WHERE name = 'budget_since'")?
+    migrate(conn)
+}
+
+/// Moves the project-wide briefs of earlier versions, with their metric,
+/// ideas, findings and runs, into one optimization per project. Runs once.
+fn migrate(conn: &Connection) -> Result<()> {
+    let done = |conn: &Connection| -> Result<bool> {
+        Ok(conn
+            .prepare("SELECT 1 FROM vlr_flavor_meta WHERE key = ?1")?
+            .exists([MIGRATED_KEY])?)
+    };
+    if done(conn)? {
+        return Ok(());
+    }
+    ideas::create_tables(conn)?;
+    super::findings::create_tables(conn)?;
+    super::metrics::ensure_tables(conn)?;
+    let legacy_briefs = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vlr_briefs'")?
         .exists([])?;
-    if !has_budget_since {
-        conn.execute_batch(
-            "ALTER TABLE vlr_briefs ADD COLUMN budget_since INTEGER;
-             UPDATE vlr_briefs SET budget_since = confirmed_at;",
+    if legacy_briefs {
+        super::metrics::add_column(conn, "vlr_briefs", "budget_since", "INTEGER")?;
+        super::metrics::add_column(conn, "vlr_briefs", "chat_session_id", "TEXT")?;
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // Another process may have moved them while this one waited for the lock.
+    if done(&tx)? {
+        return Ok(());
+    }
+    let mut sources = vec![
+        "SELECT project_id FROM vlr_project_metric",
+        "SELECT project_id FROM vlr_ideas WHERE optimization_id IS NULL",
+    ];
+    if legacy_briefs {
+        sources.push("SELECT project_id FROM vlr_briefs");
+    }
+    let projects: Vec<String> = tx
+        .prepare(&sources.join(" UNION "))?
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    let now = crate::store::now_ms();
+    for project_id in projects {
+        let id = new_id();
+        tx.execute(
+            "INSERT INTO vlr_optimizations (id, project_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![id, project_id, now],
+        )?;
+        if legacy_briefs {
+            tx.execute(
+                "UPDATE vlr_optimizations SET (objective, may_change, must_not_change,
+                     locked_json, budget_runs, budget_gpu_hours, budget_days, pointers, sources,
+                     stop_rule, confirmed_at, confirmed_by, budget_since, chat_session_id,
+                     created_at, updated_at) =
+                 (SELECT objective, may_change, must_not_change, locked_json, budget_runs,
+                     budget_gpu_hours, budget_days, pointers, sources, stop_rule, confirmed_at,
+                     confirmed_by, budget_since, chat_session_id, updated_at, updated_at
+                  FROM vlr_briefs WHERE project_id = ?2)
+                 WHERE id = ?1 AND EXISTS (SELECT 1 FROM vlr_briefs WHERE project_id = ?2)",
+                params![id, project_id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE vlr_optimizations SET (metric_key, metric_direction, noise_floor, metric_split) =
+                 (SELECT key, direction, noise_floor, split FROM vlr_project_metric
+                  WHERE project_id = ?2)
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM vlr_project_metric WHERE project_id = ?2)",
+            params![id, project_id],
+        )?;
+        tx.execute(
+            "UPDATE vlr_ideas SET optimization_id = ?1
+             WHERE project_id = ?2 AND optimization_id IS NULL",
+            params![id, project_id],
+        )?;
+        tx.execute(
+            "UPDATE vlr_findings SET optimization_id = ?1
+             WHERE project_id = ?2 AND optimization_id IS NULL",
+            params![id, project_id],
+        )?;
+        // A project-wide brief held every run in the project.
+        tx.execute(
+            "INSERT OR IGNORE INTO vlr_optimization_runs (run_id, optimization_id)
+             SELECT id, ?1 FROM runs WHERE project_id = ?2",
+            params![id, project_id],
         )?;
     }
-    super::metrics::add_column(conn, "vlr_briefs", "chat_session_id", "TEXT")?;
+    tx.execute(
+        "INSERT INTO vlr_flavor_meta (key, value) VALUES (?1, ?2)",
+        params![MIGRATED_KEY, now.to_string()],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
-pub(crate) fn get(store: &Store, project_id: &str) -> Result<Option<Brief>> {
-    let conn = store.flavor_conn();
-    ensure_tables(conn)?;
-    let brief = conn
-        .query_row(
-            "SELECT project_id, objective, may_change, must_not_change, locked_json, budget_runs,
-                    budget_gpu_hours, budget_days, pointers, sources, stop_rule, confirmed_at,
-                    confirmed_by, updated_at, budget_since, chat_session_id
-             FROM vlr_briefs WHERE project_id = ?1",
-            [project_id],
-            |row| {
-                let locked: String = row.get(4)?;
-                Ok(Brief {
-                    project_id: row.get(0)?,
-                    objective: row.get(1)?,
-                    may_change: row.get(2)?,
-                    must_not_change: row.get(3)?,
-                    locked: serde_json::from_str(&locked).unwrap_or_default(),
-                    budget_runs: row.get(5)?,
-                    budget_gpu_hours: row.get(6)?,
-                    budget_days: row.get(7)?,
-                    pointers: row.get(8)?,
-                    sources: row.get(9)?,
-                    stop_rule: row.get(10)?,
-                    confirmed_at: row.get(11)?,
-                    confirmed_by: row.get(12)?,
-                    updated_at: row.get(13)?,
-                    budget_since: row.get(14)?,
-                    chat_session_id: row.get(15)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(brief)
+fn new_id() -> String {
+    format!("opt_{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
 
-/// Normalizes a repository-relative path for locking.
+const COLUMNS: &str = "id, project_id, objective, may_change, must_not_change, locked_json,
+    scope_json, budget_runs, budget_gpu_hours, budget_days, pointers, sources, stop_rule,
+    confirmed_at, confirmed_by, budget_since, base_commit, created_at, updated_at,
+    chat_session_id";
+
+fn from_row(row: &Row) -> rusqlite::Result<Brief> {
+    let locked: String = row.get(5)?;
+    let scope: String = row.get(6)?;
+    Ok(Brief {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        objective: row.get(2)?,
+        may_change: row.get(3)?,
+        must_not_change: row.get(4)?,
+        locked: serde_json::from_str(&locked).unwrap_or_default(),
+        scope: serde_json::from_str(&scope).unwrap_or_default(),
+        budget_runs: row.get(7)?,
+        budget_gpu_hours: row.get(8)?,
+        budget_days: row.get(9)?,
+        pointers: row.get(10)?,
+        sources: row.get(11)?,
+        stop_rule: row.get(12)?,
+        confirmed_at: row.get(13)?,
+        confirmed_by: row.get(14)?,
+        budget_since: row.get(15)?,
+        base_commit: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        chat_session_id: row.get(19)?,
+    })
+}
+
+/// One optimization by id.
+pub(crate) fn get(store: &Store, id: &str) -> Result<Option<Brief>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {COLUMNS} FROM vlr_optimizations WHERE id = ?1"),
+            [id.trim()],
+            from_row,
+        )
+        .optional()?)
+}
+
+pub(crate) fn require(store: &Store, id: &str) -> Result<Brief> {
+    get(store, id)?.ok_or_else(|| {
+        anyhow!("Optimization {id} was not found. List them with `orx brief list <projectId>`.")
+    })
+}
+
+/// A project's optimizations, most recently changed first.
+pub(crate) fn list(store: &Store, project_id: &str) -> Result<Vec<Brief>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM vlr_optimizations WHERE project_id = ?1
+         ORDER BY updated_at DESC, id"
+    ))?;
+    let briefs = stmt
+        .query_map([project_id], from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(briefs)
+}
+
+/// The optimization a chat runs, if any.
+pub(crate) fn for_chat(store: &Store, session_id: &str) -> Result<Option<Brief>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {COLUMNS} FROM vlr_optimizations WHERE chat_session_id = ?1"),
+            [session_id],
+            from_row,
+        )
+        .optional()?)
+}
+
+/// A new, empty optimization, run by `chat` when given.
+pub(crate) fn create(store: &Store, project_id: &str, chat: Option<&str>) -> Result<Brief> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let id = new_id();
+    let now = crate::store::now_ms();
+    if let Some(chat) = chat {
+        unlink_chat(conn, chat)?;
+    }
+    conn.execute(
+        "INSERT INTO vlr_optimizations (id, project_id, chat_session_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![id, project_id, chat, now],
+    )?;
+    require(store, &id)
+}
+
+/// A chat runs one optimization at a time.
+fn unlink_chat(conn: &Connection, chat: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE vlr_optimizations SET chat_session_id = NULL WHERE chat_session_id = ?1",
+        [chat],
+    )?;
+    Ok(())
+}
+
+/// Hands the optimization to a chat, which stops running any other.
+pub(crate) fn set_chat(store: &Store, id: &str, session_id: &str) -> Result<Brief> {
+    let brief = require(store, id)?;
+    let conn = store.flavor_conn();
+    unlink_chat(conn, session_id)?;
+    conn.execute(
+        "UPDATE vlr_optimizations SET chat_session_id = ?2 WHERE id = ?1",
+        params![brief.id, session_id],
+    )?;
+    require(store, &brief.id)
+}
+
+/// The chat a side chat branched from (or the chat itself): a side chat asks
+/// about its parent's optimization.
+pub(crate) fn top_level_chat(store: &Store, session_id: &str) -> String {
+    let mut current = session_id.to_owned();
+    // Side chats don't nest deeply; the bound only guards against a cycle.
+    for _ in 0..8 {
+        match store.get_chat_session(&current) {
+            Ok(Some(session)) => match session.side_parent_session_id {
+                Some(parent) => current = parent,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    current
+}
+
+/// The chat this `orx` command runs in, as its top-level chat.
+pub(crate) fn current_chat(store: &Store) -> Option<String> {
+    if !crate::local::chat::in_local_session() {
+        return None;
+    }
+    let session = crate::local::chat::launching_chat_session()?;
+    Some(top_level_chat(store, &session))
+}
+
+/// Which optimization a command means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolve {
+    /// One that exists.
+    Existing,
+    /// Start one when the chat runs none (or, outside a chat, when the
+    /// project has none): commands that fill in a brief, a metric or ideas.
+    OrCreate,
+}
+
+/// The optimization a command acts on: the one named with `--opt`; else the
+/// one this chat runs; else the project's only one.
+pub(crate) fn resolve(
+    store: &Store,
+    project_id: &str,
+    explicit: Option<&str>,
+    want: Resolve,
+) -> Result<Brief> {
+    if let Some(id) = explicit {
+        let brief = require(store, id)?;
+        if brief.project_id != project_id {
+            return Err(anyhow!(
+                "Optimization {} belongs to project {}, not {project_id}.",
+                brief.id,
+                brief.project_id
+            ));
+        }
+        return Ok(brief);
+    }
+    if let Some(chat) = current_chat(store) {
+        match for_chat(store, &chat)? {
+            Some(brief) if brief.project_id == project_id => return Ok(brief),
+            // A chat runs one optimization; another project's leaves it be.
+            Some(_) => {}
+            None if want == Resolve::OrCreate => {
+                return create(store, project_id, Some(&chat));
+            }
+            None => {}
+        }
+    }
+    let mut all = list(store, project_id)?;
+    match all.len() {
+        0 if want == Resolve::OrCreate => create(store, project_id, None),
+        0 => Err(anyhow!(
+            "Project {project_id} has no optimization yet. Scope one with the user \
+             (`orx skill grill`), or start one from the dashboard."
+        )),
+        1 => Ok(all.remove(0)),
+        _ => Err(anyhow!(
+            "Project {project_id} runs several optimizations, and this command doesn't say \
+             which: {}. Pass `--opt <optId>`, or run it from the chat that runs the one you \
+             mean.",
+            all.iter().map(label).collect::<Vec<_>>().join("; ")
+        )),
+    }
+}
+
+/// An optimization as a one-line reference: its id and objective.
+pub(crate) fn label(brief: &Brief) -> String {
+    match &brief.objective {
+        Some(objective) => format!("{} ({objective})", brief.id),
+        None => brief.id.clone(),
+    }
+}
+
+/// Normalizes a repository-relative path for locking or scoping.
 fn clean_path(path: &str) -> Result<String> {
     let trimmed = path
         .trim()
@@ -205,7 +504,7 @@ fn clean_path(path: &str) -> Result<String> {
             .any(|part| part == ".." || part.is_empty())
     {
         return Err(anyhow!(
-            "Lock files or folders by their path from the repository root, without `..`: {path:?}"
+            "Name files or folders by their path from the repository root, without `..`: {path:?}"
         ));
     }
     Ok(trimmed)
@@ -213,11 +512,8 @@ fn clean_path(path: &str) -> Result<String> {
 
 /// Applies changes to the brief. Any change reopens a confirmed brief, so the
 /// user agrees to the brief as it now stands.
-pub(crate) fn set(store: &Store, project_id: &str, fields: BriefFields) -> Result<Brief> {
-    let mut brief = get(store, project_id)?.unwrap_or(Brief {
-        project_id: project_id.to_owned(),
-        ..Brief::default()
-    });
+pub(crate) fn set(store: &Store, id: &str, fields: BriefFields) -> Result<Brief> {
+    let mut brief = require(store, id)?;
     let text = |value: Option<String>, current: Option<String>| match value
         .map(|value| value.trim().to_owned())
     {
@@ -270,6 +566,16 @@ pub(crate) fn set(store: &Store, project_id: &str, fields: BriefFields) -> Resul
             brief.locked.push(LockedPath { path, object: None });
         }
     }
+    for path in fields.unscope {
+        let path = clean_path(&path)?;
+        brief.scope.retain(|scoped| *scoped != path);
+    }
+    for path in fields.scope {
+        let path = clean_path(&path)?;
+        if !brief.scope.contains(&path) {
+            brief.scope.push(path);
+        }
+    }
     brief.confirmed_at = None;
     brief.confirmed_by = None;
     brief.updated_at = crate::store::now_ms();
@@ -281,24 +587,19 @@ fn save(store: &Store, brief: &Brief) -> Result<()> {
     let conn = store.flavor_conn();
     ensure_tables(conn)?;
     conn.execute(
-        "INSERT INTO vlr_briefs (project_id, objective, may_change, must_not_change, locked_json,
-             budget_runs, budget_gpu_hours, budget_days, pointers, sources, stop_rule,
-             confirmed_at, confirmed_by, updated_at, budget_since, chat_session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-         ON CONFLICT(project_id) DO UPDATE SET objective = excluded.objective,
-             may_change = excluded.may_change, must_not_change = excluded.must_not_change,
-             locked_json = excluded.locked_json, budget_runs = excluded.budget_runs,
-             budget_gpu_hours = excluded.budget_gpu_hours, budget_days = excluded.budget_days,
-             pointers = excluded.pointers, sources = excluded.sources,
-             stop_rule = excluded.stop_rule, confirmed_at = excluded.confirmed_at,
-             confirmed_by = excluded.confirmed_by, updated_at = excluded.updated_at,
-             budget_since = excluded.budget_since, chat_session_id = excluded.chat_session_id",
+        "UPDATE vlr_optimizations SET objective = ?2, may_change = ?3, must_not_change = ?4,
+             locked_json = ?5, scope_json = ?6, budget_runs = ?7, budget_gpu_hours = ?8,
+             budget_days = ?9, pointers = ?10, sources = ?11, stop_rule = ?12,
+             confirmed_at = ?13, confirmed_by = ?14, budget_since = ?15, base_commit = ?16,
+             updated_at = ?17
+         WHERE id = ?1",
         params![
-            brief.project_id,
+            brief.id,
             brief.objective,
             brief.may_change,
             brief.must_not_change,
             serde_json::to_string(&brief.locked)?,
+            serde_json::to_string(&brief.scope)?,
             brief.budget_runs,
             brief.budget_gpu_hours,
             brief.budget_days,
@@ -307,55 +608,38 @@ fn save(store: &Store, brief: &Brief) -> Result<()> {
             brief.stop_rule,
             brief.confirmed_at,
             brief.confirmed_by,
-            brief.updated_at,
             brief.budget_since,
-            brief.chat_session_id,
+            brief.base_commit,
+            brief.updated_at,
         ],
     )?;
     Ok(())
-}
-
-/// Links the brief to the chat the user started the research in.
-pub(crate) fn set_chat(store: &Store, project_id: &str, session_id: &str) -> Result<Brief> {
-    let mut brief =
-        get(store, project_id)?.ok_or_else(|| anyhow!("Project {project_id} has no brief yet."))?;
-    brief.chat_session_id = Some(session_id.to_owned());
-    save(store, &brief)?;
-    Ok(brief)
 }
 
 /// The improvement loop's entry points (`orx idea next`, `orx idea start`)
 /// wait for a confirmed brief: what to improve and how it is measured, its
 /// limits, a budget, a stop rule and ideas to start from, agreed with the
 /// user. Even where launches are allowed without one. Off with the gate.
-pub(crate) fn require_confirmed(store: &Store, project_id: &str) -> Result<()> {
-    if gate_mode() == GateMode::Off {
+pub(crate) fn require_confirmed(store: &Store, brief: &Brief) -> Result<()> {
+    if gate_mode() == GateMode::Off || brief.confirmed_at.is_some() {
         return Ok(());
     }
-    match get(store, project_id)? {
-        Some(brief) if brief.confirmed_at.is_some() => Ok(()),
-        Some(brief) => {
-            let missing = missing(store, &brief)?;
-            let next_step = if missing.is_empty() {
-                format!(
-                    "Show it to the user; they confirm it in the Research view, or once they \
-                     agree, run `orx brief confirm {project_id}`."
-                )
-            } else {
-                format!("It still needs {}.", missing.join("; "))
-            };
-            Err(anyhow!(
-                "The improvement loop starts from a confirmed brief, and project {project_id}'s \
-                 isn't confirmed yet. {next_step}"
-            ))
-        }
-        None => Err(anyhow!(
-            "The improvement loop starts from a confirmed brief: what to improve and how it is \
-             measured, what may and must not change, a budget, a stop rule and ideas to start \
-             from. Project {project_id} has none yet. Scope it with the user first (`orx skill \
-             grill`), or ask them to start it from the Research view in the Experiments tab."
-        )),
-    }
+    let missing = missing(store, brief)?;
+    let next_step = if missing.is_empty() {
+        format!(
+            "Show it to the user; they confirm it in the Research view, or once they agree, run \
+             `orx brief confirm {} --opt {}`.",
+            brief.project_id, brief.id
+        )
+    } else {
+        format!("It still needs {}.", missing.join("; "))
+    };
+    Err(anyhow!(
+        "The improvement loop starts from a confirmed brief: what to improve and how it is \
+         measured, what may and must not change, a budget, a stop rule and ideas to start from. \
+         Optimization {} isn't confirmed yet. {next_step}",
+        brief.id
+    ))
 }
 
 /// What a brief still lacks before it can be confirmed.
@@ -364,7 +648,7 @@ pub(crate) fn missing(store: &Store, brief: &Brief) -> Result<Vec<&'static str>>
     if brief.objective.is_none() {
         missing.push("an objective (--objective)");
     }
-    if super::metrics::primary(store, &brief.project_id)?.is_none() {
+    if super::metrics::primary(store, &brief.id)?.is_none() {
         missing
             .push("a primary metric (orx metric primary <projectId> <key> --maximize|--minimize)");
     }
@@ -382,12 +666,9 @@ pub(crate) fn missing(store: &Store, brief: &Brief) -> Result<Vec<&'static str>>
     }
     // The loop needs somewhere to start: the user's pointers and the
     // interview's proposals, queued as ideas.
-    let queued = ideas::list(store, &brief.project_id)?
-        .into_iter()
-        .any(|idea| {
-            matches!(idea.status, ideas::Status::Open | ideas::Status::Running)
-                && !idea.is_blocker()
-        });
+    let queued = ideas::list(store, &brief.id)?.into_iter().any(|idea| {
+        matches!(idea.status, ideas::Status::Open | ideas::Status::Running) && !idea.is_blocker()
+    });
     if !queued {
         missing.push("at least one idea to start from (orx idea add)");
     }
@@ -411,17 +692,60 @@ fn object_at(repo: &Path, revision: &str, path: &str) -> Result<Option<String>> 
     Ok((!object.is_empty()).then_some(object))
 }
 
-/// Confirms the brief as it stands: every required field is present, and each
-/// locked path is pinned to its object on the project's baseline branch. The
-/// budget starts counting at the first confirmation.
-pub(crate) fn confirm(store: &Store, project: &LocalProject, by: &str) -> Result<Brief> {
-    let mut brief = get(store, &project.id)?.ok_or_else(|| {
-        anyhow!(
-            "Project {} has no brief yet. Fill it with `orx brief set {} ...` first.",
-            project.id,
-            project.id
-        )
-    })?;
+/// The commit a revision names, or `None`.
+fn commit_at(repo: &Path, revision: &str) -> Result<Option<String>> {
+    let output = crate::local::git::git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{revision}^{{commit}}"))
+        .output()
+        .map_err(|error| anyhow!("Could not run git to read {revision}: {error}"))?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((output.status.success() && !commit.is_empty()).then_some(commit))
+}
+
+/// Files a revision changes since it branched from `base`.
+fn changed_paths(repo: &Path, base: &str, revision: &str) -> Result<Vec<String>> {
+    let output = crate::local::git::git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--name-only", "--no-renames"])
+        .arg(format!("{base}...{revision}"))
+        .output()
+        .map_err(|error| anyhow!("Could not run git to compare {revision} with {base}: {error}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Could not compare {revision} with {base}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn within(path: &str, scope: &[String]) -> bool {
+    scope
+        .iter()
+        .any(|allowed| path == allowed || path.starts_with(&format!("{allowed}/")))
+}
+
+/// Confirms the brief as it stands: every required field is present, each
+/// locked path is pinned to its object on the project's baseline branch, and
+/// the scope check's starting commit is that branch's. The budget starts
+/// counting at the first confirmation.
+pub(crate) fn confirm(store: &Store, project: &LocalProject, id: &str, by: &str) -> Result<Brief> {
+    let mut brief = require(store, id)?;
+    if brief.project_id != project.id {
+        return Err(anyhow!(
+            "Optimization {} belongs to project {}.",
+            brief.id,
+            brief.project_id
+        ));
+    }
     let missing = missing(store, &brief)?;
     if !missing.is_empty() {
         return Err(anyhow!("The brief still needs {}.", missing.join("; ")));
@@ -437,16 +761,25 @@ pub(crate) fn confirm(store: &Store, project: &LocalProject, by: &str) -> Result
             )
         })?);
     }
+    if !brief.scope.is_empty() {
+        brief.base_commit = Some(commit_at(repo, &baseline)?.ok_or_else(|| {
+            anyhow!(
+                "The baseline branch {} has no commit to measure the scope from.",
+                project.baseline_branch
+            )
+        })?);
+    }
     let now = crate::store::now_ms();
     brief.confirmed_at = Some(now);
     brief.confirmed_by = Some(by.to_owned());
     brief.budget_since.get_or_insert(now);
+    brief.updated_at = now;
     save(store, &brief)?;
     Ok(brief)
 }
 
-/// What the brief's budget has used so far: non-probe runs launched since the
-/// budget started, and their wall-clock hours.
+/// What the brief's budget has used so far: the optimization's non-probe runs
+/// launched since the budget started, and their wall-clock hours.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Usage {
@@ -463,10 +796,11 @@ pub(crate) fn usage(store: &Store, brief: &Brief) -> Result<Usage> {
     ensure_tables(conn)?;
     let now = crate::store::now_ms();
     let (runs, millis): (i64, Option<i64>) = conn.query_row(
-        "SELECT COUNT(*), SUM(COALESCE(ended_at, ?3) - created_at) FROM runs
-         WHERE project_id = ?1 AND created_at >= ?2
-           AND id NOT IN (SELECT run_id FROM vlr_probe_runs)",
-        params![brief.project_id, since, now],
+        "SELECT COUNT(*), SUM(COALESCE(r.ended_at, ?3) - r.created_at) FROM runs r
+         JOIN vlr_optimization_runs o ON o.run_id = r.id
+         WHERE o.optimization_id = ?1 AND r.created_at >= ?2
+           AND r.id NOT IN (SELECT run_id FROM vlr_probe_runs)",
+        params![brief.id, since, now],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(Usage {
@@ -474,6 +808,50 @@ pub(crate) fn usage(store: &Store, brief: &Brief) -> Result<Usage> {
         run_hours: millis.unwrap_or(0).max(0) as f64 / 3_600_000.0,
         days: (now - since).max(0) as f64 / 86_400_000.0,
     })
+}
+
+/// The runs an optimization's results come from: those launched for it, and
+/// any run of an experiment one of its ideas tests.
+pub(crate) fn run_ids(store: &Store, brief: &Brief) -> Result<HashSet<String>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT run_id FROM vlr_optimization_runs WHERE optimization_id = ?1
+         UNION
+         SELECT r.id FROM runs r JOIN vlr_ideas i ON i.experiment_id = r.experiment_id
+         WHERE i.optimization_id = ?1",
+    )?;
+    let ids = stmt
+        .query_map([&brief.id], |row| row.get(0))?
+        .collect::<std::result::Result<HashSet<String>, _>>()?;
+    Ok(ids)
+}
+
+/// The optimization a run of `experiment` belongs to: that of the idea testing
+/// the experiment, else of the chat that created it, else of the chat
+/// launching the run.
+pub(crate) fn for_launch(
+    store: &Store,
+    experiment: &LocalExperiment,
+    launching_chat: Option<&str>,
+) -> Result<Option<Brief>> {
+    if let Some(id) = ideas::optimization_of_experiment(store, &experiment.id)? {
+        if let Some(brief) = get(store, &id)? {
+            return Ok(Some(brief));
+        }
+    }
+    for chat in [experiment.chat_session_id.as_deref(), launching_chat]
+        .into_iter()
+        .flatten()
+    {
+        let chat = top_level_chat(store, chat);
+        if let Some(brief) = for_chat(store, &chat)? {
+            if brief.project_id == experiment.project_id {
+                return Ok(Some(brief));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn is_probe(store: &Store, run_id: &str) -> Result<bool> {
@@ -511,7 +889,7 @@ impl Drop for LaunchRequest {
 
 /// Called by `orx exp run` before it launches, in the agent's (or user's)
 /// own process: records a probe request when `VLR_PROBE` is set, and reminds
-/// about the brief where the gate would only remind.
+/// about briefs where the gate would only remind.
 pub(crate) fn before_launch(experiment_id: &str) -> LaunchRequest {
     let mut request = LaunchRequest {
         experiment_id: None,
@@ -539,19 +917,16 @@ pub(crate) fn before_launch(experiment_id: &str) -> LaunchRequest {
     if gate_mode() != GateMode::Scoped {
         return request;
     }
-    let project = store
-        .get_local_experiment(experiment_id)
-        .ok()
-        .flatten()
-        .map(|experiment| experiment.project_id);
-    if let Some(project_id) = project {
-        if matches!(get(&store, &project_id), Ok(None)) {
-            eprintln!(
-                "Note: project {project_id} has no brief. For improvement work, agree one with \
-                 the user first (`orx skill grill`); orx then holds runs to its budget and locked \
-                 files."
-            );
-        }
+    let Ok(Some(experiment)) = store.get_local_experiment(experiment_id) else {
+        return request;
+    };
+    let chat = current_chat(&store);
+    if matches!(for_launch(&store, &experiment, chat.as_deref()), Ok(None)) {
+        eprintln!(
+            "Note: this run isn't part of an optimization, so no brief holds it. For improvement \
+             work, agree one with the user first (`orx skill grill`); orx then holds its runs to \
+             the budget, the locked files and the scope."
+        );
     }
     request
 }
@@ -569,12 +944,14 @@ fn take_probe_request(store: &Store, experiment_id: &str) -> Result<bool> {
 }
 
 /// What the gate decided about a launch.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Launch {
     /// A probe: allowed past the gate, recorded as one, never a result.
     pub probe: bool,
-    /// Whether the snapshot still has to pass the locked-path check.
-    check_locked: bool,
+    /// The optimization the run belongs to.
+    pub optimization_id: Option<String>,
+    /// Whether the snapshot still has to pass the locked-path and scope checks.
+    pub check_snapshot: bool,
 }
 
 /// Called in `compute::submit` before any compute is spent. `Err` refuses the
@@ -585,29 +962,32 @@ pub(crate) fn check_launch(
     project: &LocalProject,
     experiment: &LocalExperiment,
     forwarded: bool,
+    launching_chat: Option<&str>,
 ) -> Result<Launch> {
     let probe =
         take_probe_request(store, &experiment.id)? || (!forwarded && super::env_flag(PROBE_ENV));
+    let brief = for_launch(store, experiment, launching_chat)?;
+    let mut launch = Launch {
+        probe,
+        optimization_id: brief.as_ref().map(|brief| brief.id.clone()),
+        check_snapshot: false,
+    };
     let mode = gate_mode();
     if probe || mode == GateMode::Off {
-        return Ok(Launch {
-            probe,
-            check_locked: false,
-        });
+        return Ok(launch);
     }
     let probe_hint = format!(
         "A smoke test or baseline check can run as a probe, which never counts as a result: \
          `VLR_PROBE=1 orx exp run {}`.",
         experiment.id
     );
-    let brief = match get(store, &project.id)? {
-        None if mode == GateMode::Scoped => return Ok(Launch::default()),
+    let brief = match brief {
+        None if mode == GateMode::Scoped => return Ok(launch),
         None => {
             return Err(anyhow!(
-                "orx won't spend compute on project {} until its brief is agreed with the user. \
-                 Scope it first: `orx skill grill` walks through the interview, which ends with \
-                 `orx brief confirm {}`. {probe_hint}",
-                project.id,
+                "orx won't spend compute on this run until it belongs to an optimization whose \
+                 brief the user agreed. Scope one first: `orx skill grill` walks through the \
+                 interview, which ends with `orx brief confirm {}`. {probe_hint}",
                 project.id
             ))
         }
@@ -615,28 +995,23 @@ pub(crate) fn check_launch(
             let missing = missing(store, &brief)?;
             let next_step = if missing.is_empty() {
                 format!(
-                    "Show it to the user and, once they agree, run `orx brief confirm {}`.",
-                    project.id
+                    "Show it to the user and, once they agree, run `orx brief confirm {} --opt {}`.",
+                    project.id, brief.id
                 )
             } else {
                 format!("It still needs {}.", missing.join("; "))
             };
             return Err(anyhow!(
-                "Project {}'s brief is not confirmed, so orx won't spend compute on it yet. \
-                 {next_step} {probe_hint}",
-                project.id
+                "This run belongs to optimization {}, whose brief is not confirmed, so orx won't \
+                 spend compute on it yet. {next_step} {probe_hint}",
+                brief.id
             ));
         }
         Some(brief) => brief,
     };
-    let blockers: Vec<String> = ideas::list(store, &project.id)?
+    let blockers: Vec<String> = ideas::list(store, &brief.id)?
         .into_iter()
-        .filter(|idea| {
-            matches!(
-                idea.kind,
-                ideas::Kind::InfraBlocker | ideas::Kind::EvalBlocker | ideas::Kind::Halt
-            ) && !idea.status.is_closed()
-        })
+        .filter(|idea| idea.is_blocker() && !idea.status.is_closed())
         .map(|idea| format!("{} ({})", idea.title, idea.id))
         .collect();
     if !blockers.is_empty() {
@@ -661,24 +1036,29 @@ pub(crate) fn check_launch(
              ask the user whether to extend it."
         ));
     }
-    Ok(Launch {
-        probe: false,
-        check_locked: !brief.locked.is_empty(),
-    })
+    launch.check_snapshot = !brief.locked.is_empty() || !brief.scope.is_empty();
+    Ok(launch)
 }
 
-/// Called in `compute::submit` once the source snapshot is staged: the
-/// commit about to run must leave every locked path as the brief pinned it.
+/// Called in `compute::submit` once the source snapshot is staged: the commit
+/// about to run must leave every locked path as the brief pinned it, and
+/// change nothing outside the brief's scope.
 pub(crate) fn check_snapshot(
     store: &Store,
     project: &LocalProject,
     launch: &Launch,
     revision: &str,
 ) -> Result<()> {
-    if !launch.check_locked {
+    if !launch.check_snapshot {
         return Ok(());
     }
-    let Some(brief) = get(store, &project.id)? else {
+    let Some(brief) = launch
+        .optimization_id
+        .as_deref()
+        .map(|id| get(store, id))
+        .transpose()?
+        .flatten()
+    else {
         return Ok(());
     };
     let repo = Path::new(&project.repo_path);
@@ -695,34 +1075,66 @@ pub(crate) fn check_snapshot(
             ));
         }
     }
+    if let (false, Some(base)) = (brief.scope.is_empty(), &brief.base_commit) {
+        let outside: Vec<String> = changed_paths(repo, base, revision)?
+            .into_iter()
+            .filter(|path| !within(path, &brief.scope))
+            .collect();
+        if !outside.is_empty() {
+            let shown = outside
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = outside.len().saturating_sub(5);
+            return Err(anyhow!(
+                "This run's code changes {shown}{}, outside what this optimization works on ({}). \
+                 Keep the change inside those paths, or ask the user to widen the brief's scope.",
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                },
+                brief.scope.join(", ")
+            ));
+        }
+    }
     Ok(())
 }
 
-/// Bookkeeping once a launch is accepted: a probe run is recorded as one.
+/// Bookkeeping once a launch is accepted: the run joins its optimization, and
+/// a probe run is recorded as one.
 pub(crate) fn after_launch(store: &Store, run_id: &str, launch: &Launch) {
-    if !launch.probe {
-        return;
-    }
-    let recorded = ensure_tables(store.flavor_conn()).and_then(|()| {
-        store
-            .flavor_conn()
-            .execute(
+    let conn = store.flavor_conn();
+    let recorded = ensure_tables(conn).and_then(|()| {
+        if let Some(optimization_id) = &launch.optimization_id {
+            conn.execute(
+                "INSERT OR REPLACE INTO vlr_optimization_runs (run_id, optimization_id)
+                 VALUES (?1, ?2)",
+                params![run_id, optimization_id],
+            )?;
+        }
+        if launch.probe {
+            conn.execute(
                 "INSERT OR IGNORE INTO vlr_probe_runs (run_id) VALUES (?1)",
                 [run_id],
-            )
-            .map_err(Into::into)
+            )?;
+        }
+        Ok(())
     });
     if let Err(error) = recorded {
-        eprintln!("vlresearch: could not record run {run_id} as a probe: {error}");
+        eprintln!("vlresearch: could not record run {run_id}: {error}");
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::flavor::metrics::{self, Direction, PrimaryMetric};
+    use crate::store::StoredChatSession;
 
-    fn temp_store() -> (Store, std::path::PathBuf) {
+    pub(crate) fn temp_store() -> (Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vlr-scope-{}", uuid::Uuid::new_v4()));
         (Store::open_at(dir.clone()).unwrap(), dir)
     }
@@ -756,7 +1168,7 @@ mod tests {
         }
     }
 
-    fn experiment(id: &str) -> LocalExperiment {
+    pub(crate) fn experiment(id: &str, chat: Option<&str>) -> LocalExperiment {
         LocalExperiment {
             id: id.into(),
             project_id: "p".into(),
@@ -769,16 +1181,71 @@ mod tests {
             agent_status: "idle".into(),
             created_at: 1,
             updated_at: 1,
-            chat_session_id: None,
+            chat_session_id: chat.map(str::to_owned),
             archived: false,
         }
     }
 
+    pub(crate) fn chat(id: &str, side_parent: Option<&str>) -> StoredChatSession {
+        StoredChatSession {
+            id: id.into(),
+            project_id: "p".into(),
+            harness: "claude-code".into(),
+            native_session_id: None,
+            title: None,
+            title_source: None,
+            model: None,
+            service_tier: None,
+            permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: None,
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            goal: None,
+            autonomy: None,
+            active_leaf_id: None,
+            parent_session_id: None,
+            side_parent_session_id: side_parent.map(str::to_owned),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    /// An optimization with a chosen id in project `p`, holding every run the
+    /// project has when this is called, for tests that name it.
+    pub(crate) fn named(store: &Store, id: &str) -> Brief {
+        let conn = store.flavor_conn();
+        ensure_tables(conn).unwrap();
+        conn.execute(
+            "INSERT INTO vlr_optimizations (id, project_id, created_at, updated_at)
+             VALUES (?1, 'p', 1, 1)",
+            [id],
+        )
+        .unwrap();
+        adopt_runs(store, id);
+        get(store, id).unwrap().unwrap()
+    }
+
+    /// Makes every run in project `p` one of the optimization's, as runs
+    /// launched for it are.
+    pub(crate) fn adopt_runs(store: &Store, id: &str) {
+        store
+            .flavor_conn()
+            .execute(
+                "INSERT OR IGNORE INTO vlr_optimization_runs (run_id, optimization_id)
+                 SELECT id, ?1 FROM runs WHERE project_id = 'p'",
+                [id],
+            )
+            .unwrap();
+    }
+
     /// An idea to start the loop from.
-    fn seed(store: &Store) {
+    pub(crate) fn seed(store: &Store, brief: &Brief) {
         ideas::add(
             store,
-            "p",
+            &brief.id,
             ideas::IdeaFields {
                 title: Some("Volume features".into()),
                 ..ideas::IdeaFields::default()
@@ -787,12 +1254,12 @@ mod tests {
         .unwrap();
     }
 
-    fn primary(store: &Store) {
+    pub(crate) fn primary(store: &Store, brief: &Brief, key: &str) {
         metrics::set_primary(
             store,
-            "p",
+            &brief.id,
             &PrimaryMetric {
-                key: "val_ic".into(),
+                key: key.into(),
                 direction: Direction::Max,
                 noise_floor: None,
                 split: None,
@@ -801,9 +1268,25 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn launches_wait_for_a_confirmed_brief_and_the_snapshot_keeps_locked_paths() {
-        let (store, dir) = temp_store();
+    fn complete(store: &Store, brief: &Brief, scope: &[&str]) -> Brief {
+        primary(store, brief, "val_ic");
+        seed(store, brief);
+        set(
+            store,
+            &brief.id,
+            BriefFields {
+                objective: Some("Raise validation IC".into()),
+                must_not_change: Some("eval".into()),
+                scope: scope.iter().map(|path| (*path).to_owned()).collect(),
+                budget_runs: Some(5),
+                stop_rule: Some("No gain in 3 runs".into()),
+                ..BriefFields::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn repo_with_baseline(dir: &Path) -> std::path::PathBuf {
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join("eval")).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
@@ -811,20 +1294,37 @@ mod tests {
         std::fs::write(repo.join("eval/splits.yaml"), "valid: 2023\n").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "baseline"]);
+        repo
+    }
+
+    #[test]
+    fn launches_wait_for_a_confirmed_brief_and_the_snapshot_keeps_locked_paths() {
+        let (store, dir) = temp_store();
+        let repo = repo_with_baseline(&dir);
         let same = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["checkout", "-q", "-b", "orx/tampered"]);
         std::fs::write(repo.join("eval/splits.yaml"), "valid: 2022\n").unwrap();
         git(&repo, &["commit", "-q", "-am", "easier split"]);
         let tampered = git(&repo, &["rev-parse", "HEAD"]);
         let project = project(&repo);
-        let launch = |forwarded| check_launch(&store, &project, &experiment("e"), forwarded);
+        let launch = |forwarded| {
+            check_launch(
+                &store,
+                &project,
+                &experiment("e", Some("chat_loop")),
+                forwarded,
+                None,
+            )
+        };
 
-        // Without a brief, launches go ahead.
-        assert!(!launch(false).unwrap().probe);
+        // Outside any optimization, launches go ahead.
+        let free = launch(false).unwrap();
+        assert!(!free.probe && free.optimization_id.is_none());
 
+        let opt = create(&store, "p", Some("chat_loop")).unwrap();
         set(
             &store,
-            "p",
+            &opt.id,
             BriefFields {
                 objective: Some("Raise validation IC".into()),
                 // A whole folder can be locked.
@@ -840,12 +1340,12 @@ mod tests {
         assert!(refused.contains("a primary metric"), "{refused}");
         assert!(refused.contains("at least one idea"), "{refused}");
         assert!(refused.contains("VLR_PROBE=1 orx exp run e"), "{refused}");
-        assert!(confirm(&store, &project, "user").is_err());
-        primary(&store);
+        assert!(confirm(&store, &project, &opt.id, "user").is_err());
+        primary(&store, &opt, "val_ic");
         // A blocker isn't an idea to start from.
         ideas::add(
             &store,
-            "p",
+            &opt.id,
             ideas::IdeaFields {
                 title: Some("Check the label join".into()),
                 kind: Some(ideas::Kind::EvalBlocker),
@@ -855,15 +1355,18 @@ mod tests {
         .map(|blocker| ideas::close(&store, &blocker.id, ideas::Verdict::Dropped, None))
         .unwrap()
         .unwrap();
-        let still = confirm(&store, &project, "user").unwrap_err().to_string();
+        let still = confirm(&store, &project, &opt.id, "user")
+            .unwrap_err()
+            .to_string();
         assert!(still.contains("at least one idea"), "{still}");
-        seed(&store);
-        let confirmed = confirm(&store, &project, "user").unwrap();
+        seed(&store, &opt);
+        let confirmed = confirm(&store, &project, &opt.id, "user").unwrap();
         assert_eq!(confirmed.locked[0].path, "eval");
         assert!(confirmed.locked[0].object.is_some());
         assert!(confirmed.budget_since.is_some());
 
         let accepted = launch(false).unwrap();
+        assert_eq!(accepted.optimization_id.as_deref(), Some(opt.id.as_str()));
         check_snapshot(&store, &project, &accepted, &same).unwrap();
         let tampering = check_snapshot(&store, &project, &accepted, &tampered)
             .unwrap_err()
@@ -873,7 +1376,7 @@ mod tests {
         // An open blocker stops launches until it is closed.
         let blocker = ideas::add(
             &store,
-            "p",
+            &opt.id,
             ideas::IdeaFields {
                 title: Some("Validation overlaps training".into()),
                 kind: Some(ideas::Kind::EvalBlocker),
@@ -891,7 +1394,7 @@ mod tests {
         // Changing the brief reopens it.
         set(
             &store,
-            "p",
+            &opt.id,
             BriefFields {
                 pointers: Some("Start with volume".into()),
                 ..BriefFields::default()
@@ -905,9 +1408,10 @@ mod tests {
     #[test]
     fn a_probe_request_from_the_launching_command_reaches_a_forwarded_launch() {
         let (store, dir) = temp_store();
+        let opt = create(&store, "p", Some("chat_loop")).unwrap();
         set(
             &store,
-            "p",
+            &opt.id,
             BriefFields {
                 objective: Some("x".into()),
                 ..BriefFields::default()
@@ -915,8 +1419,9 @@ mod tests {
         )
         .unwrap();
         let project = project(&dir);
+        let e = experiment("e", Some("chat_loop"));
         // The brief is unconfirmed, so only a probe gets through.
-        assert!(check_launch(&store, &project, &experiment("e"), true).is_err());
+        assert!(check_launch(&store, &project, &e, true, None).is_err());
         store
             .flavor_conn()
             .execute(
@@ -924,12 +1429,12 @@ mod tests {
                 [crate::store::now_ms()],
             )
             .unwrap();
-        let launch = check_launch(&store, &project, &experiment("e"), true).unwrap();
+        let launch = check_launch(&store, &project, &e, true, None).unwrap();
         assert!(launch.probe);
         after_launch(&store, "run_probe", &launch);
         assert!(is_probe(&store, "run_probe").unwrap());
         // The request was used up, and a stale one doesn't count.
-        assert!(check_launch(&store, &project, &experiment("e"), true).is_err());
+        assert!(check_launch(&store, &project, &e, true, None).is_err());
         store
             .flavor_conn()
             .execute(
@@ -937,74 +1442,58 @@ mod tests {
                 [crate::store::now_ms() - 10 * PROBE_REQUEST_TTL_MS],
             )
             .unwrap();
-        assert!(check_launch(&store, &project, &experiment("e"), true).is_err());
+        assert!(check_launch(&store, &project, &e, true, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_budget_keeps_counting_across_reconfirmations() {
         let (store, dir) = temp_store();
-        let repo = dir.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let repo = repo_with_baseline(&dir);
         let project = project(&repo);
-        primary(&store);
-        seed(&store);
+        let opt = create(&store, "p", None).unwrap();
+        complete(&store, &opt, &[]);
+        let first = confirm(&store, &project, &opt.id, "user")
+            .unwrap()
+            .budget_since;
         set(
             &store,
-            "p",
-            BriefFields {
-                objective: Some("x".into()),
-                must_not_change: Some("eval".into()),
-                budget_runs: Some(1),
-                stop_rule: Some("y".into()),
-                ..BriefFields::default()
-            },
-        )
-        .unwrap();
-        let first = confirm(&store, &project, "user").unwrap().budget_since;
-        set(
-            &store,
-            "p",
+            &opt.id,
             BriefFields {
                 budget_runs: Some(2),
                 ..BriefFields::default()
             },
         )
         .unwrap();
-        let again = confirm(&store, &project, "user").unwrap();
+        let again = confirm(&store, &project, &opt.id, "user").unwrap();
         assert_eq!(again.budget_since, first);
         set(
             &store,
-            "p",
+            &opt.id,
             BriefFields {
                 reset_budget: true,
                 ..BriefFields::default()
             },
         )
         .unwrap();
-        assert!(get(&store, "p").unwrap().unwrap().budget_since.is_none());
+        assert!(get(&store, &opt.id)
+            .unwrap()
+            .unwrap()
+            .budget_since
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_loop_waits_for_a_confirmed_brief() {
         let (store, dir) = temp_store();
-        let repo = dir.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let repo = repo_with_baseline(&dir);
         let project = project(&repo);
-
-        let none = require_confirmed(&store, "p").unwrap_err().to_string();
-        assert!(none.contains("has none yet"), "{none}");
-        assert!(none.contains("Research view"), "{none}");
-
-        primary(&store);
+        let opt = create(&store, "p", None).unwrap();
+        primary(&store, &opt, "val_ic");
         set(
             &store,
-            "p",
+            &opt.id,
             BriefFields {
                 objective: Some("Raise validation IC".into()),
                 must_not_change: Some("eval".into()),
@@ -1014,19 +1503,24 @@ mod tests {
             },
         )
         .unwrap();
-        let unseeded = require_confirmed(&store, "p").unwrap_err().to_string();
+        let get_opt = || get(&store, &opt.id).unwrap().unwrap();
+        let unseeded = require_confirmed(&store, &get_opt())
+            .unwrap_err()
+            .to_string();
         assert!(unseeded.contains("at least one idea"), "{unseeded}");
-        seed(&store);
-        let unconfirmed = require_confirmed(&store, "p").unwrap_err().to_string();
-        assert!(unconfirmed.contains("confirm"), "{unconfirmed}");
-        confirm(&store, &project, "user").unwrap();
-        require_confirmed(&store, "p").unwrap();
+        seed(&store, &opt);
+        let unconfirmed = require_confirmed(&store, &get_opt())
+            .unwrap_err()
+            .to_string();
+        assert!(unconfirmed.contains("Research view"), "{unconfirmed}");
+        confirm(&store, &project, &opt.id, "user").unwrap();
+        require_confirmed(&store, &get_opt()).unwrap();
 
         // The dashboard links the chat it started, and the link survives edits.
-        set_chat(&store, "p", "chat_research").unwrap();
+        set_chat(&store, &opt.id, "chat_research").unwrap();
         let edited = set(
             &store,
-            "p",
+            &opt.id,
             BriefFields {
                 clear_budget: true,
                 budget_days: Some(7.0),
@@ -1037,12 +1531,212 @@ mod tests {
         assert_eq!(edited.chat_session_id.as_deref(), Some("chat_research"));
         assert_eq!((edited.budget_runs, edited.budget_days), (None, Some(7.0)));
         assert!(edited.confirmed_at.is_none());
-        assert!(set_chat(&store, "other", "chat_x").is_err());
+        assert!(set_chat(&store, "opt_missing", "chat_x").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn lock_paths_stay_inside_the_repository() {
+    fn each_chat_runs_its_own_optimization() {
+        let (store, dir) = temp_store();
+        // Outside a chat, with none yet, a reading command asks for one and a
+        // writing one starts one.
+        let none = resolve(&store, "p", None, Resolve::Existing)
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("no optimization yet"), "{none}");
+        let first = resolve(&store, "p", None, Resolve::OrCreate).unwrap();
+        assert_eq!(
+            resolve(&store, "p", None, Resolve::Existing).unwrap().id,
+            first.id
+        );
+
+        let speed = create(&store, "p", Some("chat_speed")).unwrap();
+        let several = resolve(&store, "p", None, Resolve::Existing)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            several.contains("several") && several.contains(&speed.id),
+            "{several}"
+        );
+        assert_eq!(
+            resolve(&store, "p", Some(&speed.id), Resolve::Existing)
+                .unwrap()
+                .id,
+            speed.id
+        );
+        assert!(resolve(&store, "q", Some(&speed.id), Resolve::Existing).is_err());
+
+        // A chat runs one optimization; handing it another takes the first back.
+        assert_eq!(
+            for_chat(&store, "chat_speed").unwrap().unwrap().id,
+            speed.id
+        );
+        set_chat(&store, &first.id, "chat_speed").unwrap();
+        assert_eq!(
+            for_chat(&store, "chat_speed").unwrap().unwrap().id,
+            first.id
+        );
+        assert!(get(&store, &speed.id)
+            .unwrap()
+            .unwrap()
+            .chat_session_id
+            .is_none());
+
+        // A side chat stands for the chat it branched from.
+        store
+            .create_chat_session(&chat("chat_speed", None))
+            .unwrap();
+        store
+            .create_chat_session(&chat("chat_side", Some("chat_speed")))
+            .unwrap();
+        assert_eq!(top_level_chat(&store, "chat_side"), "chat_speed");
+        assert_eq!(top_level_chat(&store, "chat_unknown"), "chat_unknown");
+
+        // Runs belong to the optimization of the idea testing their
+        // experiment, else of the chat that made it.
+        let idea = ideas::add(
+            &store,
+            &speed.id,
+            ideas::IdeaFields {
+                title: Some("Cache features".into()),
+                ..ideas::IdeaFields::default()
+            },
+        )
+        .unwrap();
+        store
+            .flavor_conn()
+            .execute(
+                "UPDATE vlr_ideas SET experiment_id = 'e_cache' WHERE id = ?1",
+                [&idea.id],
+            )
+            .unwrap();
+        let owned = |id: &str, chat: Option<&str>, launching: Option<&str>| {
+            for_launch(&store, &experiment(id, chat), launching)
+                .unwrap()
+                .map(|brief| brief.id)
+        };
+        assert_eq!(
+            owned("e_cache", Some("chat_speed"), None),
+            Some(speed.id.clone())
+        );
+        assert_eq!(
+            owned("e_any", Some("chat_side"), None),
+            Some(first.id.clone())
+        );
+        assert_eq!(
+            owned("e_any", None, Some("chat_speed")),
+            Some(first.id.clone())
+        );
+        assert_eq!(owned("e_any", Some("chat_other"), None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scoped_optimization_refuses_changes_outside_its_paths() {
+        let (store, dir) = temp_store();
+        let repo = repo_with_baseline(&dir);
+        std::fs::create_dir_all(repo.join("features")).unwrap();
+        std::fs::write(repo.join("features/volume.py"), "WINDOW = 10\n").unwrap();
+        std::fs::write(repo.join("model.py"), "DEPTH = 3\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "code"]);
+        let project = project(&repo);
+        let opt = create(&store, "p", Some("chat_features")).unwrap();
+        complete(&store, &opt, &["features/"]);
+        let confirmed = confirm(&store, &project, &opt.id, "user").unwrap();
+        assert_eq!(confirmed.scope, ["features"]);
+        assert!(confirmed.base_commit.is_some());
+
+        git(&repo, &["checkout", "-q", "-b", "orx/inside"]);
+        std::fs::write(repo.join("features/volume.py"), "WINDOW = 20\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "wider window"]);
+        let inside = git(&repo, &["rev-parse", "HEAD"]);
+        // A child of an accepted step, which also touches the model.
+        git(&repo, &["checkout", "-q", "-b", "orx/outside"]);
+        std::fs::write(repo.join("model.py"), "DEPTH = 4\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "deeper"]);
+        let outside = git(&repo, &["rev-parse", "HEAD"]);
+
+        let launch = check_launch(
+            &store,
+            &project,
+            &experiment("e", Some("chat_features")),
+            false,
+            None,
+        )
+        .unwrap();
+        check_snapshot(&store, &project, &launch, &inside).unwrap();
+        let refused = check_snapshot(&store, &project, &launch, &outside)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("model.py") && refused.contains("features"),
+            "{refused}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_wide_briefs_become_one_optimization_each() {
+        let dir = std::env::temp_dir().join(format!("vlr-migrate-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let conn = store.flavor_conn();
+        // The tables as earlier versions left them.
+        conn.execute_batch(
+            "CREATE TABLE vlr_briefs (
+                 project_id TEXT PRIMARY KEY, objective TEXT, may_change TEXT,
+                 must_not_change TEXT, locked_json TEXT NOT NULL DEFAULT '[]', budget_runs INTEGER,
+                 budget_gpu_hours REAL, budget_days REAL, pointers TEXT, sources TEXT,
+                 stop_rule TEXT, confirmed_at INTEGER, confirmed_by TEXT,
+                 updated_at INTEGER NOT NULL, budget_since INTEGER, chat_session_id TEXT);
+             INSERT INTO vlr_briefs (project_id, objective, budget_runs, confirmed_at,
+                 confirmed_by, updated_at, budget_since, chat_session_id)
+             VALUES ('p', 'Raise IC', 20, 5, 'user', 5, 5, 'chat_old');
+             CREATE TABLE vlr_project_metric (project_id TEXT PRIMARY KEY, key TEXT NOT NULL,
+                 direction TEXT NOT NULL, noise_floor REAL, updated_at INTEGER NOT NULL,
+                 split TEXT);
+             INSERT INTO vlr_project_metric VALUES ('p', 'val_ic', 'max', 0.002, 5, 'val');",
+        )
+        .unwrap();
+        ideas::create_tables(conn).unwrap();
+        conn.execute(
+            "INSERT INTO vlr_ideas (id, project_id, title, kind, priority, status, author,
+                 created_at, updated_at)
+             VALUES ('idea_old', 'p', 'Volume', 'science', 2, 'open', 'agent', 5, 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE vlr_ideas SET optimization_id = NULL WHERE id = 'idea_old'",
+            [],
+        )
+        .unwrap();
+
+        let migrated = list(&store, "p").unwrap();
+        assert_eq!(migrated.len(), 1);
+        let opt = &migrated[0];
+        assert_eq!(opt.objective.as_deref(), Some("Raise IC"));
+        assert_eq!(opt.budget_runs, Some(20));
+        assert_eq!(opt.confirmed_by.as_deref(), Some("user"));
+        assert_eq!(opt.chat_session_id.as_deref(), Some("chat_old"));
+        let metric = metrics::primary(&store, &opt.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                metric.key.as_str(),
+                metric.noise_floor,
+                metric.split.as_deref()
+            ),
+            ("val_ic", Some(0.002), Some("val"))
+        );
+        assert_eq!(ideas::list(&store, &opt.id).unwrap()[0].id, "idea_old");
+        // Once only.
+        conn.execute("DELETE FROM vlr_optimizations", []).unwrap();
+        assert!(list(&store, "p").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paths_stay_inside_the_repository() {
         for bad in [
             "",
             ".",
@@ -1055,5 +1749,9 @@ mod tests {
         }
         assert_eq!(clean_path(" ./eval\\score.py ").unwrap(), "eval/score.py");
         assert_eq!(clean_path("eval/").unwrap(), "eval");
+        let scope = ["features".to_owned()];
+        assert!(within("features/volume.py", &scope));
+        assert!(within("features", &scope));
+        assert!(!within("features_old/x.py", &scope));
     }
 }

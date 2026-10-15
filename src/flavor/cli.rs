@@ -12,8 +12,9 @@ pub(crate) enum FlavorCommand {
     /// Queue ideas to try, each with a forecast, a cost and a kill test, and
     /// record what each did.
     Idea(IdeaArgs),
-    /// The project's agreed brief: objective, limits, budget and stop rule.
-    /// Once a project has one, launches wait for it to be confirmed.
+    /// Optimizations and their briefs. Each chat runs its own: the objective,
+    /// limits, scope, budget and stop rule agreed with the user, which its
+    /// runs are held to once confirmed.
     Brief(BriefArgs),
     /// Record what the project has learned: claims, the runs that back or
     /// undercut them, how claims relate, and verdicts over time.
@@ -38,6 +39,10 @@ pub(crate) enum FindingCommand {
         /// The idea whose test produced or tests it.
         #[arg(long, value_name = "IDEA_ID")]
         idea: Option<String>,
+        /// The optimization whose work produced it. Defaults to the idea's,
+        /// or the one this chat runs.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
     },
     /// A project's findings, most recently changed first.
     List {
@@ -123,13 +128,33 @@ pub(crate) enum BriefCommand {
     /// Show the brief, what it still needs, and the budget used so far.
     Show {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
         /// Print JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Fill in or change the brief. Any change reopens a confirmed brief.
+    /// The project's optimizations: each one's objective, metric, chat and
+    /// state.
+    List {
+        project_id: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run an existing optimization in this chat (it stops running any other).
+    Use { opt_id: String },
+    /// Fill in or change the brief, starting an optimization for this chat
+    /// if it runs none. Any change reopens a confirmed brief.
     Set {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         /// The goal in words. The number that measures it is the primary
         /// metric (`orx metric primary`).
         #[arg(long)]
@@ -148,6 +173,14 @@ pub(crate) enum BriefCommand {
         /// Stop locking a file (repeatable).
         #[arg(long, value_name = "PATH")]
         unlock: Vec<String>,
+        /// Confine runs to a part of the system: once any path is in the
+        /// scope, a run may change only files inside it, checked at every
+        /// launch (repeatable).
+        #[arg(long, value_name = "PATH")]
+        scope: Vec<String>,
+        /// Take a path out of the scope (repeatable).
+        #[arg(long, value_name = "PATH")]
+        unscope: Vec<String>,
         /// How many runs (probes excluded) the brief allows.
         #[arg(long, value_name = "RUNS")]
         budget_runs: Option<i64>,
@@ -173,7 +206,13 @@ pub(crate) enum BriefCommand {
     },
     /// Confirm the brief once the user has agreed to it. Locked files are
     /// pinned to their content on the baseline branch.
-    Confirm { project_id: String },
+    Confirm {
+        project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+    },
 }
 
 impl FlavorCommand {
@@ -231,10 +270,15 @@ pub(crate) struct IdeaFieldArgs {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum IdeaCommand {
-    /// Add an idea to a project's queue.
+    /// Add an idea to an optimization's queue.
     Add {
         project_id: String,
         title: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         #[command(flatten)]
         fields: IdeaFieldArgs,
     },
@@ -246,9 +290,13 @@ pub(crate) enum IdeaCommand {
         #[command(flatten)]
         fields: IdeaFieldArgs,
     },
-    /// A project's open and running ideas; `--all` adds closed ones.
+    /// An optimization's open and running ideas; `--all` adds closed ones.
     List {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
         #[arg(long)]
         all: bool,
         /// Print JSON instead of a table.
@@ -265,6 +313,11 @@ pub(crate) enum IdeaCommand {
     /// The idea to work on next, and why.
     Next {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -303,6 +356,11 @@ pub(crate) enum IdeaCommand {
     /// How well tested ideas' forecasts held up.
     Calibration {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -324,9 +382,15 @@ pub(crate) enum MetricCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Rank a project's runs by a metric: its primary metric unless `--key`.
+    /// Rank an optimization's runs by its primary metric, or the project's
+    /// runs by `--key`.
     Runs {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         /// Rank by this key instead of the primary metric (say which way is
         /// better with `--maximize` or `--minimize`).
         #[arg(long)]
@@ -344,10 +408,15 @@ pub(crate) enum MetricCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show the project's primary metric, or set it: a key plus `--maximize`
-    /// or `--minimize`.
+    /// Show the optimization's primary metric, or set it: a key plus
+    /// `--maximize` or `--minimize`.
     Primary {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         /// The key to optimize, as printed in `ORX_METRIC` lines. Use a
         /// validation metric; keep test splits for final reports.
         key: Option<String>,
@@ -365,10 +434,15 @@ pub(crate) enum MetricCommand {
         #[arg(long)]
         split: Option<String>,
     },
-    /// The best finished run against the baseline, and the experiments on the
-    /// path between them with each one's change.
+    /// The optimization's best finished run against the baseline, and the
+    /// experiments on the path between them with each one's change.
     Best {
         project_id: String,
+        /// The optimization to act on. Defaults to the one this chat runs,
+        /// or the project's only one.
+        #[arg(long = "opt", value_name = "OPT_ID")]
+        opt: Option<String>,
+
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -404,7 +478,7 @@ pub(crate) fn is_readonly(tokens: &[&str]) -> bool {
                         | IdeaCommand::Next { .. }
                         | IdeaCommand::Calibration { .. },
                 }) | FlavorCommand::Brief(BriefArgs {
-                    command: BriefCommand::Show { .. },
+                    command: BriefCommand::Show { .. } | BriefCommand::List { .. },
                 }) | FlavorCommand::Finding(FindingArgs {
                     command: FindingCommand::List { .. } | FindingCommand::Show { .. },
                 })
@@ -451,6 +525,8 @@ mod tests {
             "orx idea next proj_1",
             "orx idea calibration proj_1 --json",
             "orx brief show proj_1",
+            "orx brief show proj_1 --opt opt_1",
+            "orx brief list proj_1",
             "orx finding list proj_1 --status supported",
             "orx finding show fnd_1 --json",
         ] {
@@ -466,6 +542,7 @@ mod tests {
             "orx idea start idea_1 exp_1",
             "orx brief confirm proj_1",
             "orx brief set proj_1 --objective x",
+            "orx brief use opt_1",
             "orx finding unlock fnd_1",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();

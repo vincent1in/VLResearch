@@ -8,13 +8,13 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **Chats hear back from their runs.** Every run a chat launches wakes that chat when it finishes, instead of only when the agent remembered to ask.
 - **Stuck runs get noticed.** If a run a chat is waiting on prints nothing for 30 minutes, logs a NaN or infinite metric, or hits an out-of-memory error while still running, orx tells the agent. The agent can then read the log and cancel the run instead of letting it burn compute.
 - **Waiting is visible.** When Claude Code is retrying a failed API call, the chat shows a retry row instead of a silent hang. Claude Code also keeps a checklist of its steps (its TodoWrite tool), whichever model you pick.
-- **Runs are scored.** Run code prints `ORX_METRIC {json}` lines and orx records them per run. Each project names one primary metric and its direction. `orx metric` then ranks runs on it, tracks the best run against the baseline, and splits the gain across the experiments between them. A noise floor keeps a lucky run from counting as an improvement.
+- **Runs are scored.** Run code prints `ORX_METRIC {json}` lines and orx records them per run. Each optimization names its primary metric and its direction. `orx metric` then ranks runs on it, tracks the best run against the baseline, and splits the gain across the experiments between them. A noise floor keeps a lucky run from counting as an improvement.
 - **Ideas are work items.** Each idea to try is queued with a forecast, an 80% interval, a GPU-hour cost and a cheap kill test. `orx idea next` picks the next one by expected gain per GPU-hour, with blockers first and a rule that keeps the search from only making small steps. Closing an idea measures what its experiment did against its parent, so forecasts can be checked.
-- **Work is scoped before compute is spent.** The agent interviews you in rounds, each question with its recommended answer, until the objective, metric, limits, budget and stop rule are agreed, then reviews the data for leakage and proposes ideas. Once a project has this brief, orx holds every launch to it.
+- **Work is scoped before compute is spent.** Each auto-research chat runs its own optimization, on the whole system or on one part of it, so a project can run several at once. The agent interviews you in rounds, each question with its recommended answer, until the objective, metric, limits, scope, budget and stop rule are agreed, then reviews the data for leakage and proposes ideas. Once you confirm this brief, orx holds the optimization's runs to it.
 - **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
 - **Long chats keep going.** When a chat's context window is 80% full, orx compacts it as soon as the turn that filled it ends, so a long research loop doesn't run out of room in the middle of a task. The metrics, ideas, brief and findings live outside the chat, so compacting loses none of them.
 
-In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows the running best against the baseline, what moved the score, the idea queue, the brief with its budget, and the findings. On a project without a brief, it starts auto-research from a form. Its Side chat button, and the ask buttons beside the next idea, each step that moved the score, each idea and each finding, open a side chat off the chat that runs the loop, so you can ask about the work without stopping it.
+In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows an optimization's running best against the baseline, what moved the score, its idea queue and its brief with its budget, then the project's findings; a switcher moves between a project's optimizations, starting with the open chat's, and New optimization starts another from a form. Its Side chat button, and the ask buttons beside the next idea, each step that moved the score, each idea and each finding, open a side chat off the chat that runs the loop, so you can ask about the work without stopping it.
 
 ## Scoring runs
 
@@ -28,7 +28,7 @@ ORX_METRIC {"step": 1200, "val_ic": 0.031, "train_loss": 0.42}
 `orx skill metrics/assets/orx_metrics.py` prints a small Python helper that writes these lines. Then:
 
 ```sh
-orx metric primary <projectId> val_ic --maximize --noise-floor 0.002   # once per project
+orx metric primary <projectId> val_ic --maximize --noise-floor 0.002   # once per optimization
 orx metric runs <projectId>     # runs ranked on the primary metric
 orx metric best <projectId>     # best run against the baseline, step by step
 orx metric show <runId>         # everything one run reported
@@ -60,11 +60,14 @@ Ask the agent to scope a goal, or start one and let it: the `orx-grill` skill in
 orx brief show <projectId>       # the brief, what it still needs, budget used
 orx brief set <projectId> --objective "..." --lock eval/score.py --budget-runs 20 --stop-rule "..."
 orx brief confirm <projectId>    # only after you have agreed to it
+orx brief list <projectId>       # the project's optimizations
 ```
 
-Or start from the dashboard: in the Experiments tab, open Research and choose Set up research. The form asks what to improve and the metric that measures it, what runs may and must not change, the budget and stop rule, and your pointers and seed ideas. Save and start records them and opens a chat in which the agent scopes the rest with you, asking only about what's missing. Confirm the brief in the Research view when you agree; the chat then starts the loop.
+These act on the optimization the chat they run in runs, and the first that writes one starts it; from a terminal, or for another chat's, name it with `--opt <optId>`. To work on one part of the system, scope the brief to it (`--scope features/`, repeatable): a run may then change only files inside those paths.
 
-Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the commit about to run changes a locked file or folder, or once the run or day budget is spent. The budget counts from the first confirmation; editing and reconfirming the brief doesn't reset it unless you ask (`--reset-budget`). Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder, but the improvement loop itself (`orx idea next`, `orx idea start`) waits for a confirmed brief, and confirming needs at least one idea to start from.
+Or start from the dashboard: in the Experiments tab, open Research and choose Set up research (or New optimization). The form asks what to improve and the metric that measures it, what runs may and must not change, which paths they may touch, the budget and stop rule, and your pointers and seed ideas. Save and start records them and opens the chat that runs the optimization, in which the agent scopes the rest with you, asking only about what's missing. Confirm the brief in the Research view when you agree; the chat then starts the loop.
+
+A run belongs to the optimization of the idea testing its experiment, else of the chat that created the experiment or launched the run. orx refuses such a run until its brief is confirmed, while one of its blocker ideas is open, when the commit about to run changes a locked file or folder or anything outside the scope, or once its run or day budget is spent. The budget counts from the first confirmation; editing and reconfirming the brief doesn't reset it unless you ask (`--reset-budget`). Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Runs outside any optimization launch as before, with a reminder, but the improvement loop itself (`orx idea next`, `orx idea start`) waits for a confirmed brief, and confirming needs at least one idea to start from.
 
 Findings record what the loop learns:
 
@@ -126,7 +129,7 @@ All optional. Set them in the environment `orx up` starts from.
 | `VLR_AGENT_ENV_DEFAULTS` | on | `0` stops orx adding the no-telemetry settings to agent processes |
 | `VLR_AGENT_CHECKLIST` | on | `0` leaves Claude Code's task tools as Claude Code configures them |
 | `VLR_STALL_MINUTES` | `30` | Minutes a running job may print nothing before its chat is told; `0` turns stall alerts off |
-| `VLR_SCOPE_GATE` | on | Holds launches to a project's brief once it has one; `strict` also refuses projects without a brief; `0` turns the gate off |
+| `VLR_SCOPE_GATE` | on | Holds each optimization's runs to its brief; `strict` also refuses runs outside any optimization; `0` turns the gate off |
 | `VLR_PROBE` | off | Set to `1` on a single launch to run it as a probe |
 | `VLR_AUTO_ABLATE` | on | `0` stops orx from queueing ablation checks when a kept idea makes a new best |
 | `VLR_AUTO_COMPACT` | `0.8` | How full a chat's context window gets before orx compacts it, as a fraction (`0.8`) or a percentage (`80`, `80%`); `0` turns autocompaction off |

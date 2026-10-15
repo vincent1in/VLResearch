@@ -14,7 +14,9 @@ orx idea add <projectId> "<title>" --class incremental \
   --forecast 0.003 --interval -0.001 0.007 --cost-hours 2
 ```
 
-- `--forecast` is the change you expect in the project's primary metric, in
+- The idea joins this chat's optimization's queue (`--opt <optId>` for
+  another's).
+- `--forecast` is the change you expect in the optimization's primary metric, in
   its units and sign: negative for a loss that should fall. `--interval` is
   your 80% interval, so about one outcome in five should land outside it.
 - `--class` says how it relates to what was tried: `incremental`,
@@ -48,7 +50,7 @@ trials behind any "best" number, which is how its luck gets discounted.
 
 ## Ablation checks
 
-When a kept idea's experiment becomes the project's best, orx queues up to
+When a kept idea's experiment becomes the optimization's best, orx queues up to
 two ablation checks for the biggest earlier steps on its lineage path (the
 steps `orx metric best` lists), titled `Ablate "<step>" from the best`. Each
 forecasts that taking that step's change back out of the best loses about

@@ -6,7 +6,7 @@ use crate::local::agent_skills::{AgentSkill, AgentSkillResource};
 
 pub(crate) const METRICS: AgentSkill = AgentSkill {
     name: "orx-metrics",
-    description: "Report run metrics as ORX_METRIC lines and compare runs on the project's primary metric with `orx metric`. Use when writing or editing code that reports losses or scores, before launching a run whose result will be compared, when choosing what to optimize, or before saying which experiment is best.",
+    description: "Report run metrics as ORX_METRIC lines and compare runs on this chat's optimization's primary metric with `orx metric`. Use when writing or editing code that reports losses or scores, before launching a run whose result will be compared, when choosing what to optimize, or before saying which experiment is best.",
     content: include_str!("../../agent-skills/orx-metrics/SKILL.md"),
     resources: &[AgentSkillResource {
         path: "assets/orx_metrics.py",
@@ -30,7 +30,7 @@ pub(crate) const GRILL: AgentSkill = AgentSkill {
 
 pub(crate) const IMPROVE: AgentSkill = AgentSkill {
     name: "orx-improve",
-    description: "Run the forecast-and-verify improvement loop on a scoped project: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on a project with a confirmed brief.",
+    description: "Run the forecast-and-verify improvement loop on this chat's scoped optimization: pick the next idea, check its forecast, build it on a child of the best experiment, run it, measure it against the forecast, and keep a new best only past the noise floor. Use when asked to improve a model, dataset or process over several experiments, or to keep going on an optimization with a confirmed brief.",
     content: include_str!("../../agent-skills/orx-improve/SKILL.md"),
     resources: &[],
 };

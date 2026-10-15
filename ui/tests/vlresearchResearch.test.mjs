@@ -15,6 +15,9 @@ import {
   emptyDraft,
   ideaPayloads,
   kickoffMessage,
+  defaultOptimization,
+  optimizationLabel,
+  parseOptimizations,
   setupProblems,
   calibrationLine,
   forecastText,
@@ -261,6 +264,7 @@ test("the setup form turns into the brief, metric and ideas the endpoints take",
     noiseFloor: "0.002",
     mustNotChange: "Evaluation code",
     locked: "eval/score.py\n\n data/splits.yaml ,eval/folds",
+    scope: "features/\n",
     budgetRuns: "20",
     budgetGpuHours: "",
     budgetDays: "14",
@@ -274,6 +278,7 @@ test("the setup form turns into the brief, metric and ideas the endpoints take",
     mayChange: null,
     mustNotChange: "Evaluation code",
     locked: ["eval/score.py", "data/splits.yaml", "eval/folds"],
+    scope: ["features/"],
     budgetRuns: 20,
     budgetGpuHours: null,
     budgetDays: 14,
@@ -316,9 +321,9 @@ test("ideas queued before a failed step leave the form, so a retry doesn't queue
 test("editing starts from the saved brief", () => {
   const draft = draftFromBrief({
     brief: {
-      objective: "Raise IC", mayChange: null, mustNotChange: "eval", locked: [{ path: "eval" }, { path: "splits.yaml" }],
-      budgetRuns: 20, budgetGpuHours: null, budgetDays: 14, pointers: "Volume", sources: null, stopRule: "5 flat runs",
-      confirmedAt: null, confirmedBy: null, chatSessionId: null,
+      id: "opt_1", objective: "Raise IC", mayChange: null, mustNotChange: "eval", locked: [{ path: "eval" }, { path: "splits.yaml" }],
+      scope: ["features", "data/loaders.py"], budgetRuns: 20, budgetGpuHours: null, budgetDays: 14, pointers: "Volume",
+      sources: null, stopRule: "5 flat runs", confirmedAt: null, confirmedBy: null, chatSessionId: null, updatedAt: 1,
     },
     primary: { key: "val_loss", direction: "min", noiseFloor: 0.01, split: "val" },
     usage: null,
@@ -329,6 +334,7 @@ test("editing starts from the saved brief", () => {
   assert.equal(draft.noiseFloor, "0.01");
   assert.equal(draft.split, "val");
   assert.equal(draft.locked, "eval\nsplits.yaml");
+  assert.equal(draft.scope, "features\ndata/loaders.py");
   assert.equal(draft.budgetRuns, "20");
   assert.equal(draft.budgetGpuHours, "");
   assert.deepEqual(draft.ideas, [{ title: "", forecast: "" }]);
@@ -336,13 +342,14 @@ test("editing starts from the saved brief", () => {
 });
 
 test("the started chat is told where the brief is and what comes next", () => {
-  const kickoff = kickoffMessage("proj_1", 2);
+  const kickoff = kickoffMessage("proj_1", "opt_7", 2);
+  assert.match(kickoff, /runs optimization opt_7/);
   assert.match(kickoff, /`orx brief show proj_1`/);
   assert.match(kickoff, /2 seed ideas \(`orx idea list proj_1`\)/);
   assert.match(kickoff, /orx-grill/);
   assert.match(kickoff, /orx-improve/);
-  assert.match(kickoffMessage("proj_1", 0), /no seed ideas yet/);
-  assert.match(kickoffMessage("proj_1", 1), /1 seed idea \(/);
+  assert.match(kickoffMessage("proj_1", "opt_7", 0), /no seed ideas yet/);
+  assert.match(kickoffMessage("proj_1", "opt_7", 1), /1 seed idea \(/);
   assert.match(CONFIRMED_MESSAGE, /orx-improve/);
 });
 
@@ -373,4 +380,26 @@ test("side chats open with a question that names the item and its id", () => {
   assert.equal(askAboutStep(step, "val_ic"), "Why did “Volume features” (experiment vol-20d) move val_ic by +0.003? Would the gain hold without the steps around it?");
   assert.match(askAboutStep({ ...step, detail: null }, "val_ic"), /^Why did “Volume features” move/);
   assert.match(askAboutFinding({ id: "fnd_1", statement: "Volume helps in volatile months", kind: "model", status: "supported", locked: false }), /“Volume helps in volatile months” \(`fnd_1`\)/);
+});
+
+test("a project's optimizations: the open chat's comes first, each named by its goal", () => {
+  const entry = (id, objective, chat, key) => ({
+    brief: { id, objective, chatSessionId: chat, scope: [], locked: [] },
+    primary: key ? { key, direction: "max", noiseFloor: null, split: null } : null,
+    usage: null,
+    missing: [],
+  });
+  const { optimizations, keys } = parseOptimizations({
+    optimizations: [entry("opt_b", null, "chat_b", "backtest_seconds"), entry("opt_a", "Raise the validation IC", "chat_a", "val_ic"), { brief: null }],
+    keys: ["val_ic", 3],
+  });
+  assert.deepEqual(optimizations.map((payload) => payload.brief.id), ["opt_b", "opt_a"]);
+  assert.deepEqual(keys, ["val_ic"]);
+  assert.equal(defaultOptimization(optimizations, "chat_a"), "opt_a");
+  assert.equal(defaultOptimization(optimizations, "chat_other"), "opt_b");
+  assert.equal(defaultOptimization([], "chat_a"), null);
+  assert.equal(optimizationLabel(optimizations[1]), "Raise the validation IC");
+  assert.equal(optimizationLabel(optimizations[0]), "Improve backtest_seconds");
+  assert.equal(optimizationLabel(parseOptimizations({ optimizations: [entry("opt_c", null, null, null)] }).optimizations[0]), "New optimization");
+  assert.match(optimizationLabel(entry("opt_d", "x".repeat(80), null, null)), /…$/);
 });
