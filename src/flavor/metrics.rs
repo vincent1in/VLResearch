@@ -1887,7 +1887,10 @@ mod tests {
             min: None,
         };
         set_guard(&store, &opt.id, &guard).unwrap();
-        assert_eq!(guards(&store, &opt.id).unwrap(), std::slice::from_ref(&guard));
+        assert_eq!(
+            guards(&store, &opt.id).unwrap(),
+            std::slice::from_ref(&guard)
+        );
         let (ranked, _, _) = standing(&store, &opt, &metric).unwrap();
         assert_eq!(ranked.best.unwrap().experiment_id, "fast");
         assert_eq!(ranked.breaches.len(), 1);
