@@ -14,7 +14,7 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
 - **Long chats keep going.** When a chat's context window is 80% full, orx compacts it as soon as the turn that filled it ends, so a long research loop doesn't run out of room in the middle of a task. The metrics, ideas, brief and findings live outside the chat, so compacting loses none of them.
 
-Planned next: dashboard views for chat progress, metrics, ideas, the brief and findings.
+In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows the running best against the baseline, what moved the score, the idea queue, the brief with its budget, and the findings. On a project without a brief, it starts auto-research from a form.
 
 ## Scoring runs
 
@@ -61,6 +61,8 @@ orx brief show <projectId>       # the brief, what it still needs, budget used
 orx brief set <projectId> --objective "..." --lock eval/score.py --budget-runs 20 --stop-rule "..."
 orx brief confirm <projectId>    # only after you have agreed to it
 ```
+
+Or start from the dashboard: in the Experiments tab, open Research and choose Set up research. The form asks what to improve and the metric that measures it, what runs may and must not change, the budget and stop rule, and your pointers and seed ideas. Save and start records them and opens a chat in which the agent scopes the rest with you, asking only about what's missing. Confirm the brief in the Research view when you agree; the chat then starts the loop.
 
 Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the commit about to run changes a locked file or folder, or once the run or day budget is spent. The budget counts from the first confirmation; editing and reconfirming the brief doesn't reset it unless you ask (`--reset-budget`). Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder, but the improvement loop itself (`orx idea next`, `orx idea start`) waits for a confirmed brief, and confirming needs at least one idea to start from.
 

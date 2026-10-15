@@ -7,6 +7,7 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 | Path | What it holds |
 | --- | --- |
 | `src/flavor/` | All VLResearch Rust code: `egress.rs` (network policy), `wake.rs` (run wake-ups), `harness.rs` (agent settings and events surfaced in chat), `stall.rs` (stall alerts), `compact.rs` (autocompaction), `activity.rs` (each chat's last-activity clock), `metrics.rs` (the metrics ledger), `ideas.rs` (the idea queue and its selector), `scope.rs` (the brief, its launch gate, and the loop's wait for it), `start.rs` (saving the brief, ideas and confirmation from the dashboard), `findings.rs` (the findings ledger), `cli.rs` (the commands' arguments and dispatch), `metric_cli.rs`, `idea_cli.rs`, `brief_cli.rs` and `finding_cli.rs` (`orx metric`, `orx idea`, `orx brief`, `orx finding`), `skills.rs` (agent skills), `api.rs` (dashboard endpoints under `/api/vlresearch/`) |
+| `ui/src/flavor/` | Dashboard code: the chat progress strip (`ProgressStrip.tsx`, `progress.ts`, `checklist.ts`) and the Research view (`ResearchView.tsx`, `research.ts`), with its form for starting auto-research (`ResearchSetup.tsx`). Their logic is in the `.ts` files, tested by `ui/tests/vlresearch*.test.mjs` |
 | `agent-skills/orx-metrics/`, `orx-ideas/`, `orx-findings/`, `orx-grill/`, `orx-improve/` | Agent skills: reporting metrics (with a Python helper), working the idea queue, keeping findings, scoping a goal with the user, and running the improvement loop |
 | `src/flavor/chat_host.rs` | Code that starts hidden chat turns. It is compiled as a child module of `src/local/chat/mod.rs` (a `#[path]` declaration there), the only way to reach the chat host's private turn machinery without making upstream's items public |
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
@@ -39,6 +40,8 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/commands/up/harness_setup.rs` | No agent installs or updates unless `VLR_ALLOW_INSTALLERS` |
 | `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `watch_runs` runs the stall check; a finished turn calls the autocompactor; declares the `vlresearch` child module |
 | `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server |
+| `ui/src/components/ChatPanel.tsx` | The progress strip above the composer; the agent's checklist tool reads as progress |
+| `ui/src/App.tsx` | The Experiments tab's Research toggle, beside Table and Tree |
 | `src/compute.rs` | `submit` checks the scoping gate before any compute is spent and the locked paths against the commit it staged, then registers the launching chat's wake-up and records probe runs |
 | `src/plane/local_plane.rs` | `launch` passes a probe request on to the gate, which runs in the `orx up` process for launches from chat |
 | `src/commands/exp.rs`, `src/plane/local_plane.rs` | `orx exp wait` timeout under Claude Code; a wait that sees the result settles the wake-up |
@@ -69,5 +72,4 @@ Upstream merges are never rebased, so `main` is never force-pushed.
 
 ## Next up
 
-1. Dashboard views on the endpoints that already exist: the chat progress strip (`GET /api/vlresearch/sessions/{id}/progress`), the optimization surface with the running best and the lineage waterfall (`GET /api/vlresearch/projects/{id}/metrics`), the idea board (`GET /api/vlresearch/projects/{id}/ideas`), which shows titles and never ids, the brief with its budget (`GET /api/vlresearch/projects/{id}/brief`), and the findings table and claim page (`GET /api/vlresearch/projects/{id}/findings`, `GET /api/vlresearch/findings/{id}`).
-2. A calibrated predictor trained on the idea ledger, to sit beside the agent's own forecasts once enough ideas have closed.
+1. A claim page for each finding, with its evidence and links (`GET /api/vlresearch/findings/{id}`).

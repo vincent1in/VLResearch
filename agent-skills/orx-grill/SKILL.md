@@ -7,12 +7,18 @@ description: "Scope research work with the user before spending compute: intervi
 
 - Before the first improvement experiment in a project, and whenever the
   goal changes.
+- When the user starts auto-research from the dashboard's Research view.
+  They have already filled in part of the brief, and maybe some ideas.
 - When `orx exp run` refuses a launch because the brief is missing or not
   confirmed.
 - Work in plan mode when it is on: the interview and the review only read,
   and the plan you submit at the end is the brief.
 
 ## 1. Interrogate
+
+Start from what is already recorded: `orx brief show <projectId>` and
+`orx idea list <projectId>`. Don't ask again for what the user filled in;
+ask about what is missing, vague or at odds with the repository.
 
 Ask in numbered rounds, one round at a time, three to six questions each.
 Give your recommended answer to every question, worked out from the
@@ -82,6 +88,11 @@ orx brief set <projectId> --objective "..." --may-change "..." \
 orx idea add <projectId> "<title>" ...    # one per idea
 orx brief confirm <projectId>
 ```
+
+`orx brief set` changes only the fields you pass. The user can confirm the
+brief in the dashboard's Research view, and this chat is told when they do;
+ask them to if they started there. If they agree in the chat instead,
+confirm it yourself.
 
 Never confirm a brief the user has not seen. Confirming needs at least one
 open idea to start from, and the loop (`orx idea next`, `orx idea start`)

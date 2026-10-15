@@ -120,6 +120,7 @@ import { DesktopAppBanner } from "./components/DesktopAppBanner";
 import { OfflineBanner } from "./components/OfflineBanner";
 import { NewProjectDialog } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
+import { ResearchView } from "./flavor/ResearchView"; // VLResearch
 import { archiveActionsByExperiment } from "./components/ArchiveMenu";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
@@ -373,6 +374,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const artifacts = artifactsQuery.data ?? null;
 
   const [view, setView] = useState<ExperimentsView>("table");
+  const [vlrResearch, setVlrResearch] = useState(false); // VLResearch: the Research view
   const [showArchivedExperiments, setShowArchivedExperiments] = useState(false);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there is no usable experiment attribution.
@@ -1966,24 +1968,30 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       aria-label={m.app_experiment_view()}
                     >
                       <button
-                        className={view === "table" ? "active" : ""}
-                        aria-pressed={view === "table"}
-                        onClick={() => setView("table")}
+                        className={view === "table" && !vlrResearch ? "active" : ""}
+                        aria-pressed={view === "table" && !vlrResearch}
+                        onClick={() => { setVlrResearch(false); setView("table"); }}
                       >
                         {m.app_table()}
                       </button>
                       <button
-                        className={view === "tree" ? "active" : ""}
-                        aria-pressed={view === "tree"}
-                        onClick={() => setView("tree")}
+                        className={view === "tree" && !vlrResearch ? "active" : ""}
+                        aria-pressed={view === "tree" && !vlrResearch}
+                        onClick={() => { setVlrResearch(false); setView("tree"); }}
                       >
                         {m.app_tree()}
+                      </button>
+                      {/* VLResearch: the optimization surface, ideas, brief and findings. */}
+                      <button className={vlrResearch ? "active" : ""} aria-pressed={vlrResearch} onClick={() => setVlrResearch(true)}>
+                        Research
                       </button>
                     </div>
                   </div>
                 </div>
                 <div className="pane-content flex-1 min-h-0 relative bg-background">
-                  {view === "tree" ? (
+                  {vlrResearch && activeProject ? (
+                    <ResearchView projectId={activeProject.id} />
+                  ) : view === "tree" ? (
                     activeProject && (
                       <TreeView
                         experiments={experiments}

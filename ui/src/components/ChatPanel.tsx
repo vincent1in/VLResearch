@@ -168,6 +168,8 @@ import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { ChatImageScope, Md } from "./Md";
 import { PlanStrip } from "./PlanStrip";
+import { checklistLabel } from "../flavor/checklist"; // VLResearch
+import { ProgressStrip } from "../flavor/ProgressStrip"; // VLResearch
 import { SETTINGS_NAV, type SettingsTab } from "./SettingsPage";
 import { SkillMenu } from "./SkillMenu";
 import { ComposerSkillChips, MessageWithChips, skillMarginSpaces } from "./SkillChips";
@@ -1791,6 +1793,8 @@ function computeToolActivity(part: ChatPart): ToolActivity {
       return { kind: "command", label: m.chat_panel_tool_failed() };
     case "importedchat":
       return { kind: "project", label: m.activity_imported_chat() };
+    case "todowrite": // VLResearch: the agent's checklist reads as progress.
+      return { kind: "project", label: checklistLabel(normalizedInput) };
     case "contextcompaction":
       return {
         kind: "command",
@@ -6654,6 +6658,16 @@ export function ChatPanel({
             in when it arrives (effect above). The transcript status covers
             the interim ("Waiting for your input…" for a beat until the old
             card's resolve broadcast lands, then Working…). */}
+          {/* VLResearch: checklist, last-update clock and the runs this chat waits on. */}
+          {activeId && (
+            <ProgressStrip
+              sessionId={activeId}
+              messages={messages}
+              busy={busy && !awaitingInput}
+              toolRunning={hasPendingTailTool}
+              onOpenRun={onOpenRun}
+            />
+          )}
           {pendingPlan && !(revisingPlan && pendingPlan.promptId === revisingPlan.promptId) && (
             <PlanStrip
               synthesized={pendingPlan.synthesized}
