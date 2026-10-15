@@ -1011,6 +1011,84 @@ pub(crate) fn calibration(ideas: &[Idea]) -> Calibration {
     result
 }
 
+/// Past forecasts needed before orx offers its own reading of a new one.
+const MIN_FORECASTS_FOR_ADJUSTMENT: usize = 5;
+
+/// How past forecasts missed, as a correction for new ones: shift a forecast
+/// by the mean error, and stretch its interval by the factor that would have
+/// put 80% of past outcomes inside theirs. Learned from the agent's own
+/// forecasts on tested attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Adjustment {
+    pub shift: f64,
+    pub stretch: f64,
+    /// How many past forecasts it comes from.
+    pub from: usize,
+}
+
+/// The correction past forecasts suggest, once there are enough of them.
+pub(crate) fn adjustment(ideas: &[Idea]) -> Option<Adjustment> {
+    let samples: Vec<(f64, f64, f64, f64)> = ideas
+        .iter()
+        .filter(|idea| {
+            !idea.kind.is_blocker()
+                && idea.ablates.is_none()
+                && matches!(idea.status, Status::Kept | Status::Refuted)
+        })
+        .filter_map(|idea| {
+            Some((
+                idea.forecast?,
+                idea.forecast_low?,
+                idea.forecast_high?,
+                idea.outcome?,
+            ))
+        })
+        .collect();
+    if samples.len() < MIN_FORECASTS_FOR_ADJUSTMENT {
+        return None;
+    }
+    let shift = samples
+        .iter()
+        .map(|(forecast, _, _, outcome)| outcome - forecast)
+        .sum::<f64>()
+        / samples.len() as f64;
+    // How many half-widths, on the side it fell, each outcome landed from
+    // its shifted forecast. Point forecasts have no width to measure by.
+    let mut misses: Vec<f64> = samples
+        .iter()
+        .filter_map(|&(forecast, low, high, outcome)| {
+            let center = forecast + shift;
+            let half = if outcome >= center {
+                high - forecast
+            } else {
+                forecast - low
+            };
+            (half > 0.0).then(|| (outcome - center).abs() / half)
+        })
+        .collect();
+    if misses.len() < MIN_FORECASTS_FOR_ADJUSTMENT {
+        return None;
+    }
+    misses.sort_by(|a, b| a.total_cmp(b));
+    // The smallest stretch that covers 80% of past outcomes.
+    let rank = ((0.8 * misses.len() as f64).ceil() as usize).clamp(1, misses.len());
+    Some(Adjustment {
+        shift,
+        stretch: misses[rank - 1].clamp(0.25, 10.0),
+        from: samples.len(),
+    })
+}
+
+/// An idea's forecast and interval as past forecasts suggest reading them.
+pub(crate) fn adjusted(idea: &Idea, adjustment: &Adjustment) -> Option<(f64, f64, f64)> {
+    let forecast = idea.forecast?;
+    let center = forecast + adjustment.shift;
+    let low = center - (forecast - idea.forecast_low?) * adjustment.stretch;
+    let high = center + (idea.forecast_high? - forecast) * adjustment.stretch;
+    Some((center, low, high))
+}
+
 /// How the tested ideas of one class have done.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1628,6 +1706,63 @@ mod tests {
         let pick = next(&store, "p").unwrap().unwrap();
         assert_eq!(pick.idea.id, incremental.id);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn past_misses_shift_and_stretch_new_forecasts() {
+        let scored = |forecast: f64, low: f64, high: f64, outcome: f64| Idea {
+            id: "i".into(),
+            project_id: "p".into(),
+            title: "t".into(),
+            kind: Kind::Science,
+            class: None,
+            priority: 2,
+            hypothesis: None,
+            kill_test: None,
+            forecast: Some(forecast),
+            forecast_low: Some(low),
+            forecast_high: Some(high),
+            cost_hours: None,
+            status: Status::Kept,
+            blocked_by: None,
+            author: Author::Agent,
+            evidence: None,
+            experiment_id: None,
+            outcome: Some(outcome),
+            outcome_key: None,
+            created_at: 1,
+            started_at: None,
+            closed_at: None,
+            ablates: None,
+        };
+        // Forecasts of +0.002 (0 to +0.004) that ran about 0.0026 low.
+        let mut ideas: Vec<Idea> = [0.004, 0.008, 0.0, 0.006, 0.005]
+            .into_iter()
+            .map(|outcome| scored(0.002, 0.0, 0.004, outcome))
+            .collect();
+        // orx's own checks and blockers don't count.
+        let mut check = scored(-0.006, -0.009, -0.003, 0.5);
+        check.ablates = Some("step".into());
+        ideas.push(check);
+        let mut blocker = scored(0.0, -1.0, 1.0, 9.0);
+        blocker.kind = Kind::EvalBlocker;
+        ideas.push(blocker);
+
+        let learned = adjustment(&ideas).unwrap();
+        assert_eq!(learned.from, 5);
+        assert!((learned.shift - 0.0026).abs() < 1e-12);
+        // Misses of 0.2, 0.3, 0.7, 1.7 and 2.3 half-widths: 1.7 covers four
+        // of five.
+        assert!((learned.stretch - 1.7).abs() < 1e-9);
+        let (center, low, high) = adjusted(&scored(0.003, 0.001, 0.005, 0.0), &learned).unwrap();
+        assert!((center - 0.0056).abs() < 1e-12);
+        assert!((low - 0.0022).abs() < 1e-9);
+        assert!((high - 0.009).abs() < 1e-9);
+
+        // Too few forecasts, or forecasts without intervals, give nothing.
+        assert_eq!(adjustment(&ideas[..4]), None);
+        let points: Vec<Idea> = (0..6).map(|_| scored(0.002, 0.002, 0.002, 0.003)).collect();
+        assert_eq!(adjustment(&points), None);
     }
 
     #[test]

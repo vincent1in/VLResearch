@@ -14,7 +14,7 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
 - **Long chats keep going.** When a chat's context window is 80% full, orx compacts it as soon as the turn that filled it ends, so a long research loop doesn't run out of room in the middle of a task. The metrics, ideas, brief and findings live outside the chat, so compacting loses none of them.
 
-Planned next: dashboard views for chat progress, metrics, ideas, the brief and findings.
+In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows the running best against the baseline, what moved the score, the idea queue, the brief with its budget, and the findings.
 
 ## Scoring runs
 
@@ -48,7 +48,7 @@ orx idea done <ideaId>                  # measured against the parent: kept or r
 orx idea calibration <projectId>        # how well forecasts have held up, and which classes of idea pay
 ```
 
-Forecasts are changes in the primary metric, in its units and sign. Agents follow the same steps through the `orx-ideas` skill.
+Forecasts are changes in the primary metric, in its units and sign. Once five ideas have been tested, orx also reads each new forecast in the light of past ones: shifted by the mean error, with its interval stretched until 80% of past outcomes would have landed inside. Agents follow the same steps through the `orx-ideas` skill.
 
 The per-step gains in `orx metric best` assume the steps add up. To check that, when a kept idea makes a new best, orx queues up to two ablation ideas for the biggest earlier steps behind it: take that step's change back out of the best and see whether the metric loses what the step gained. A check is confirmed when the loss lands in its forecast interval, and refuted when it is far smaller or larger: then the steps interact, and the per-step split is off. `orx idea next` takes these checks, and replicates, before new ideas (`VLR_AUTO_ABLATE=0` stops the automatic ablations).
 

@@ -70,7 +70,9 @@ what the step gained.
 `orx idea calibration <projectId>` compares forecasts with outcomes. The mean
 error says whether your forecasts run high or low; the share of outcomes
 inside the 80% intervals says whether the intervals are too narrow (well
-under 80%) or too wide. Adjust new forecasts to match. Its table by class
+under 80%) or too wide. Once five ideas have been tested, it also prints the
+correction to apply (a shift and an interval stretch), and `orx idea next`
+shows the next idea's forecast with it applied. Its table by class
 shows which kinds of idea (data, incremental, orthogonal, process) have paid
 off, as a hit rate and as gain per GPU-hour; lean the next proposals toward
 the classes that pay.

@@ -13,11 +13,13 @@ one, scope the work first with `orx-grill`.
 1. **Select.** `orx idea next <projectId>`. Work on what it picks. If you
    disagree, say why and change the idea's priority or blockers rather than
    skipping it silently.
-2. **Predict.** Revisit the idea's forecast with what you now know, and with
-   `orx idea calibration <projectId>`: shift forecasts by the reported bias,
-   and widen intervals if fewer than about 80% of outcomes land inside them.
-   Edit the forecast (`orx idea edit <ideaId> --forecast ... --interval ...`)
-   before the run, never after.
+2. **Predict.** Revisit the idea's forecast with what you now know. Once
+   five ideas have been tested, `orx idea next` also prints the forecast as
+   past misses suggest reading it: shifted by your mean error, with the
+   interval stretched until about 80% of past outcomes would have landed
+   inside. Take that reading unless you know something it can't. Edit the
+   forecast (`orx idea edit <ideaId> --forecast ... --interval ...`) before
+   the run, never after.
 3. **Build.** Create the experiment as a child of the current best
    (`orx metric best <projectId>` prints its experiment id), changing only
    what the brief allows. Locked files are checked against the exact commit

@@ -275,10 +275,17 @@ fn report_closed(closed: &ideas::Closed) {
 fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
     let project = crate::local::resolve::resolve_project(store, project_id)?;
     let pick = ideas::next(store, &project.id)?;
+    let learned = ideas::adjustment(&ideas::list(store, &project.id)?);
+    let adjusted = pick
+        .as_ref()
+        .zip(learned.as_ref())
+        .and_then(|(pick, learned)| ideas::adjusted(&pick.idea, learned));
     if json {
+        let adjusted = adjusted
+            .map(|(forecast, low, high)| json!({ "forecast": forecast, "low": low, "high": high }));
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "pick": pick }))?
+            serde_json::to_string_pretty(&json!({ "pick": pick, "adjusted": adjusted }))?
         );
         return Ok(());
     }
@@ -286,6 +293,17 @@ fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
         Some(pick) => {
             println!("Next: {} ({})", pick.idea.title, pick.idea.id);
             println!("Why: {}.", pick.reason);
+            if let (Some((forecast, low, high)), Some(learned)) = (adjusted, learned) {
+                println!(
+                    "Forecast {}; past forecasts suggest reading it as {} [{}, {}], from {} \
+                     tested ideas.",
+                    forecast_text(&pick.idea),
+                    signed(forecast),
+                    signed(low),
+                    signed(high),
+                    learned.from
+                );
+            }
             if let Some(test) = &pick.idea.kill_test {
                 println!("Kill test first: {test}");
             }
@@ -306,9 +324,11 @@ fn calibration(store: &Store, project_id: &str, json: bool) -> Result<()> {
     let direction = metrics::primary(store, &project.id)?
         .map_or(metrics::Direction::Max, |metric| metric.direction);
     let board = ideas::scoreboard(&all, direction);
+    let learned = ideas::adjustment(&all);
     if json {
         let mut value = serde_json::to_value(&report)?;
         value["byClass"] = serde_json::to_value(&board)?;
+        value["adjustment"] = serde_json::to_value(learned)?;
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
@@ -345,6 +365,15 @@ fn calibration(store: &Store, project_id: &str, json: bool) -> Result<()> {
             report.inside_interval,
             report.with_interval,
             100 * report.inside_interval / report.with_interval
+        );
+    }
+    if let Some(learned) = learned {
+        println!(
+            "To correct a new forecast, add {} and stretch its interval {}x (learned from {} \
+             forecasts; `orx idea next` shows the corrected reading).",
+            signed(learned.shift),
+            metrics::format_value(Some(learned.stretch)),
+            learned.from
         );
     }
     if !board.is_empty() {

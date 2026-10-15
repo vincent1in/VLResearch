@@ -136,9 +136,20 @@ async fn project_ideas(Path(project_id): Path<String>) -> ApiResult {
             .map_or(super::metrics::Direction::Max, |metric| metric.direction);
         // Each idea also carries its status as people read it ("resolved",
         // "confirmed"), so the dashboard doesn't restate the rule.
+        let learned = super::ideas::adjustment(&ideas);
         let labeled = |idea: &super::ideas::Idea| -> crate::error::Result<Value> {
             let mut value = serde_json::to_value(idea)?;
             value["statusLabel"] = json!(idea.status_label());
+            // Open ideas also carry their forecast as past misses suggest
+            // reading it.
+            if !idea.status.is_closed() {
+                if let Some((forecast, low, high)) = learned
+                    .as_ref()
+                    .and_then(|learned| super::ideas::adjusted(idea, learned))
+                {
+                    value["adjusted"] = json!({ "forecast": forecast, "low": low, "high": high });
+                }
+            }
             Ok(value)
         };
         let next = match super::ideas::next(&store, &project.id)? {
@@ -153,6 +164,7 @@ async fn project_ideas(Path(project_id): Path<String>) -> ApiResult {
             "next": next,
             "calibration": super::ideas::calibration(&ideas),
             "byClass": super::ideas::scoreboard(&ideas, direction),
+            "adjustment": learned,
             "ideas": ideas.iter().map(labeled).collect::<crate::error::Result<Vec<_>>>()?,
         })))
     })
