@@ -8,6 +8,32 @@ use super::scope::{self, Brief, BriefFields};
 use crate::error::Result;
 use crate::store::Store;
 
+/// Links the brief to the chat whose agent is setting it, so that confirming
+/// it in the Research view tells that chat to start the loop. A helper or side
+/// chat's top-level chat takes its place. Outside a chat, nothing changes.
+fn link_calling_chat(store: &Store, project_id: &str) {
+    if !crate::local::chat::in_local_session() {
+        return;
+    }
+    if let Some(session_id) = crate::local::chat::launching_chat_session() {
+        let _ = link_chat_or_parent(store, project_id, session_id);
+    }
+}
+
+fn link_chat_or_parent(store: &Store, project_id: &str, mut session_id: String) -> Result<()> {
+    // Helper chats nest, but not deeply; the bound only guards against a cycle.
+    for _ in 0..8 {
+        let Some(session) = store.get_chat_session(&session_id)? else {
+            return Ok(());
+        };
+        match session.parent_session_id.or(session.side_parent_session_id) {
+            Some(parent) => session_id = parent,
+            None => return super::start::link_chat(store, project_id, &session.id),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run(command: BriefCommand) -> Result<()> {
     let store = Store::open()?;
     match command {
@@ -47,6 +73,7 @@ pub(crate) fn run(command: BriefCommand) -> Result<()> {
                     stop_rule,
                 },
             )?;
+            link_calling_chat(&store, &project.id);
             let missing = scope::missing(&store, &brief)?;
             if missing.is_empty() {
                 println!(
@@ -199,4 +226,69 @@ fn print_fields(
     line("pointers", brief.pointers.clone());
     line("sources", brief.sources.clone());
     line("stop rule", brief.stop_rule.clone());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_chat_or_parent;
+    use crate::flavor::scope::{self, BriefFields};
+    use crate::store::{Store, StoredChatSession};
+
+    fn chat(id: &str, project_id: &str, parent: Option<&str>) -> StoredChatSession {
+        StoredChatSession {
+            id: id.into(),
+            project_id: project_id.into(),
+            harness: "claude-code".into(),
+            native_session_id: None,
+            title: None,
+            title_source: None,
+            model: None,
+            service_tier: None,
+            permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: None,
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            goal: None,
+            autonomy: None,
+            active_leaf_id: None,
+            parent_session_id: parent.map(str::to_owned),
+            side_parent_session_id: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn the_brief_links_the_top_level_chat_that_set_it() {
+        let dir = std::env::temp_dir().join(format!("vlr-brief-cli-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        scope::set(
+            &store,
+            "p",
+            BriefFields {
+                objective: Some("Raise IC".into()),
+                ..BriefFields::default()
+            },
+        )
+        .unwrap();
+        for session in [
+            chat("chat_main", "p", None),
+            chat("chat_helper", "p", Some("chat_main")),
+            chat("chat_other", "q", None),
+        ] {
+            store.create_chat_session(&session).unwrap();
+        }
+        let linked = || scope::get(&store, "p").unwrap().unwrap().chat_session_id;
+
+        link_chat_or_parent(&store, "p", "chat_helper".into()).unwrap();
+        assert_eq!(linked().as_deref(), Some("chat_main"));
+        // Another project's chat, or one orx doesn't know, leaves the link alone.
+        assert!(link_chat_or_parent(&store, "p", "chat_other".into()).is_err());
+        link_chat_or_parent(&store, "p", "chat_gone".into()).unwrap();
+        assert_eq!(linked().as_deref(), Some("chat_main"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
