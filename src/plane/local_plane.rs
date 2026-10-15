@@ -382,6 +382,8 @@ impl LocalPlane {
                         last_status = Some(r.status.clone());
                     }
                     if crate::local::is_terminal(&r.status) {
+                        // VLResearch: this wait delivered the result; no second wake-up.
+                        crate::flavor::wake::consume(store, &r.id);
                         let run = Run::from(&r);
                         println!("{} {}", run.id, run.status);
                         if let Some(detail) = run.failure_detail() {
@@ -437,6 +439,8 @@ impl LocalPlane {
                     Some(prev) => format!("{} {} -> {}", r.id, prev, r.status),
                     None => format!("{} {} (new)", r.id, r.status),
                 };
+                // VLResearch: this wait delivered the result; no second wake-up.
+                crate::flavor::wake::consume(store, &r.id);
                 completed.push((line, Run::from(r).failure_detail()));
             }
             if !completed.is_empty() {

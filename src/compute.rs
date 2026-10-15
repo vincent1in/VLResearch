@@ -873,6 +873,12 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
                     );
                 }
             }
+            // VLResearch: wake the launching chat when this run finishes.
+            crate::flavor::wake::register_on_submit(
+                &store,
+                &run_id,
+                pending.chat_session_id.as_deref(),
+            );
             Ok(run)
         }
         Err(error) => {

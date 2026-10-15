@@ -926,7 +926,8 @@ mod tests {
         let md = sample_playbook();
         let compute = agent_skills::find("orx-compute", SkillSet::Local).unwrap();
         assert!(compute.content.contains("`orx exp wake <expId>`"));
-        assert!(compute.content.contains("Wake-up is opt-in"));
+        // VLResearch: wake-ups are automatic for runs a chat launches.
+        assert!(compute.content.contains("Wake-ups are automatic"));
         assert!(!md.contains("`orx exp wake <expId>`"));
         assert!(!md.contains("OpenResearch injects an `[orx]` message"));
     }

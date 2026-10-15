@@ -28,6 +28,10 @@ pub fn orx() -> &'static str {
 /// The "what to run next" line every backend prints after launching a run.
 pub fn follow_up(experiment_id: &str, run_id: &str) -> String {
     let orx = orx();
+    // VLResearch: a chat that launched the run is woken automatically.
+    if let Some(line) = crate::flavor::wake::follow_up(orx, experiment_id, run_id) {
+        return line;
+    }
     format!("  Follow it with `{orx} exp wait {experiment_id}` or `{orx} logs {run_id}`.")
 }
 

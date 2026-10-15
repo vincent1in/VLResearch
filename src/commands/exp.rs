@@ -139,9 +139,12 @@ async fn wait(
     interval: Option<u64>,
 ) -> Result<()> {
     let interval = Duration::from_secs(interval.unwrap_or(5).max(1));
-    let deadline = Instant::now() + Duration::from_secs(timeout.unwrap_or(1800));
+    // VLResearch: a shorter default under Claude Code; see flavor::wake.
+    let deadline = Instant::now()
+        + Duration::from_secs(timeout.unwrap_or_else(crate::flavor::wake::default_wait_secs));
+    let (waited_exp, waited_project) = (exp_id.clone(), project.clone());
 
-    match (exp_id, project) {
+    let result = match (exp_id, project) {
         (Some(_), Some(_)) => Err(anyhow!("Pass either <expId> or --project, not both.")),
         (None, None) => Err(anyhow!(
             "Specify what to wait on: `orx exp wait <expId>` (one run) or \
@@ -157,7 +160,14 @@ async fn wait(
                 .wait_project(interval, deadline)
                 .await
         }
-    }
+    };
+    // VLResearch: a timed-out wait in a chat points the agent at its wake-up.
+    crate::flavor::wake::after_wait(
+        result,
+        Instant::now() >= deadline,
+        waited_exp.as_deref(),
+        waited_project.as_deref(),
+    )
 }
 
 // --- job-launch helpers shared with the src/local/* backends -----------------

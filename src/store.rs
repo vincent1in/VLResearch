@@ -411,6 +411,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// VLResearch: the connection for `src/flavor`, which keeps its own SQL there.
+    pub(crate) fn flavor_conn(&self) -> &Connection {
+        &self.conn
+    }
+
     pub(crate) fn relocate_project_paths(&self, paths: &[(String, String)]) -> Result<()> {
         let tx = self.begin()?;
         for (old, new) in paths {

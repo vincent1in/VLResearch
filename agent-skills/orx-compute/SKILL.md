@@ -56,8 +56,9 @@ change the configured backend or authorize bypassing the launch contract.
 - **Commit before launching.** Every backend runs the recorded commit's
   immutable source snapshot. Uncommitted files are excluded; no backend needs a
   GitHub push.
-- `orx exp run` queues the run and returns immediately. Follow it with `orx
-  runs`, `orx logs`, `orx exp wait`, or `orx exp wake`.
+- `orx exp run` queues the run and returns immediately. In a chat, orx wakes
+  you when the run finishes, so you can end your turn; check on it with `orx
+  runs` or `orx logs`, or block on it with `orx exp wait`.
 - `--force` permits a deliberate concurrent run on the same experiment.
   Without it, `orx` rejects a launch while that node already has a run in
   flight.
@@ -104,10 +105,13 @@ orx exp wait <expId> --interval 10 --timeout 3600
 - A wait is a sleep-until-change signal, not the source of truth. After every
   return, read `orx runs <projectId>` and reconcile all newly terminal runs.
 - When nothing is in flight, project wait returns `drained: no runs in flight`.
-- The default interval is 5 seconds and timeout is 1800 seconds. Timeout exits
-  non-zero and means nothing changed yet, not that the run failed.
-- Cancel only a run that is broken or no longer wanted; after a wait timeout,
-  wait again instead of cancelling.
+- The default interval is 5 seconds. The default timeout is 1800 seconds, or
+  100 seconds under Claude Code, which moves longer shell commands to the
+  background. Timeout exits non-zero and means nothing changed yet, not that
+  the run failed.
+- Cancel only a run that is broken or no longer wanted. After a wait timeout in
+  a chat, end your turn: the run's wake-up resumes you. Outside a chat, wait
+  again instead of cancelling.
 - Failed runs include a `reason:` line. Provider-capacity failures are often
   retryable; failures after startup require reading the file located by `orx logs <runId>`.
 - A failed run is not a new node. Repair and relaunch the same experiment as
@@ -115,12 +119,13 @@ orx exp wait <expId> --interval 10 --timeout 3600
 
 ### Going idle instead — `orx exp wake`
 
-After launching, use `orx exp wake <expId>` when you want to end the turn and
-resume after that run succeeds or fails. Wake-up is opt-in, fires only for
-`done` or `failed`, and waits behind queued user messages. If orx cannot
-monitor a live Slurm run for over a minute, it tells you once per outage; the
-final wake-up comes once orx can see the run finish. Use either wait or wake
-for a run, not both.
+Wake-ups are automatic: every run launched from this chat wakes it when the run
+succeeds or fails, so you can end your turn right after launching. Use
+`orx exp wake <expId>` only for a run this chat did not launch. Wake-ups fire only for
+`done` or `failed` and wait behind queued user messages. If orx cannot monitor
+a live Slurm run for over a minute, it tells you once per outage; the final
+wake-up comes once orx can see the run finish. A wait that sees the run finish
+replaces its wake-up, so you are not woken twice for one result.
 
 ## Sizing compute
 
