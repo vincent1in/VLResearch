@@ -10,3 +10,8 @@
 # be treated as text and normalized.
 *.pt binary
 *.pkl binary
+
+# VLResearch: README.md is this distribution's own; upstream's README edits are
+# never merged into it. Needs `git config merge.ours.driver true` (the sync
+# script sets it).
+README.md merge=ours
