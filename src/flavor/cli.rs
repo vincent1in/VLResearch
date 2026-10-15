@@ -13,6 +13,9 @@ use crate::store::Store;
 pub(crate) enum FlavorCommand {
     /// Record and compare run metrics (`ORX_METRIC {json}` lines in run output).
     Metric(MetricArgs),
+    /// Queue ideas to try, each with a forecast, a cost and a kill test, and
+    /// record what each did.
+    Idea(IdeaArgs),
 }
 
 impl FlavorCommand {
@@ -20,8 +23,130 @@ impl FlavorCommand {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             FlavorCommand::Metric(_) => "metric",
+            FlavorCommand::Idea(_) => "idea",
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct IdeaArgs {
+    #[command(subcommand)]
+    pub command: IdeaCommand,
+}
+
+/// Fields shared by `idea add` and `idea edit`.
+#[derive(Args, Debug, Default)]
+pub(crate) struct IdeaFieldArgs {
+    /// What kind of work it is.
+    #[arg(long, value_enum)]
+    pub kind: Option<super::ideas::Kind>,
+    /// How it relates to what has been tried.
+    #[arg(long, value_enum)]
+    pub class: Option<super::ideas::Class>,
+    /// 1 (most urgent) to 3.
+    #[arg(long)]
+    pub priority: Option<i64>,
+    /// What should happen and why.
+    #[arg(long)]
+    pub hypothesis: Option<String>,
+    /// The cheap test (under about a GPU-hour) whose negative result kills it.
+    #[arg(long)]
+    pub kill_test: Option<String>,
+    /// Forecast change in the primary metric, in its units and sign.
+    #[arg(long, allow_negative_numbers = true)]
+    pub forecast: Option<f64>,
+    /// The forecast's 80% interval.
+    #[arg(long, num_args = 2, value_names = ["LOW", "HIGH"], allow_negative_numbers = true)]
+    pub interval: Option<Vec<f64>>,
+    /// Expected compute in GPU-hours.
+    #[arg(long, value_name = "HOURS")]
+    pub cost_hours: Option<f64>,
+    /// An idea that has to close before this one can start.
+    #[arg(long, value_name = "IDEA_ID")]
+    pub blocked_by: Option<String>,
+    /// Who proposed it. Defaults to agent inside a chat, user otherwise.
+    #[arg(long, value_enum)]
+    pub author: Option<super::ideas::Author>,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum IdeaCommand {
+    /// Add an idea to a project's queue.
+    Add {
+        project_id: String,
+        title: String,
+        #[command(flatten)]
+        fields: IdeaFieldArgs,
+    },
+    /// Change an idea's fields; anything not given stays as it is.
+    Edit {
+        idea_id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[command(flatten)]
+        fields: IdeaFieldArgs,
+    },
+    /// A project's open and running ideas; `--all` adds closed ones.
+    List {
+        project_id: String,
+        #[arg(long)]
+        all: bool,
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One idea in full.
+    Show {
+        idea_id: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The idea to work on next, and why.
+    Next {
+        project_id: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record that an experiment tests the idea.
+    Start {
+        idea_id: String,
+        experiment_id: String,
+    },
+    /// Close a tested idea. It is kept when its experiment beat the parent by
+    /// more than the noise floor and refuted otherwise, unless `--kept` or
+    /// `--refuted` says so.
+    Done {
+        idea_id: String,
+        /// What showed it: run ids, numbers, a sentence.
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long, conflicts_with = "refuted")]
+        kept: bool,
+        #[arg(long)]
+        refuted: bool,
+    },
+    /// Close an idea whose kill test fired.
+    Kill {
+        idea_id: String,
+        /// What the kill test showed.
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Close an idea without testing it.
+    Drop {
+        idea_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// How well tested ideas' forecasts held up.
+    Calibration {
+        project_id: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -77,11 +202,13 @@ pub(crate) enum MetricCommand {
 }
 
 pub(crate) async fn run(command: FlavorCommand) -> Result<()> {
-    match command {
-        FlavorCommand::Metric(args) => tokio::task::spawn_blocking(move || metric(args.command))
-            .await
-            .map_err(|error| anyhow!("orx metric stopped unexpectedly: {error}"))?,
-    }
+    let name = command.name();
+    tokio::task::spawn_blocking(move || match command {
+        FlavorCommand::Metric(args) => metric(args.command),
+        FlavorCommand::Idea(args) => super::idea_cli::run(args.command),
+    })
+    .await
+    .map_err(|error| anyhow!("orx {name} stopped unexpectedly: {error}"))?
 }
 
 /// Whether a tokenized `orx …` call only reads, for Claude's plan-mode gate.
@@ -90,12 +217,19 @@ pub(crate) fn is_readonly(tokens: &[&str]) -> bool {
     match crate::Cli::try_parse_from(tokens) {
         Ok(cli) => matches!(
             cli.command,
-            Some(crate::Command::Flavor(FlavorCommand::Metric(MetricArgs {
-                command: MetricCommand::Show { .. }
-                    | MetricCommand::Runs { .. }
-                    | MetricCommand::Best { .. }
-                    | MetricCommand::Primary { key: None, .. },
-            })))
+            Some(crate::Command::Flavor(
+                FlavorCommand::Metric(MetricArgs {
+                    command: MetricCommand::Show { .. }
+                        | MetricCommand::Runs { .. }
+                        | MetricCommand::Best { .. }
+                        | MetricCommand::Primary { key: None, .. },
+                }) | FlavorCommand::Idea(IdeaArgs {
+                    command: IdeaCommand::List { .. }
+                        | IdeaCommand::Show { .. }
+                        | IdeaCommand::Next { .. }
+                        | IdeaCommand::Calibration { .. },
+                })
+            ))
         ),
         Err(error) => matches!(error.kind(), clap::error::ErrorKind::DisplayHelp),
     }
@@ -392,21 +526,31 @@ fn best(store: &Store, project_id: &str, json: bool) -> Result<()> {
     if path.len() > 1 {
         println!("\nPath from the baseline:");
         let column = metric.key.to_uppercase();
+        let with_ideas = path.iter().any(|step| step.idea.is_some());
         let rows: Vec<Vec<String>> = path
             .iter()
             .map(|step| {
-                vec![
-                    step.experiment.clone(),
+                let mut row = vec![step.experiment.clone()];
+                if with_ideas {
+                    row.push(step.idea.clone().unwrap_or_default());
+                }
+                row.extend([
                     step.run_id.clone().unwrap_or_else(|| "—".to_string()),
                     step.score.map_or_else(
                         || "—".to_string(),
                         |score| metrics::format_value(Some(score)),
                     ),
                     step.delta.map(signed).unwrap_or_default(),
-                ]
+                ]);
+                row
             })
             .collect();
-        print_table(&["EXPERIMENT", "RUN", &column, "CHANGE"], &rows);
+        let mut headers = vec!["EXPERIMENT"];
+        if with_ideas {
+            headers.push("IDEA");
+        }
+        headers.extend(["RUN", &column, "CHANGE"]);
+        print_table(&headers, &rows);
     }
     Ok(())
 }
@@ -432,6 +576,10 @@ mod tests {
             "orx metric best proj_1 --json",
             "orx metric primary proj_1",
             "orx metric --help",
+            "orx idea list proj_1 --all",
+            "orx idea show idea_1",
+            "orx idea next proj_1",
+            "orx idea calibration proj_1 --json",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();
             assert!(is_readonly(&tokens), "{call}");
@@ -440,6 +588,9 @@ mod tests {
             "orx metric primary proj_1 val_ic --maximize",
             "orx metric bogus",
             "orx exp run exp_1",
+            "orx idea add proj_1 Volume",
+            "orx idea done idea_1",
+            "orx idea start idea_1 exp_1",
         ] {
             let tokens: Vec<&str> = call.split_whitespace().collect();
             assert!(!is_readonly(&tokens), "{call}");

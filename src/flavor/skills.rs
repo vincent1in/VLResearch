@@ -1,6 +1,6 @@
 //! Agent skills VLResearch adds to upstream's bundled set. Each is a complete
-//! skill package under `agent-skills/`, registered in
-//! `local::agent_skills::skills` by a hook line.
+//! skill package under `agent-skills/`; `local::agent_skills::skills` hands
+//! its lists to [`add_to`] (one hook line).
 
 use crate::local::agent_skills::{AgentSkill, AgentSkillResource};
 
@@ -14,8 +14,49 @@ pub(crate) const METRICS: AgentSkill = AgentSkill {
     }],
 };
 
+pub(crate) const IDEAS: AgentSkill = AgentSkill {
+    name: "orx-ideas",
+    description: "Queue and track ideas with `orx idea`: forecasts with 80% intervals, GPU-hour costs, kill tests, blockers and measured outcomes. Use before proposing or starting an experiment, when deciding what to try next, after a run finishes, and when the user asks what has been tried or what worked.",
+    content: include_str!("../../agent-skills/orx-ideas/SKILL.md"),
+    resources: &[],
+};
+
+/// VLResearch's skills, in the order they are listed.
+const SKILLS: [&AgentSkill; 2] = [&METRICS, &IDEAS];
+
+/// Adds VLResearch's skills to an upstream skill list, right after
+/// `orx-results` (or at the end if upstream renames it).
+pub(crate) fn add_to(skills: &mut Vec<&'static AgentSkill>) {
+    let at = skills
+        .iter()
+        .position(|skill| skill.name == "orx-results")
+        .map_or(skills.len(), |index| index + 1);
+    for (offset, skill) in SKILLS.into_iter().enumerate() {
+        if skills.iter().all(|existing| existing.name != skill.name) {
+            skills.insert(at + offset, skill);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::local::agent_skills::{skills, SkillSet};
+
+    #[test]
+    fn both_sets_list_the_skills_after_results() {
+        for set in [SkillSet::Local, SkillSet::Full] {
+            let names: Vec<_> = skills(set).iter().map(|skill| skill.name).collect();
+            let results = names
+                .iter()
+                .position(|name| *name == "orx-results")
+                .unwrap();
+            assert_eq!(
+                names[results + 1..results + 3],
+                ["orx-metrics", "orx-ideas"]
+            );
+        }
+    }
+
     #[test]
     fn the_metrics_helper_prints_what_the_ledger_parses() {
         // The helper's own format string, applied to a typical record.

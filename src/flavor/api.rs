@@ -24,6 +24,29 @@ where
             "/api/vlresearch/projects/{id}/metrics",
             get(project_metrics),
         )
+        .route("/api/vlresearch/projects/{id}/ideas", get(project_ideas))
+}
+
+/// The project's idea queue, the selector's next pick, and how well forecasts
+/// have held up. Ideas carry ids for the dashboard's own use; it shows titles.
+async fn project_ideas(Path(project_id): Path<String>) -> ApiResult {
+    let body = tokio::task::spawn_blocking(move || -> crate::error::Result<Option<Value>> {
+        let store = Store::open()?;
+        let Some(project) = store.get_local_project(&project_id)? else {
+            return Ok(None);
+        };
+        let ideas = super::ideas::list(&store, &project.id)?;
+        Ok(Some(json!({
+            "next": super::ideas::next(&store, &project.id)?,
+            "calibration": super::ideas::calibration(&ideas),
+            "ideas": ideas,
+        })))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    body.map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))
 }
 
 /// What the chat's progress strip shows beyond the transcript: when the agent

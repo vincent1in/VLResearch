@@ -251,7 +251,7 @@ const S_FEEDBACK: AgentSkill = AgentSkill {
 /// The modules for a given set, in a stable order. Full adds `create`; every
 /// shared module uses the same canonical `SKILL.md`.
 pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
-    match set {
+    let mut skills = match set {
         SkillSet::Local => vec![
             &S_EXPERIMENT_TREE,
             &S_GIT,
@@ -260,7 +260,6 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_INSTANCES,
             &S_LOGS,
             &S_RESULTS,
-            &crate::flavor::skills::METRICS, // VLResearch
             &S_REPORTS,
             &S_FIGURES,
             &S_PAPER,
@@ -277,7 +276,6 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_INSTANCES,
             &S_LOGS,
             &S_RESULTS,
-            &crate::flavor::skills::METRICS, // VLResearch
             &S_REPORTS,
             &S_FIGURES,
             &S_PAPER,
@@ -285,7 +283,9 @@ pub fn skills(set: SkillSet) -> Vec<&'static AgentSkill> {
             &S_LIT,
             &S_FEEDBACK,
         ],
-    }
+    };
+    crate::flavor::skills::add_to(&mut skills); // VLResearch: this distribution's skills.
+    skills
 }
 
 /// Resolve a bundled skill by name within `set`, accepting both the public name

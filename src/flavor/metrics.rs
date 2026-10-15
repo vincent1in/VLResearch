@@ -630,6 +630,8 @@ pub(crate) fn running_best(runs: &[ScoredRun], metric: &PrimaryMetric) -> Standi
 pub(crate) struct PathStep {
     pub experiment_id: String,
     pub experiment: String,
+    /// The title of the idea the experiment tested, when one is linked.
+    pub idea: Option<String>,
     /// The experiment's best finished run.
     pub run_id: Option<String>,
     pub score: Option<f64>,
@@ -691,6 +693,7 @@ pub(crate) fn lineage(
                 .get(&id)
                 .map(display_name)
                 .unwrap_or_else(|| id.clone()),
+            idea: None,
             run_id: best_run.map(|(run, _)| run.run_id.clone()),
             experiment_id: id,
             score,
@@ -709,10 +712,14 @@ pub(crate) fn standing(
 ) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
     let runs = scored_runs(store, project_id, &metric.key)?;
     let mut standing = running_best(&runs, metric);
-    let path = match &standing.best {
+    let mut path = match &standing.best {
         Some(best) => lineage(store, project_id, &best.experiment_id, &runs, metric)?,
         None => Vec::new(),
     };
+    let ideas = super::ideas::titles_by_experiment(store, project_id)?;
+    for step in &mut path {
+        step.idea = ideas.get(&step.experiment_id).cloned();
+    }
     if let Some(root) = path.first() {
         standing.baseline = root
             .run_id
