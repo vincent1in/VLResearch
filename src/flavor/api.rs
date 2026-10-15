@@ -150,6 +150,7 @@ fn brief_body(store: &Store, brief: &Brief) -> crate::error::Result<Value> {
     Ok(json!({
         "brief": brief,
         "primary": super::metrics::primary(store, &brief.id)?,
+        "guards": super::metrics::guards(store, &brief.id)?,
         "usage": super::scope::usage(store, brief)?,
         "missing": super::scope::missing(store, brief)?,
     }))

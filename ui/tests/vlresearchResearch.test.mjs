@@ -291,6 +291,11 @@ test("the setup form turns into the brief, metric and ideas the endpoints take",
     budgetDays: "14",
     stopRule: "No gain in 5 runs",
     pointers: "Volume features first",
+    guards: [
+      { key: " turnover ", max: "2", min: "", split: "" },
+      { key: "", max: "", min: "", split: "" },
+      { key: "drawdown", max: "0.2", min: "−0.5", split: " val " },
+    ],
     ideas: [{ title: "Volume features", forecast: "0.003" }, { title: "  ", forecast: "" }, { title: "Lagged returns", forecast: "" }],
   };
   assert.deepEqual(setupProblems(draft), {});
@@ -307,7 +312,13 @@ test("the setup form turns into the brief, metric and ideas the endpoints take",
     sources: null,
     stopRule: "No gain in 5 runs",
     metric: { key: "val_ic", direction: "max", noiseFloor: 0.002, split: null },
+    guards: [
+      { key: "turnover", max: 2, min: null, split: null },
+      { key: "drawdown", max: 0.2, min: -0.5, split: "val" },
+    ],
   });
+  // A form with no guards sends an empty list, which removes any it had.
+  assert.deepEqual(briefPayload(emptyDraft()).guards, []);
   assert.deepEqual(ideaPayloads(draft), [
     { title: "Volume features", forecast: 0.003 },
     { title: "Lagged returns", forecast: null },
@@ -318,6 +329,18 @@ test("the setup form turns into the brief, metric and ideas the endpoints take",
   // A typographic minus is a minus.
   assert.deepEqual(setupProblems({ ...draft, ideas: [{ title: "x", forecast: "\u22120.001" }] }), {});
   assert.equal(briefPayload({ ...draft, metricKey: " " }).metric, null);
+});
+
+test("guards are checked as the server checks them", () => {
+  const guard = (key, max, min = "", split = "") => ({ key, max, min, split });
+  const problem = (...guards) => setupProblems({ ...emptyDraft(), objective: "x", metricKey: "ic", guards }).guards;
+  assert.equal(problem(guard("turnover", "2"), guard("drawdown", "", "-0.5")), undefined);
+  assert.equal(problem(guard("", "", "")), undefined, "a blank row is ignored");
+  assert.match(problem(guard("", "2")), /Name the metric/);
+  assert.match(problem(guard("turnover", "")), /upper bound, a lower bound or both/);
+  assert.match(problem(guard("turnover", "lots")), /are numbers/);
+  assert.match(problem(guard("turnover", "1", "2")), /lower bound above its upper bound/);
+  assert.match(problem(guard("turnover", "2"), guard(" turnover", "", "0")), /turnover has two guards/);
 });
 
 test("a seed forecast that moves the metric the wrong way is flagged", () => {
@@ -347,9 +370,14 @@ test("editing starts from the saved brief", () => {
       sources: null, stopRule: "5 flat runs", confirmedAt: null, confirmedBy: null, chatSessionId: null, updatedAt: 1,
     },
     primary: { key: "val_loss", direction: "min", noiseFloor: 0.01, split: "val" },
+    guards: [{ key: "turnover", split: null, max: 2, min: null }, { key: "drawdown", split: "val", max: 0.2, min: -0.5 }],
     usage: null,
     missing: [],
   });
+  assert.deepEqual(draft.guards, [
+    { key: "turnover", max: "2", min: "", split: "" },
+    { key: "drawdown", max: "0.2", min: "-0.5", split: "val" },
+  ]);
   assert.equal(draft.metricKey, "val_loss");
   assert.equal(draft.direction, "min");
   assert.equal(draft.noiseFloor, "0.01");
@@ -359,7 +387,9 @@ test("editing starts from the saved brief", () => {
   assert.equal(draft.budgetRuns, "20");
   assert.equal(draft.budgetGpuHours, "");
   assert.deepEqual(draft.ideas, [{ title: "", forecast: "" }]);
-  assert.equal(draftFromBrief({ brief: null, primary: null, usage: null, missing: [] }).objective, "");
+  const blank = draftFromBrief({ brief: null, primary: null, guards: [], usage: null, missing: [] });
+  assert.equal(blank.objective, "");
+  assert.deepEqual(blank.guards, []);
 });
 
 test("the started chat is told where the brief is and what comes next", () => {
@@ -374,15 +404,18 @@ test("the started chat is told where the brief is and what comes next", () => {
   assert.match(CONFIRMED_MESSAGE, /orx-improve/);
 });
 
-test("the brief payload carries pointers, the chat link and the metric", () => {
-  const { brief, primary } = parseBrief({
+test("the brief payload carries pointers, the chat link, the metric and the guards", () => {
+  const { brief, primary, guards } = parseBrief({
     brief: { objective: "x", locked: [], pointers: "Volume", sources: "/data/opt", chatSessionId: "chat_1" },
     primary: { key: "val_ic", direction: "max", noiseFloor: null, split: null },
+    guards: [{ key: "turnover", split: null, max: 2, min: null }, { max: 1 }],
   });
   assert.equal(brief?.pointers, "Volume");
   assert.equal(brief?.sources, "/data/opt");
   assert.equal(brief?.chatSessionId, "chat_1");
   assert.equal(primary?.key, "val_ic");
+  assert.deepEqual(guards, [{ key: "turnover", split: null, max: 2, min: null }], "a guard without a key is dropped");
+  assert.deepEqual(parseBrief({}).guards, []);
 });
 
 test("side chats open with a question that names the item and its id", () => {

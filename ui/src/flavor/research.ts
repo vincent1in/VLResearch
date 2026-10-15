@@ -184,6 +184,7 @@ export interface Usage {
 export interface BriefPayload {
   brief: Brief | null;
   primary: PrimaryMetric | null;
+  guards: Guard[];
   usage: Usage | null;
   missing: string[];
 }
@@ -226,6 +227,13 @@ function readPrimary(value: unknown): PrimaryMetric | null {
     noiseFloor: number(value.noiseFloor),
     split: text(value.split),
   };
+}
+
+function readGuards(value: unknown): Guard[] {
+  return list(value).flatMap((guard): Guard[] => {
+    if (!isObject(guard) || typeof guard.key !== "string") return [];
+    return [{ key: guard.key, split: text(guard.split), max: number(guard.max), min: number(guard.min) }];
+  });
 }
 
 function readRun(value: unknown): ScoredRun | null {
@@ -288,10 +296,7 @@ export function parseMetrics(value: unknown): MetricsPayload {
   const trials = isObject(body.trials)
     ? { runs: number(body.trials.runs) ?? 0, ideasTested: number(body.trials.ideasTested) ?? 0, ideasKept: number(body.trials.ideasKept) ?? 0 }
     : null;
-  const guards = list(body.guards).flatMap((guard): Guard[] => {
-    if (!isObject(guard) || typeof guard.key !== "string") return [];
-    return [{ key: guard.key, split: text(guard.split), max: number(guard.max), min: number(guard.min) }];
-  });
+  const guards = readGuards(body.guards);
   const breaches = list(body.breaches).flatMap((breach): Breach[] => {
     if (!isObject(breach) || typeof breach.experimentId !== "string") return [];
     return [{ experimentId: breach.experimentId, experiment: text(breach.experiment) ?? breach.experimentId, reason: text(breach.reason) ?? "" }];
@@ -401,6 +406,7 @@ export function parseBrief(value: unknown): BriefPayload {
   return {
     brief,
     primary: readPrimary(body.primary),
+    guards: readGuards(body.guards),
     usage,
     missing: list(body.missing).flatMap((item) => (typeof item === "string" ? [plainMissing(item)] : [])),
   };
@@ -468,7 +474,6 @@ export function parseFindings(value: unknown): FindingRow[] {
 
 // --- numbers --------------------------------------------------------------------
 
-/** The metric's value the way `orx metric` prints it: about five significant digits. */
 /** A guard in words: "output_diff at most 0". */
 export function guardText(guard: Guard): string {
   const bounds =
@@ -482,6 +487,7 @@ export function guardText(guard: Guard): string {
   return `${guard.key}${guard.split ? ` (${guard.split})` : ""} ${bounds}`;
 }
 
+/** The metric's value the way `orx metric` prints it: about five significant digits. */
 export function formatValue(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "–";
   if (value === 0) return "0";
@@ -809,6 +815,14 @@ export interface SetupIdea {
   forecast: string;
 }
 
+/** A guard typed into the setup form: its bounds as typed, blank when unbounded. */
+export interface SetupGuard {
+  key: string;
+  max: string;
+  min: string;
+  split: string;
+}
+
 /** The setup form as typed: strings until saved. */
 export interface SetupDraft {
   objective: string;
@@ -828,6 +842,8 @@ export interface SetupDraft {
   stopRule: string;
   pointers: string;
   sources: string;
+  /** Every guard the optimization keeps. */
+  guards: SetupGuard[];
   /** New seed ideas; ideas already queued stay as they are. */
   ideas: SetupIdea[];
 }
@@ -849,15 +865,18 @@ export function emptyDraft(): SetupDraft {
     stopRule: "",
     pointers: "",
     sources: "",
+    guards: [],
     ideas: [{ title: "", forecast: "" }],
   };
 }
+
+export const EMPTY_GUARD: SetupGuard = { key: "", max: "", min: "", split: "" };
 
 const shown = (value: number | null) => (value === null ? "" : String(value));
 
 /** The form filled in from a saved brief, to edit it. */
 export function draftFromBrief(payload: BriefPayload): SetupDraft {
-  const { brief, primary } = payload;
+  const { brief, primary, guards } = payload;
   return {
     ...emptyDraft(),
     objective: brief?.objective ?? "",
@@ -875,6 +894,7 @@ export function draftFromBrief(payload: BriefPayload): SetupDraft {
     stopRule: brief?.stopRule ?? "",
     pointers: brief?.pointers ?? "",
     sources: brief?.sources ?? "",
+    guards: (guards ?? []).map((guard) => ({ key: guard.key, max: shown(guard.max), min: shown(guard.min), split: guard.split ?? "" })),
     ideas: [{ title: "", forecast: "" }],
   };
 }
@@ -896,7 +916,30 @@ export interface SetupProblems {
   metricKey?: string;
   noiseFloor?: string;
   budget?: string;
+  guards?: string;
   ideas?: string;
+}
+
+const anyNumber = () => true;
+
+/** What is wrong with the typed guards, checked as the server checks them. */
+function guardProblem(guards: readonly SetupGuard[]): string | undefined {
+  const seen = new Set<string>();
+  for (const guard of guards) {
+    const key = guard.key.trim();
+    if (!key) {
+      if ([guard.max, guard.min, guard.split].some((typed) => typed.trim())) return "Name the metric each guard bounds.";
+      continue;
+    }
+    if (seen.has(key)) return `${key} has two guards. Give it one, with both bounds if it needs them.`;
+    seen.add(key);
+    const max = parseNumber(guard.max, anyNumber);
+    const min = parseNumber(guard.min, anyNumber);
+    if (!max.ok || !min.ok) return `The bounds of the guard on ${key} are numbers.`;
+    if (max.value === null && min.value === null) return `Give the guard on ${key} an upper bound, a lower bound or both.`;
+    if (max.value !== null && min.value !== null && min.value > max.value) return `The guard on ${key} has its lower bound above its upper bound.`;
+  }
+  return undefined;
 }
 
 /** What has to be fixed before the form can be saved. */
@@ -911,7 +954,9 @@ export function setupProblems(draft: SetupDraft): SetupProblems {
     parseNumber(draft.budgetDays, positive),
   ];
   if (budgets.some((parsed) => !parsed.ok)) problems.budget = "Budgets are positive numbers, and runs a whole number.";
-  if (draft.ideas.some((idea) => idea.title.trim() && !parseNumber(idea.forecast, () => true).ok)) {
+  const guards = guardProblem(draft.guards);
+  if (guards) problems.guards = guards;
+  if (draft.ideas.some((idea) => idea.title.trim() && !parseNumber(idea.forecast, anyNumber).ok)) {
     problems.ideas = "A forecast is a number: the change you expect in the metric.";
   }
   return problems;
@@ -943,13 +988,19 @@ export function briefPayload(draft: SetupDraft) {
           split: textOrNull(draft.split),
         }
       : null,
+    // Every guard, so one removed from the form is removed from the optimization.
+    guards: draft.guards.flatMap((guard) => {
+      const key = guard.key.trim();
+      if (!key) return [];
+      return [{ key, max: value(parseNumber(guard.max, anyNumber)), min: value(parseNumber(guard.min, anyNumber)), split: textOrNull(guard.split) }];
+    }),
   };
 }
 
 /** The body for POST /api/vlresearch/optimizations/{id}/ideas, or null for a blank row. */
 export function ideaPayload(idea: SetupIdea) {
   const title = idea.title.trim();
-  return title ? { title, forecast: value(parseNumber(idea.forecast, () => true)) } : null;
+  return title ? { title, forecast: value(parseNumber(idea.forecast, anyNumber)) } : null;
 }
 
 /** The bodies for POST /api/vlresearch/optimizations/{id}/ideas, one per typed idea. */

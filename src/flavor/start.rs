@@ -1,14 +1,15 @@
 //! Starting auto-research from the dashboard. The Research view's form starts
-//! an optimization with its whole brief at once (with the primary metric),
-//! adds the seed ideas, links the chat it starts, and lets the user confirm
-//! the brief with a button; it edits an optimization's brief the same way.
+//! an optimization with its whole brief at once (with the primary metric and
+//! guards), adds the seed ideas, links the chat it starts, and lets the user
+//! confirm the brief with a button; it edits an optimization's brief the same
+//! way.
 //! The rules are the CLI's: any change reopens a confirmed brief, confirming
 //! needs everything `scope::missing` lists, and nothing here launches compute.
 
 use serde::Deserialize;
 
 use super::ideas::{self, Author, Class, Idea, IdeaFields, Kind};
-use super::metrics::{self, Direction, PrimaryMetric};
+use super::metrics::{self, Direction, Guard, PrimaryMetric};
 use super::scope::{self, Brief, BriefFields};
 use crate::error::{anyhow, Result};
 use crate::store::Store;
@@ -33,6 +34,9 @@ pub(crate) struct BriefDraft {
     pub sources: Option<String>,
     pub stop_rule: Option<String>,
     pub metric: Option<MetricDraft>,
+    /// Every guard the optimization keeps, replacing the ones it had; `None`
+    /// leaves them as they are.
+    pub guards: Option<Vec<GuardDraft>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +47,24 @@ pub(crate) struct MetricDraft {
     pub direction: String,
     pub noise_floor: Option<f64>,
     pub split: Option<String>,
+}
+
+/// A guard as the form holds it: a key an experiment must keep within an
+/// upper bound, a lower bound or both.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GuardDraft {
+    pub key: String,
+    pub max: Option<f64>,
+    pub min: Option<f64>,
+    /// The split to read the key in, when runs report it under several.
+    pub split: Option<String>,
+}
+
+/// A draft's primary metric and guards, checked before anything is written.
+struct Checked {
+    metric: Option<PrimaryMetric>,
+    guards: Option<Vec<Guard>>,
 }
 
 /// An idea typed into the dashboard.
@@ -62,27 +84,27 @@ pub(crate) struct IdeaDraft {
 /// Starts an optimization in the project with the brief the form holds. The
 /// draft is checked first, so a refused one starts nothing.
 pub(crate) fn create(store: &Store, project_id: &str, draft: BriefDraft) -> Result<Brief> {
-    let metric = check(store, project_id, &draft, None)?;
+    let checked = check(store, project_id, &draft, None)?;
     let brief = scope::create(store, project_id, None)?;
-    apply(store, &brief, draft, metric)
+    apply(store, &brief, draft, checked)
 }
 
-/// Saves an optimization's brief as the form holds it, and its primary metric.
-/// The draft is checked first, so a refused one saves nothing.
+/// Saves an optimization's brief as the form holds it, with its primary metric
+/// and guards. The draft is checked first, so a refused one saves nothing.
 pub(crate) fn save_brief(store: &Store, optimization_id: &str, draft: BriefDraft) -> Result<Brief> {
     let brief = scope::require(store, optimization_id)?;
-    let metric = check(store, &brief.project_id, &draft, Some(&brief))?;
-    apply(store, &brief, draft, metric)
+    let checked = check(store, &brief.project_id, &draft, Some(&brief))?;
+    apply(store, &brief, draft, checked)
 }
 
-/// The draft's metric, checked, and its budgets and paths checked before
-/// anything is written.
+/// The draft's metric and guards, and its budgets, checked before anything is
+/// written.
 fn check(
     store: &Store,
     project_id: &str,
     draft: &BriefDraft,
     current: Option<&Brief>,
-) -> Result<Option<PrimaryMetric>> {
+) -> Result<Checked> {
     if draft.budget_runs.is_some_and(|runs| runs < 1) {
         return Err(anyhow!("A run budget is at least 1."));
     }
@@ -94,19 +116,57 @@ fn check(
             return Err(anyhow!("A {name} budget must be a positive number."));
         }
     }
-    draft
+    let metric = draft
         .metric
         .as_ref()
         .map(|metric| primary_metric(store, project_id, metric, current))
-        .transpose()
+        .transpose()?;
+    let guards = draft.guards.as_deref().map(guards).transpose()?;
+    Ok(Checked { metric, guards })
 }
 
-fn apply(
-    store: &Store,
-    brief: &Brief,
-    draft: BriefDraft,
-    metric: Option<PrimaryMetric>,
-) -> Result<Brief> {
+/// The form's guards, checked the way `orx metric guard` checks one, and one
+/// per key.
+fn guards(drafts: &[GuardDraft]) -> Result<Vec<Guard>> {
+    let mut guards: Vec<Guard> = Vec::new();
+    for draft in drafts {
+        let key = draft.key.trim();
+        if key.is_empty() {
+            return Err(anyhow!("Name the metric each guard bounds."));
+        }
+        if guards.iter().any(|guard| guard.key == key) {
+            return Err(anyhow!(
+                "{key} has two guards. Give it one, with both bounds if it needs them."
+            ));
+        }
+        if draft.max.is_none() && draft.min.is_none() {
+            return Err(anyhow!(
+                "Give the guard on {key} an upper bound, a lower bound or both."
+            ));
+        }
+        if let (Some(min), Some(max)) = (draft.min, draft.max) {
+            if min > max {
+                return Err(anyhow!(
+                    "The guard on {key} has its lower bound above its upper bound."
+                ));
+            }
+        }
+        guards.push(Guard {
+            key: key.to_owned(),
+            split: draft
+                .split
+                .as_deref()
+                .map(str::trim)
+                .filter(|split| !split.is_empty())
+                .map(str::to_owned),
+            max: draft.max,
+            min: draft.min,
+        });
+    }
+    Ok(guards)
+}
+
+fn apply(store: &Store, brief: &Brief, draft: BriefDraft, checked: Checked) -> Result<Brief> {
     let blank = |value: Option<String>| Some(value.unwrap_or_default());
     let paths = |paths: Vec<String>| -> Vec<String> {
         paths
@@ -139,8 +199,18 @@ fn apply(
             stop_rule: blank(draft.stop_rule),
         },
     )?;
-    if let Some(metric) = metric {
+    if let Some(metric) = checked.metric {
         metrics::set_primary(store, &brief.id, &metric)?;
+    }
+    if let Some(guards) = checked.guards {
+        for current in metrics::guards(store, &brief.id)? {
+            if !guards.iter().any(|guard| guard.key == current.key) {
+                metrics::remove_guard(store, &brief.id, &current.key)?;
+            }
+        }
+        for guard in &guards {
+            metrics::set_guard(store, &brief.id, guard)?;
+        }
     }
     Ok(saved)
 }
@@ -257,7 +327,9 @@ pub(crate) fn link_chat(store: &Store, optimization_id: &str, session_id: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{add_idea, create, link_chat, save_brief, BriefDraft, IdeaDraft, MetricDraft};
+    use super::{
+        add_idea, create, link_chat, save_brief, BriefDraft, GuardDraft, IdeaDraft, MetricDraft,
+    };
     use crate::flavor::{ideas, metrics, scope};
     use crate::store::{Store, StoredChatSession, StoredRun};
 
@@ -434,6 +506,74 @@ mod tests {
                 .as_deref(),
             Some("val")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_form_sets_and_replaces_the_guards() {
+        let (store, dir) = temp_store();
+        let guard = |key: &str, max: Option<f64>, min: Option<f64>| GuardDraft {
+            key: key.into(),
+            max,
+            min,
+            split: None,
+        };
+        let draft = |guards: Option<Vec<GuardDraft>>| BriefDraft {
+            objective: Some("Cut backtest time".into()),
+            metric: metric("backtest_seconds", "min"),
+            guards,
+            ..BriefDraft::default()
+        };
+        let opt = create(
+            &store,
+            "p",
+            draft(Some(vec![
+                guard(" output_diff ", Some(0.0), None),
+                GuardDraft {
+                    split: Some(" val ".into()),
+                    ..guard("val_ic", None, Some(0.02))
+                },
+            ])),
+        )
+        .unwrap();
+        let saved = metrics::guards(&store, &opt.id).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(
+            (saved[0].key.as_str(), saved[0].max, saved[0].min),
+            ("output_diff", Some(0.0), None)
+        );
+        assert_eq!(saved[1].split.as_deref(), Some("val"));
+
+        // A save that doesn't list guards leaves them; one that does replaces them.
+        save_brief(&store, &opt.id, draft(None)).unwrap();
+        assert_eq!(metrics::guards(&store, &opt.id).unwrap().len(), 2);
+        let both = guard("val_ic", Some(0.05), Some(0.01));
+        save_brief(&store, &opt.id, draft(Some(vec![both]))).unwrap();
+        let saved = metrics::guards(&store, &opt.id).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (saved[0].max, saved[0].min, saved[0].split.as_deref()),
+            (Some(0.05), Some(0.01), None)
+        );
+        save_brief(&store, &opt.id, draft(Some(Vec::new()))).unwrap();
+        assert!(metrics::guards(&store, &opt.id).unwrap().is_empty());
+
+        // A bad guard is refused, and a refused save changes nothing.
+        let turnover = guard("turnover", Some(2.0), None);
+        save_brief(&store, &opt.id, draft(Some(vec![turnover]))).unwrap();
+        for bad in [
+            vec![guard(" ", Some(1.0), None)],
+            vec![guard("turnover", None, None)],
+            vec![guard("turnover", Some(1.0), Some(2.0))],
+            vec![
+                guard("turnover", Some(1.0), None),
+                guard("turnover", None, Some(0.0)),
+            ],
+        ] {
+            assert!(save_brief(&store, &opt.id, draft(Some(bad))).is_err());
+        }
+        let saved = metrics::guards(&store, &opt.id).unwrap();
+        assert_eq!((saved.len(), saved[0].max), (1, Some(2.0)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

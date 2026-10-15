@@ -14,6 +14,7 @@ import { getUiStateQuery } from "../queries/projects";
 import { getHarnessesQuery } from "../queries/settings";
 import { taskLocation } from "../workspaceState";
 import {
+  EMPTY_GUARD,
   briefPayload,
   ideaPayload,
   parseBrief,
@@ -30,6 +31,13 @@ const TEXTAREA =
   "w-full min-h-16 rounded-md border border-border bg-background px-2.5 py-1.5 font-sans text-sm text-text outline-none placeholder:text-muted focus:border-text resize-y";
 const SELECT =
   "h-8 w-full rounded-md border border-border bg-background px-2 font-sans text-sm text-text outline-none focus:border-text";
+
+/** The typed parts of a guard after its metric, each under its label. */
+const GUARD_FIELDS = [
+  { field: "max", label: "At most", placeholder: "2" },
+  { field: "min", label: "At least", placeholder: "" },
+  { field: "split", label: "Split", placeholder: "" },
+] as const;
 
 /** Refetches everything the Research view shows about optimizations. */
 export function refreshResearch(queryClient: QueryClient) {
@@ -133,6 +141,11 @@ export function ResearchSetup({
     setDraft((current) => ({
       ...current,
       ideas: current.ideas.map((idea, at) => (at === index ? { ...idea, ...change } : idea)),
+    }));
+  const updateGuard = (index: number, change: Partial<SetupDraft["guards"][number]>) =>
+    setDraft((current) => ({
+      ...current,
+      guards: current.guards.map((guard, at) => (at === index ? { ...guard, ...change } : guard)),
     }));
 
   const refresh = () => refreshResearch(queryClient);
@@ -269,6 +282,56 @@ export function ResearchSetup({
           <Field label="Must not change">
             <textarea className={TEXTAREA} rows={2} value={draft.mustNotChange} placeholder="Evaluation code, split dates, the out-of-sample window" onChange={(event) => update("mustNotChange", event.target.value)} />
           </Field>
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-subtext">Guards (optional)</span>
+            {draft.guards.map((guard, index) => (
+              <div key={index} className="flex flex-col gap-1.5 rounded-md border border-border p-2">
+                <div className="flex items-center gap-2">
+                  <Input
+                    className="min-w-0 flex-1"
+                    list="vlr-metric-keys"
+                    value={guard.key}
+                    placeholder="turnover"
+                    aria-label="Guarded metric"
+                    onChange={(event) => updateGuard(index, { key: event.target.value })}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="small"
+                    aria-label="Remove this guard"
+                    onClick={() => setDraft((current) => ({ ...current, guards: current.guards.filter((_, at) => at !== index) }))}
+                  >
+                    <X size={13} />
+                  </Button>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {GUARD_FIELDS.map(({ field, label, placeholder }) => (
+                    <label key={field} className="flex min-w-0 flex-col gap-0.5">
+                      <span className="text-xs text-muted">{label}</span>
+                      <Input
+                        inputMode={field === "split" ? undefined : "decimal"}
+                        value={guard[field]}
+                        placeholder={placeholder}
+                        onChange={(event) => updateGuard(index, { [field]: event.target.value })}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {problems.guards ? (
+              <span className="text-xs text-accent-red">{problems.guards}</span>
+            ) : (
+              <span className="text-xs text-muted">
+                Other metrics an attempt must keep in bounds, such as turnover or drawdown. One that breaks a guard, or doesn't report its metric, can't be kept or become the best.
+              </span>
+            )}
+            <div>
+              <Button variant="ghost" size="small" onClick={() => setDraft((current) => ({ ...current, guards: [...current.guards, { ...EMPTY_GUARD }] }))}>
+                <Plus size={13} /> Add a guard
+              </Button>
+            </div>
+          </div>
           <Field label="Locked files and folders" hint="One per line, from the repository root. A run whose commit changes one is refused.">
             <textarea className={`${TEXTAREA} font-mono`} rows={2} value={draft.locked} placeholder={"eval/score.py\ndata/splits.yaml"} onChange={(event) => update("locked", event.target.value)} />
           </Field>

@@ -35,7 +35,7 @@ orx metric show <runId>         # everything one run reported
 orx metric guard <projectId> output_diff --max 0   # a bound another key must keep
 ```
 
-A guard holds what must not change while the primary metric improves: a speed-up's output must match the baseline's (`output_diff` at most 0), or turnover must stay under a cap. An experiment that breaks a guard, or doesn't report its key, can't be kept or become the best, whatever it gained.
+A guard holds what must not change while the primary metric improves: a speed-up's output must match the baseline's (`output_diff` at most 0), or turnover must stay under a cap. An experiment that breaks a guard, or doesn't report its key, can't be kept or become the best, whatever it gained. Guards can also be set under Limits in the Research view's brief form.
 
 A run's score is the last value it reported, and an experiment's is the mean of its finished runs, so have each run draw its own seed. A noise floor (`--noise-floor`) is the smallest gain worth keeping; leave it unset unless smaller gains wouldn't matter in practice. Choose a validation metric as primary, and keep test splits for final reports; when a key is reported under several splits, `orx metric primary` asks which one to score (`--split val`). Coding agents in VLResearch chats get these instructions as the `orx-metrics` skill.
 
