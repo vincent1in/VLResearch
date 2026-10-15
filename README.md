@@ -14,7 +14,7 @@ VLResearch is a distribution of [OpenResearch](https://github.com/alphaXiv/OpenR
 - **What was learned is kept.** Findings are claims with evidence: runs that support or refute them, links between claims, and verdicts that are added, never overwritten. Refuted claims stay, so every trial behind a best result is counted.
 - **Long chats keep going.** When a chat's context window is 80% full, orx compacts it as soon as the turn that filled it ends, so a long research loop doesn't run out of room in the middle of a task. The metrics, ideas, brief and findings live outside the chat, so compacting loses none of them.
 
-In the dashboard, a progress strip above each chat's composer shows the agent's checklist, how long since its last update, and the runs it waits on. The Experiments tab's Research view shows the running best against the baseline, what moved the score, the idea queue, the brief with its budget, and the findings.
+Planned next: dashboard views for chat progress, metrics, ideas, the brief and findings.
 
 ## Scoring runs
 
