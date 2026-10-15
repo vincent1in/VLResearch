@@ -30,9 +30,10 @@ orx idea add <projectId> "<title>" --class incremental \
 ## Pick, run, close
 
 1. `orx idea next <projectId>` picks what to do: open blockers first; then
-   the highest expected gain per GPU-hour, computed from each forecast and
-   interval; and an orthogonal idea after three incremental ones in a row or
-   three tested ideas that kept nothing.
+   checks on the current best (replicates, then ablations); then the highest
+   expected gain per GPU-hour, computed from each forecast and interval; and
+   an orthogonal idea after three incremental ones in a row or three tested
+   ideas that kept nothing.
 2. Create the experiment, then record the link:
    `orx idea start <ideaId> <expId>`.
 3. When its runs have finished:
@@ -45,12 +46,31 @@ orx idea add <projectId> "<title>" --class incremental \
 Close every idea you start. Refuted ideas are results too: they count the
 trials behind any "best" number, which is how its luck gets discounted.
 
+## Ablation checks
+
+When a kept idea's experiment becomes the project's best, orx queues up to
+two ablation ideas for the biggest earlier steps on its lineage path (the
+steps `orx metric best` lists), titled `Ablate "<step>" from the best`. Each
+forecasts that taking that step's change back out of the best loses what the
+step gained.
+
+- Build it as a child of the best experiment that reverts only that step's
+  change, start it, run it with the best's seeds, and close it with
+  `orx idea done` as usual.
+- It is confirmed when taking the step out costs more than the noise floor,
+  and refuted when it doesn't: then the steps interact, and the per-step
+  gains in `orx metric best` don't add up the way they look.
+- If a replicate shows the new best doesn't hold, drop its ablations.
+
 ## Learn from the record
 
 `orx idea calibration <projectId>` compares forecasts with outcomes. The mean
 error says whether your forecasts run high or low; the share of outcomes
 inside the 80% intervals says whether the intervals are too narrow (well
-under 80%) or too wide. Adjust new forecasts to match.
+under 80%) or too wide. Adjust new forecasts to match. Its table by class
+shows which kinds of idea (data, incremental, orthogonal, process) have paid
+off, as a hit rate and as gain per GPU-hour; lean the next proposals toward
+the classes that pay.
 
 `orx idea list <projectId> --all` shows everything tried, and
 `orx metric best <projectId>` shows which ideas built the current best.

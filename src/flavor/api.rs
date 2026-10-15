@@ -119,8 +119,9 @@ async fn project_brief(Path(project_id): Path<String>) -> ApiResult {
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".to_string()))
 }
 
-/// The project's idea queue, the selector's next pick, and how well forecasts
-/// have held up. Ideas carry ids for the dashboard's own use; it shows titles.
+/// The project's idea queue, the selector's next pick, how well forecasts
+/// have held up, and the idea-class scoreboard. Ideas carry ids for the
+/// dashboard's own use; it shows titles.
 async fn project_ideas(Path(project_id): Path<String>) -> ApiResult {
     let body = tokio::task::spawn_blocking(move || -> crate::error::Result<Option<Value>> {
         let store = Store::open()?;
@@ -128,9 +129,12 @@ async fn project_ideas(Path(project_id): Path<String>) -> ApiResult {
             return Ok(None);
         };
         let ideas = super::ideas::list(&store, &project.id)?;
+        let direction = super::metrics::primary(&store, &project.id)?
+            .map_or(super::metrics::Direction::Max, |metric| metric.direction);
         Ok(Some(json!({
             "next": super::ideas::next(&store, &project.id)?,
             "calibration": super::ideas::calibration(&ideas),
+            "byClass": super::ideas::scoreboard(&ideas, direction),
             "ideas": ideas,
         })))
     })

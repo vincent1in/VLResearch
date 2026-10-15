@@ -104,12 +104,20 @@ impl Status {
 }
 
 impl Idea {
-    /// The status as people read it: a closed blocker was resolved, not kept.
+    /// The status as people read it: a closed blocker was resolved, not kept,
+    /// and a kept ablation confirmed what its step contributes.
     pub(crate) fn status_label(&self) -> &'static str {
         match self.status {
             Status::Kept if self.kind.is_blocker() => "resolved",
+            Status::Kept if self.class == Some(Class::Ablation) => "confirmed",
             status => status.as_str(),
         }
+    }
+
+    /// A check on the current best rather than an attempt to beat it: a
+    /// replicate with new seeds, or an ablation of one of its steps.
+    fn is_check(&self) -> bool {
+        self.kind == Kind::Replicate || self.class == Some(Class::Ablation)
     }
 }
 
@@ -195,7 +203,13 @@ pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
              closed_at     INTEGER
          );
          CREATE INDEX IF NOT EXISTS idx_vlr_ideas_project ON vlr_ideas(project_id, status);
-         CREATE INDEX IF NOT EXISTS idx_vlr_ideas_experiment ON vlr_ideas(experiment_id);",
+         CREATE INDEX IF NOT EXISTS idx_vlr_ideas_experiment ON vlr_ideas(experiment_id);
+         CREATE TABLE IF NOT EXISTS vlr_ablations (
+             step_experiment_id TEXT PRIMARY KEY,
+             best_experiment_id TEXT NOT NULL,
+             idea_id            TEXT NOT NULL,
+             created_at         INTEGER NOT NULL
+         );",
     )?;
     Ok(())
 }
@@ -444,15 +458,24 @@ pub(crate) enum Verdict {
     Dropped,
 }
 
+/// An idea just closed, and the ablation checks its result queued.
+#[derive(Debug, Clone)]
+pub(crate) struct Closed {
+    pub idea: Idea,
+    /// Queued when the idea was kept and its experiment holds the best.
+    pub ablations: Vec<Idea>,
+}
+
 /// Closes an idea. With an experiment and a primary metric, the outcome is the
 /// experiment's best finished score minus its parent's, the "verify" half of
-/// forecast-and-verify.
+/// forecast-and-verify. A kept idea whose experiment now holds the project's
+/// best queues ablation checks for the biggest earlier steps behind it.
 pub(crate) fn close(
     store: &Store,
     id: &str,
     verdict: Verdict,
     evidence: Option<String>,
-) -> Result<Idea> {
+) -> Result<Closed> {
     let idea = require(store, id)?;
     if idea.status.is_closed() {
         return Err(anyhow!(
@@ -490,7 +513,15 @@ pub(crate) fn close(
                 Direction::Max => change,
                 Direction::Min => -change,
             };
-            if gain > metric.noise_floor.unwrap_or(0.0) {
+            let floor = metric.noise_floor.unwrap_or(0.0);
+            // An ablation predicts a loss: it holds when taking the step out
+            // costs more than noise.
+            let held = if idea.class == Some(Class::Ablation) {
+                -gain > floor
+            } else {
+                gain > floor
+            };
+            if held {
                 Status::Kept
             } else {
                 Status::Refuted
@@ -511,7 +542,130 @@ pub(crate) fn close(
             now
         ],
     )?;
-    require(store, &idea.id)
+    let idea = require(store, &idea.id)?;
+    let ablations = match (&idea.experiment_id, &primary) {
+        (Some(experiment_id), Some(metric))
+            if idea.status == Status::Kept
+                && !idea.kind.is_blocker()
+                && !idea.is_check()
+                && auto_ablate() =>
+        {
+            // The close has landed; a failure here only costs the checks.
+            queue_ablations(store, &idea.project_id, experiment_id, metric).unwrap_or_else(|err| {
+                eprintln!("vlresearch: could not queue ablation checks: {err}");
+                Vec::new()
+            })
+        }
+        _ => Vec::new(),
+    };
+    Ok(Closed { idea, ablations })
+}
+
+/// Turns the automatic ablation checks on or off (`VLR_AUTO_ABLATE`, on
+/// unless `0`).
+pub(crate) const AUTO_ABLATE_ENV: &str = "VLR_AUTO_ABLATE";
+/// Ablation checks queued for one new best at most.
+const ABLATIONS_PER_BEST: usize = 2;
+
+fn auto_ablate() -> bool {
+    std::env::var(AUTO_ABLATE_ENV).map_or(true, |value| value.trim() != "0")
+}
+
+/// When `experiment_id` holds the project's best, queues a leave-one-out check
+/// for each of the biggest earlier steps on its lineage path that hasn't had
+/// one: take that step's change back out of the best and see whether the
+/// metric loses what the step gained. The contribution waterfall assumes the
+/// steps add up; these checks test it. The best's own step needs none, since
+/// taking it out gives its parent, which is already scored.
+pub(crate) fn queue_ablations(
+    store: &Store,
+    project_id: &str,
+    experiment_id: &str,
+    metric: &PrimaryMetric,
+) -> Result<Vec<Idea>> {
+    let (standing, path, _) = metrics::standing(store, project_id, metric)?;
+    let Some(best) = &standing.best else {
+        return Ok(Vec::new());
+    };
+    if best.experiment_id != experiment_id || path.len() < 3 {
+        return Ok(Vec::new());
+    }
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let floor = metric.noise_floor.unwrap_or(0.0);
+    let best_name = path
+        .last()
+        .map_or(experiment_id, |step| step.experiment.as_str());
+    let mut steps = Vec::new();
+    for step in &path[1..path.len() - 1] {
+        let Some(delta) = step.delta else {
+            continue;
+        };
+        let gain = match metric.direction {
+            Direction::Max => delta,
+            Direction::Min => -delta,
+        };
+        let ablated = conn
+            .query_row(
+                "SELECT 1 FROM vlr_ablations WHERE step_experiment_id = ?1",
+                [&step.experiment_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if gain > floor && gain > 0.0 && !ablated {
+            steps.push((step, delta, gain));
+        }
+    }
+    steps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let ideas = list(store, project_id)?;
+    let mut queued = Vec::new();
+    for (step, delta, gain) in steps.into_iter().take(ABLATIONS_PER_BEST) {
+        let label = step.idea.clone().unwrap_or_else(|| step.experiment.clone());
+        let forecast = -delta;
+        let spread = floor.max(gain / 2.0);
+        let key = &metric.key;
+        let idea = add(
+            store,
+            project_id,
+            IdeaFields {
+                title: Some(format!("Ablate \"{label}\" from the best")),
+                kind: Some(Kind::Science),
+                class: Some(Class::Ablation),
+                priority: Some(2),
+                hypothesis: Some(format!(
+                    "This step changed {key} by {} on the way to {best_name}. Taking only its \
+                     change back out of {best_name} (a child of it) should change {key} by about \
+                     {}; a much smaller or larger change means the steps interact, and the \
+                     contribution waterfall's split is off.",
+                    super::metric_cli::signed(delta),
+                    super::metric_cli::signed(forecast),
+                )),
+                forecast: Some(forecast),
+                forecast_low: Some(forecast - spread),
+                forecast_high: Some(forecast + spread),
+                cost_hours: ideas
+                    .iter()
+                    .find(|idea| idea.experiment_id.as_deref() == Some(&step.experiment_id))
+                    .and_then(|idea| idea.cost_hours),
+                author: Some(Author::Review),
+                ..IdeaFields::default()
+            },
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO vlr_ablations
+                 (step_experiment_id, best_experiment_id, idea_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                step.experiment_id,
+                experiment_id,
+                idea.id,
+                crate::store::now_ms()
+            ],
+        )?;
+        queued.push(idea);
+    }
+    Ok(queued)
 }
 
 /// The experiment's best finished score minus its parent's, on the primary
@@ -603,10 +757,11 @@ const STAGNANT_STREAK: usize = 3;
 const DEFAULT_COST_HOURS: f64 = 1.0;
 const MIN_COST_HOURS: f64 = 0.1;
 
-/// The next idea to work on. Open blockers come first (most urgent first).
-/// Among the rest, the highest expected gain per GPU-hour wins, except that
-/// after three incremental ideas in a row, or three tested ideas that kept
-/// nothing, an orthogonal idea is preferred when there is one.
+/// The next idea to work on. Open blockers come first (most urgent first),
+/// then checks on the best (replicates, then ablations). Among the rest, the
+/// highest expected gain per GPU-hour wins, except that after three
+/// incremental ideas in a row, or three tested ideas that kept nothing, an
+/// orthogonal idea is preferred when there is one.
 pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
     let ideas = list(store, project_id)?;
     let closed: std::collections::HashSet<&str> = ideas
@@ -634,6 +789,25 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
                 "it is an open {} and blockers come before other ideas",
                 blocker.kind.as_str()
             ),
+            score: None,
+        }));
+    }
+    // Then checks on the current best, replicates before ablations: whether
+    // the best stands decides what else is worth building on it.
+    if let Some(check) = ready
+        .iter()
+        .filter(|idea| idea.is_check())
+        .min_by_key(|idea| (idea.kind != Kind::Replicate, idea.priority, idea.created_at))
+    {
+        let reason = if check.kind == Kind::Replicate {
+            "it replicates a result with new seeds, and whether the best stands comes before \
+             building on it"
+        } else {
+            "it checks a step behind the current best, and checks come before new ideas"
+        };
+        return Ok(Some(Pick {
+            idea: (*check).clone(),
+            reason: reason.to_string(),
             score: None,
         }));
     }
@@ -776,7 +950,9 @@ pub(crate) fn calibration(ideas: &[Idea]) -> Calibration {
     let mut result = Calibration::default();
     let mut errors = Vec::new();
     for idea in ideas.iter().filter(|idea| !idea.kind.is_blocker()) {
-        if matches!(idea.status, Status::Kept | Status::Refuted) {
+        // The hit rate is for attempts to improve; checks on the best only
+        // add their forecasts.
+        if matches!(idea.status, Status::Kept | Status::Refuted) && !idea.is_check() {
             result.tested += 1;
             if idea.status == Status::Kept {
                 result.kept += 1;
@@ -800,6 +976,75 @@ pub(crate) fn calibration(ideas: &[Idea]) -> Calibration {
         result.mean_abs_error = Some(errors.iter().map(|error| error.abs()).sum::<f64>() / count);
     }
     result
+}
+
+/// How the tested ideas of one class have done.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClassScore {
+    /// `None` for ideas filed without a class.
+    pub class: Option<Class>,
+    pub tested: usize,
+    pub kept: usize,
+    /// Mean measured change, in the metric's improving direction.
+    pub mean_gain: Option<f64>,
+    /// Total measured gain over total GPU-hours, for ideas with both.
+    pub gain_per_hour: Option<f64>,
+}
+
+/// The idea-class scoreboard: for each class of tested improvement idea, its
+/// hit rate, mean gain and gain per GPU-hour, so the search can lean toward
+/// the kinds of change that pay. Blockers and checks are left out.
+pub(crate) fn scoreboard(ideas: &[Idea], direction: Direction) -> Vec<ClassScore> {
+    let mut scores: Vec<ClassScore> = Vec::new();
+    let mut sums: Vec<(Vec<f64>, f64, f64)> = Vec::new();
+    for idea in ideas.iter().filter(|idea| {
+        matches!(idea.status, Status::Kept | Status::Refuted)
+            && !idea.kind.is_blocker()
+            && !idea.is_check()
+    }) {
+        let index = match scores.iter().position(|score| score.class == idea.class) {
+            Some(index) => index,
+            None => {
+                scores.push(ClassScore {
+                    class: idea.class,
+                    tested: 0,
+                    kept: 0,
+                    mean_gain: None,
+                    gain_per_hour: None,
+                });
+                sums.push((Vec::new(), 0.0, 0.0));
+                scores.len() - 1
+            }
+        };
+        scores[index].tested += 1;
+        if idea.status == Status::Kept {
+            scores[index].kept += 1;
+        }
+        let Some(outcome) = idea.outcome else {
+            continue;
+        };
+        let gain = match direction {
+            Direction::Max => outcome,
+            Direction::Min => -outcome,
+        };
+        let (gains, gain_with_cost, hours) = &mut sums[index];
+        gains.push(gain);
+        if let Some(cost) = idea.cost_hours.filter(|cost| *cost > 0.0) {
+            *gain_with_cost += gain;
+            *hours += cost;
+        }
+    }
+    for (score, (gains, gain_with_cost, hours)) in scores.iter_mut().zip(sums) {
+        if !gains.is_empty() {
+            score.mean_gain = Some(gains.iter().sum::<f64>() / gains.len() as f64);
+        }
+        if hours > 0.0 {
+            score.gain_per_hour = Some(gain_with_cost / hours);
+        }
+    }
+    scores.sort_by_key(|score| std::cmp::Reverse(score.tested));
+    scores
 }
 
 #[cfg(test)]
@@ -1017,9 +1262,11 @@ mod tests {
             Some("runs r_child, r_base".into()),
         )
         .unwrap();
-        assert_eq!(closed.status, Status::Kept);
-        assert!((closed.outcome.unwrap() - 0.003).abs() < 1e-12);
-        assert_eq!(closed.outcome_key.as_deref(), Some("val_ic"));
+        assert_eq!(closed.idea.status, Status::Kept);
+        assert!((closed.idea.outcome.unwrap() - 0.003).abs() < 1e-12);
+        assert_eq!(closed.idea.outcome_key.as_deref(), Some("val_ic"));
+        // One step from the baseline: nothing earlier to ablate.
+        assert!(closed.ablations.is_empty());
         assert!(start(&store, &idea.id, "child").is_err());
 
         let report = calibration(&list(&store, "p").unwrap());
@@ -1035,6 +1282,244 @@ mod tests {
             Some("Volume features")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn experiment(store: &Store, id: &str, parent: Option<&str>) {
+        store
+            .create_local_experiment(&LocalExperiment {
+                id: id.into(),
+                project_id: "p".into(),
+                parent_experiment_id: parent.map(Into::into),
+                slug: id.into(),
+                branch_name: format!("orx/{id}"),
+                title: None,
+                description: None,
+                run_command: "python train.py".into(),
+                agent_status: "idle".into(),
+                created_at: 1,
+                updated_at: 1,
+                chat_session_id: None,
+                archived: false,
+            })
+            .unwrap();
+    }
+
+    fn scored_run(store: &Store, experiment: &str, value: f64) {
+        let run_id = format!("r_{experiment}");
+        store
+            .upsert_run(&StoredRun {
+                id: run_id.clone(),
+                experiment_id: experiment.into(),
+                project_id: "p".into(),
+                status: "done".into(),
+                backend_json: "{}".into(),
+                command: "python train.py".into(),
+                created_at: 1,
+                updated_at: 2,
+                ended_at: Some(2),
+                exit_code: Some(0),
+                commit_sha: None,
+                result_markdown: None,
+                cancel_requested: false,
+                cancel_reason: None,
+                chat_session_id: None,
+            })
+            .unwrap();
+        let log = super::super::wake::run_log_path(store, &run_id);
+        std::fs::write(log, format!("ORX_METRIC {{\"val_ic\": {value}}}\n")).unwrap();
+    }
+
+    /// A tested idea on `experiment`, closed from its measured change.
+    fn tested(store: &Store, title: &str, experiment: &str, fields: IdeaFields) -> Closed {
+        let idea = add(
+            store,
+            "p",
+            IdeaFields {
+                title: Some(title.into()),
+                ..fields
+            },
+        )
+        .unwrap();
+        start(store, &idea.id, experiment).unwrap();
+        close(store, &idea.id, Verdict::Measured, None).unwrap()
+    }
+
+    #[test]
+    fn a_new_best_queues_ablations_of_its_biggest_earlier_steps() {
+        let (store, dir) = temp_store();
+        // base 0.020 → wide 0.026 (+0.006) → tiny 0.0265 (+0.0005, noise)
+        // → lags 0.0285 (+0.002) → best 0.0335 (+0.005).
+        experiment(&store, "base", None);
+        experiment(&store, "wide", Some("base"));
+        experiment(&store, "tiny", Some("wide"));
+        experiment(&store, "lags", Some("tiny"));
+        experiment(&store, "best", Some("lags"));
+        for (id, value) in [
+            ("base", 0.020),
+            ("wide", 0.026),
+            ("tiny", 0.0265),
+            ("lags", 0.0285),
+            ("best", 0.0335),
+        ] {
+            scored_run(&store, id, value);
+        }
+        metrics::set_primary(
+            &store,
+            "p",
+            &PrimaryMetric {
+                key: "val_ic".into(),
+                direction: Direction::Max,
+                noise_floor: Some(0.001),
+                split: None,
+            },
+        )
+        .unwrap();
+        let cost = |hours: f64| IdeaFields {
+            cost_hours: Some(hours),
+            ..IdeaFields::default()
+        };
+        assert!(tested(&store, "Wider window", "wide", cost(3.0))
+            .ablations
+            .is_empty());
+        tested(&store, "Tiny tweak", "tiny", cost(1.0));
+        tested(&store, "Lagged returns", "lags", cost(1.0));
+        let closed = tested(&store, "Sector neutral", "best", cost(2.0));
+        assert_eq!(closed.idea.status, Status::Kept);
+
+        // The two biggest earlier steps past the noise floor, biggest first;
+        // not the noise-sized step, and not the best's own step.
+        let titles: Vec<&str> = closed
+            .ablations
+            .iter()
+            .map(|idea| idea.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Ablate \"Wider window\" from the best",
+                "Ablate \"Lagged returns\" from the best"
+            ]
+        );
+        let wide = &closed.ablations[0];
+        assert_eq!(wide.class, Some(Class::Ablation));
+        assert_eq!(wide.author, Author::Review);
+        assert_eq!(wide.cost_hours, Some(3.0));
+        assert!((wide.forecast.unwrap() + 0.006).abs() < 1e-9);
+        assert!((wide.forecast_low.unwrap() + 0.009).abs() < 1e-9);
+        assert!((wide.forecast_high.unwrap() + 0.003).abs() < 1e-9);
+
+        // Checks go before new ideas, replicates before ablations.
+        add(
+            &store,
+            "p",
+            IdeaFields {
+                forecast: Some(0.01),
+                ..fields("Promising new idea")
+            },
+        )
+        .unwrap();
+        let pick = next(&store, "p").unwrap().unwrap();
+        assert_eq!(pick.idea.class, Some(Class::Ablation));
+        assert!(pick.reason.contains("checks"));
+        let replicate = add(
+            &store,
+            "p",
+            IdeaFields {
+                kind: Some(Kind::Replicate),
+                ..fields("Replicate sector neutral")
+            },
+        )
+        .unwrap();
+        assert_eq!(next(&store, "p").unwrap().unwrap().idea.id, replicate.id);
+
+        // Taking the window back out of the best loses about what it added:
+        // the ablation is confirmed, and queues nothing itself.
+        experiment(&store, "best_minus_wide", Some("best"));
+        scored_run(&store, "best_minus_wide", 0.028);
+        start(&store, &wide.id, "best_minus_wide").unwrap();
+        let checked = close(&store, &wide.id, Verdict::Measured, None).unwrap();
+        assert_eq!(checked.idea.status, Status::Kept);
+        assert_eq!(checked.idea.status_label(), "confirmed");
+        assert!(checked.ablations.is_empty());
+
+        // A later best doesn't ablate the same steps again.
+        experiment(&store, "better", Some("best"));
+        scored_run(&store, "better", 0.036);
+        let later = tested(&store, "Turnover penalty", "better", cost(1.0));
+        let again: Vec<&str> = later
+            .ablations
+            .iter()
+            .map(|idea| idea.title.as_str())
+            .collect();
+        assert_eq!(again, ["Ablate \"Sector neutral\" from the best"]);
+
+        // Checks stay out of the hit rate.
+        let report = calibration(&list(&store, "p").unwrap());
+        assert_eq!((report.tested, report.kept), (5, 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scoreboard_compares_classes_of_tested_ideas() {
+        let idea =
+            |class: Option<Class>, status: Status, outcome: Option<f64>, cost: Option<f64>| Idea {
+                id: "i".into(),
+                project_id: "p".into(),
+                title: "t".into(),
+                kind: Kind::Science,
+                class,
+                priority: 2,
+                hypothesis: None,
+                kill_test: None,
+                forecast: None,
+                forecast_low: None,
+                forecast_high: None,
+                cost_hours: cost,
+                status,
+                blocked_by: None,
+                author: Author::Agent,
+                evidence: None,
+                experiment_id: None,
+                outcome,
+                outcome_key: None,
+                created_at: 1,
+                started_at: None,
+                closed_at: None,
+            };
+        let ideas = [
+            idea(Some(Class::Data), Status::Kept, Some(-0.004), Some(2.0)),
+            idea(Some(Class::Data), Status::Refuted, Some(0.001), Some(2.0)),
+            idea(Some(Class::Data), Status::Open, None, Some(5.0)),
+            idea(
+                Some(Class::Incremental),
+                Status::Refuted,
+                Some(0.0005),
+                None,
+            ),
+            idea(Some(Class::Ablation), Status::Kept, Some(0.006), Some(1.0)),
+            idea(None, Status::Kept, None, None),
+        ];
+        // A loss metric: a fall is a gain.
+        let board = scoreboard(&ideas, Direction::Min);
+        assert_eq!(board.len(), 3);
+        let data = &board[0];
+        assert_eq!(
+            (data.class, data.tested, data.kept),
+            (Some(Class::Data), 2, 1)
+        );
+        assert!((data.mean_gain.unwrap() - 0.0015).abs() < 1e-12);
+        assert!((data.gain_per_hour.unwrap() - 0.00075).abs() < 1e-12);
+        let incremental = board
+            .iter()
+            .find(|score| score.class == Some(Class::Incremental))
+            .unwrap();
+        assert!((incremental.mean_gain.unwrap() + 0.0005).abs() < 1e-12);
+        assert_eq!(incremental.gain_per_hour, None);
+        let unclassed = board.iter().find(|score| score.class.is_none()).unwrap();
+        assert_eq!(
+            (unclassed.tested, unclassed.kept, unclassed.mean_gain),
+            (1, 1, None)
+        );
     }
 
     #[test]

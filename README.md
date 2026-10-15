@@ -45,10 +45,12 @@ orx idea add <projectId> "Volume features, 20-day window" --class incremental \
 orx idea next <projectId>               # what to do next, and why
 orx idea start <ideaId> <experimentId>  # the experiment that tests it
 orx idea done <ideaId>                  # measured against the parent: kept or refuted
-orx idea calibration <projectId>        # how well forecasts have held up
+orx idea calibration <projectId>        # how well forecasts have held up, and which classes of idea pay
 ```
 
 Forecasts are changes in the primary metric, in its units and sign. Agents follow the same steps through the `orx-ideas` skill.
+
+The per-step gains in `orx metric best` assume the steps add up. To check that, when a kept idea makes a new best, orx queues up to two ablation ideas for the biggest earlier steps behind it: take that step's change back out of the best and see whether the metric loses what the step gained. `orx idea next` takes these checks, and replicates, before new ideas (`VLR_AUTO_ABLATE=0` stops the automatic ablations).
 
 ## Scoping and the improvement loop
 
@@ -122,6 +124,7 @@ All optional. Set them in the environment `orx up` starts from.
 | `VLR_STALL_MINUTES` | `30` | Minutes a running job may print nothing before its chat is told; `0` turns stall alerts off |
 | `VLR_SCOPE_GATE` | on | Holds launches to a project's brief once it has one; `strict` also refuses projects without a brief; `0` turns the gate off |
 | `VLR_PROBE` | off | Set to `1` on a single launch to run it as a probe |
+| `VLR_AUTO_ABLATE` | on | `0` stops orx from queueing ablation checks when a kept idea makes a new best |
 | `VLR_AUTO_COMPACT` | `0.8` | How full a chat's context window gets before orx compacts it, as a fraction (`0.8`) or a percentage (`80`, `80%`); `0` turns autocompaction off |
 
 ## Keys and secrets

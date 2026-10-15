@@ -34,7 +34,10 @@ one, scope the work first with `orx-grill`.
 7. **Retain.** A new best counts only past the noise floor
    (`orx metric best`). Before building on it, queue a replicate
    (`orx idea add <projectId> "Replicate <idea>" --kind replicate`) with new
-   seeds, and keep it as the incumbent only if the gain holds.
+   seeds, and keep it as the incumbent only if the gain holds. orx also
+   queues ablation checks for the biggest earlier steps behind a new best
+   (`orx-ideas`); `orx idea next` runs the replicate, then those, before new
+   ideas. Drop the ablations if the replicate fails.
 
 Report each round in two or three lines: the idea, forecast against
 outcome, kept or refuted, and the best against the baseline.

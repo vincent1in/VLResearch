@@ -251,12 +251,25 @@ fn print_idea(idea: &Idea) {
     line("evidence", idea.evidence.clone());
 }
 
-fn report_closed(idea: &Idea) {
+fn report_closed(closed: &ideas::Closed) {
+    let idea = &closed.idea;
     let outcome = match (idea.outcome, &idea.outcome_key) {
         (Some(outcome), Some(key)) => format!(" Measured change: {} {key}.", signed(outcome)),
         _ => String::new(),
     };
     println!("Idea {} is {}.{outcome}", idea.id, idea.status_label());
+    if !closed.ablations.is_empty() {
+        println!(
+            "Its experiment holds the best now, so orx queued {} ablation check{} for the \
+             biggest steps behind it. `orx idea next` takes checks before new ideas; drop them \
+             if a replicate shows the best doesn't hold.",
+            closed.ablations.len(),
+            if closed.ablations.len() == 1 { "" } else { "s" }
+        );
+        for ablation in &closed.ablations {
+            println!("  {}  {}", ablation.id, ablation.title);
+        }
+    }
 }
 
 fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
@@ -288,9 +301,15 @@ fn next(store: &Store, project_id: &str, json: bool) -> Result<()> {
 
 fn calibration(store: &Store, project_id: &str, json: bool) -> Result<()> {
     let project = crate::local::resolve::resolve_project(store, project_id)?;
-    let report = ideas::calibration(&ideas::list(store, &project.id)?);
+    let all = ideas::list(store, &project.id)?;
+    let report = ideas::calibration(&all);
+    let direction = metrics::primary(store, &project.id)?
+        .map_or(metrics::Direction::Max, |metric| metric.direction);
+    let board = ideas::scoreboard(&all, direction);
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let mut value = serde_json::to_value(&report)?;
+        value["byClass"] = serde_json::to_value(&board)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     if report.tested == 0 {
@@ -326,6 +345,28 @@ fn calibration(store: &Store, project_id: &str, json: bool) -> Result<()> {
             report.inside_interval,
             report.with_interval,
             100 * report.inside_interval / report.with_interval
+        );
+    }
+    if !board.is_empty() {
+        println!("\nBy class, gains in the metric's improving direction:");
+        let rows: Vec<Vec<String>> = board
+            .iter()
+            .map(|score| {
+                vec![
+                    score
+                        .class
+                        .map_or("(none)", ideas::Class::as_str)
+                        .to_string(),
+                    score.tested.to_string(),
+                    format!("{}%", 100 * score.kept / score.tested.max(1)),
+                    score.mean_gain.map_or("-".to_string(), signed),
+                    score.gain_per_hour.map_or("-".to_string(), signed),
+                ]
+            })
+            .collect();
+        print_table(
+            &["CLASS", "TESTED", "KEPT", "MEAN GAIN", "GAIN PER GPU-H"],
+            &rows,
         );
     }
     Ok(())
