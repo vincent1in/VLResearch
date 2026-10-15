@@ -60,14 +60,27 @@ Find them all with `git grep -n 'VLResearch:'`.
 
 ```sh
 flavor/scripts/sync-upstream.sh            # newest release, on branch sync/<tag>
-git switch main && git merge --ff-only sync/<tag> && git push origin main
+git push origin sync/<tag>                 # then open a pull request into main
 ```
 
-The script fetches upstream's tags and merges the release on a `sync/<tag>` branch. It takes upstream's copy of generated files, rebuilds the dashboard bundle if VLResearch changed the dashboard, and runs fmt, clippy, the egress audit and the tests.
+The script fetches upstream's tags and merges the release on a `sync/<tag>` branch. It takes upstream's dashboard bundle and other generated files, refuses a merge that lost a `VLResearch:` hook line from an upstream file, rebuilds the bundle if VLResearch changed the dashboard, and runs fmt, clippy, the egress audit and the tests.
 
-If it stops on a conflict, resolve the listed files: keep upstream's new code and put back the lines marked `VLResearch:`. Git remembers each resolution (`rerere`) and replays it in later syncs. Then run `git commit --no-edit` and the script again.
+If it stops on a conflict, resolve the listed files: keep upstream's new code and put back the lines marked `VLResearch:`. Then run `git commit --no-edit` and the script again; it picks up on the sync branch. Git remembers each resolution (`rerere`) in the clone that made it. When upstream changes an API VLResearch's code uses, fix `src/flavor/` or `ui/src/flavor/` in a commit of its own that says what upstream changed.
+
+A scheduled task (the OpenResearch release watcher) does this every morning: when there is a new release, it runs the script, resolves what it can, pushes `sync/<tag>` and opens a pull request for you to merge. It never pushes to `main`.
+
+To try a merge before upstream releases it, run the script on upstream's main and don't push the result: `flavor/scripts/sync-upstream.sh upstream/main`.
 
 Upstream merges are never rebased, so `main` is never force-pushed.
+
+### Known for the next release
+
+From a dry run against upstream's main on 2026-10-15 (the 0.2.19 version bump):
+
+- `src/local/chat/mod.rs`, `src/local/git.rs`, `src/local/harness/claude.rs` and `ui/src/components/ChatPanel.tsx` conflict around their `VLResearch:` hooks; keep upstream's code and the hook lines.
+- OpenResearch #633 makes `orx agent spawn` create ordinary chats and removes `StoredChatSession.parent_session_id`. Remove the helper-chat check in `src/flavor/compact.rs` (`due`) and the field from the test fixtures in `compact.rs`, `scope.rs` and `start.rs`.
+
+Delete this list once those are merged.
 
 ## The egress audit
 
