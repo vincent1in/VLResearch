@@ -1536,6 +1536,8 @@ fn apply_subagent_blocks(
 /// the recv loop). Native-session-id application and flushing are the caller's
 /// job, keeping this store-free.
 fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool {
+    // VLResearch: show Claude Code's API retries instead of a silent wait.
+    crate::flavor::harness::claude_event(ctx, event);
     let segment_running = match event.get("type").and_then(Value::as_str) {
         Some("system") => event.get("subtype").and_then(Value::as_str) == Some("init"),
         kind => matches!(kind, Some("assistant" | "user" | "stream_event")),

@@ -6,6 +6,7 @@
 //! matter of keeping those hooks in place. See `VLRESEARCH.md`.
 
 pub(crate) mod egress;
+pub(crate) mod harness;
 pub(crate) mod wake;
 
 /// Reads a boolean switch from the environment: `1`, `true`, `yes` or `on`
