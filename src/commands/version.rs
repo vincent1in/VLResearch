@@ -70,6 +70,10 @@ pub async fn run(args: crate::VersionArgs) -> Result<()> {
             updates::REPO_URL,
             latest.tag,
         ),
+        // VLResearch: say why there is never an update to offer.
+        None if crate::flavor::egress::updates_blocked() => {
+            println!("{}", crate::flavor::egress::UPDATES_DISABLED)
+        }
         None => println!("orx is up to date."),
     }
     Ok(())

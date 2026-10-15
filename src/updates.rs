@@ -1227,6 +1227,10 @@ fn relaunch_app_bundle(root: &Path, port: u16) -> std::io::Error {
 /// install would advertise — and endlessly re-attempt — a build that does not
 /// exist for it. `Ok(None)` means "nothing newer published for this channel".
 pub async fn fetch_latest_for_channel(timeout: Duration) -> Result<Option<LatestRelease>> {
+    // VLResearch: source builds never look at alphaXiv's release feed.
+    if crate::flavor::egress::updates_blocked() {
+        return Ok(None);
+    }
     match current_channel() {
         Ok(InstallChannel::AppBundle(_)) => macos_app::fetch_manifest(timeout)
             .await?
@@ -1513,7 +1517,8 @@ impl UpdateWarning {
                 render(&message, stderr_supports_ansi())
             );
         }
-        if opted_out() {
+        // VLResearch: no "new release" warnings about alphaXiv's builds.
+        if opted_out() || crate::flavor::egress::updates_blocked() {
             return UpdateWarning { refresh: None };
         }
 
