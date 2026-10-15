@@ -49,18 +49,21 @@ trials behind any "best" number, which is how its luck gets discounted.
 ## Ablation checks
 
 When a kept idea's experiment becomes the project's best, orx queues up to
-two ablation ideas for the biggest earlier steps on its lineage path (the
+two ablation checks for the biggest earlier steps on its lineage path (the
 steps `orx metric best` lists), titled `Ablate "<step>" from the best`. Each
-forecasts that taking that step's change back out of the best loses what the
-step gained.
+forecasts that taking that step's change back out of the best loses about
+what the step gained.
 
 - Build it as a child of the best experiment that reverts only that step's
   change, start it, run it with the best's seeds, and close it with
   `orx idea done` as usual.
-- It is confirmed when taking the step out costs more than the noise floor,
-  and refuted when it doesn't: then the steps interact, and the per-step
-  gains in `orx metric best` don't add up the way they look.
-- If a replicate shows the new best doesn't hold, drop its ablations.
+- It is confirmed when the change lands inside its forecast interval, and
+  refuted when it is far smaller or larger: then the steps interact, and the
+  per-step gains in `orx metric best` don't add up the way they look.
+- If a replicate shows the new best doesn't hold, drop its ablations; a
+  later best queues them again.
+- Your own `--class ablation` ideas, which remove something hoping to
+  improve, are ordinary ideas: judged by their gain and ranked like the rest.
 
 ## Learn from the record
 

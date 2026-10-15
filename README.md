@@ -50,7 +50,7 @@ orx idea calibration <projectId>        # how well forecasts have held up, and w
 
 Forecasts are changes in the primary metric, in its units and sign. Agents follow the same steps through the `orx-ideas` skill.
 
-The per-step gains in `orx metric best` assume the steps add up. To check that, when a kept idea makes a new best, orx queues up to two ablation ideas for the biggest earlier steps behind it: take that step's change back out of the best and see whether the metric loses what the step gained. `orx idea next` takes these checks, and replicates, before new ideas (`VLR_AUTO_ABLATE=0` stops the automatic ablations).
+The per-step gains in `orx metric best` assume the steps add up. To check that, when a kept idea makes a new best, orx queues up to two ablation ideas for the biggest earlier steps behind it: take that step's change back out of the best and see whether the metric loses what the step gained. A check is confirmed when the loss lands in its forecast interval, and refuted when it is far smaller or larger: then the steps interact, and the per-step split is off. `orx idea next` takes these checks, and replicates, before new ideas (`VLR_AUTO_ABLATE=0` stops the automatic ablations).
 
 ## Scoping and the improvement loop
 
@@ -77,7 +77,9 @@ The `orx-improve` skill then runs the loop: pick the next idea, check its foreca
 
 ## Long chats
 
-When a chat's context window is 80% full (`VLR_AUTO_COMPACT`), orx compacts the chat as soon as the turn that filled it ends and nothing else is waiting to run. It uses the agent's own compaction where there is one (Claude Code, Codex), and otherwise a summary that the next turn starts from; OpenCode and Cursor chats would otherwise never be compacted. It shows in the chat like a manual compaction, Stop cancels it, and messages you send meanwhile run after it.
+When a chat's context window is 80% full (`VLR_AUTO_COMPACT`), orx compacts the chat as soon as the turn that filled it ends and nothing else is waiting to run. It uses the agent's own compaction where there is one (Claude Code, Codex), and otherwise a summary that the next turn starts from. It shows in the chat like a manual compaction, Stop cancels it, and messages you send meanwhile run after it.
+
+orx has to know how full the window is. Claude Code and Codex report it. OpenCode reports only how many tokens are in use, so orx knows its window for a local model (the one you entered when connecting it) but not for a cloud model; OpenResearch turns OpenCode's own compaction off, so this is the only compaction those local-model chats get. Cursor and Antigravity report no usage, and aren't compacted automatically.
 
 orx doesn't compact a chat while a plan, question or permission card is waiting for your answer, or a helper agent that another chat delegated to. After compacting a chat, it lets three turns run before compacting it again; after a compaction that failed or that you stopped, it waits 30 minutes.
 

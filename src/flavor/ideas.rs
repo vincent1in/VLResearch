@@ -105,19 +105,20 @@ impl Status {
 
 impl Idea {
     /// The status as people read it: a closed blocker was resolved, not kept,
-    /// and a kept ablation confirmed what its step contributes.
+    /// and a kept ablation check confirmed what its step contributes.
     pub(crate) fn status_label(&self) -> &'static str {
         match self.status {
             Status::Kept if self.kind.is_blocker() => "resolved",
-            Status::Kept if self.class == Some(Class::Ablation) => "confirmed",
+            Status::Kept if self.ablates.is_some() => "confirmed",
             status => status.as_str(),
         }
     }
 
     /// A check on the current best rather than an attempt to beat it: a
-    /// replicate with new seeds, or an ablation of one of its steps.
+    /// replicate with new seeds, or an ablation check orx queued for one of
+    /// its steps. (An agent's own `--class ablation` idea is an attempt.)
     fn is_check(&self) -> bool {
-        self.kind == Kind::Replicate || self.class == Some(Class::Ablation)
+        self.kind == Kind::Replicate || self.ablates.is_some()
     }
 }
 
@@ -156,6 +157,9 @@ pub(crate) struct Idea {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub closed_at: Option<i64>,
+    /// For an ablation check orx queued: the lineage step's experiment whose
+    /// change it takes back out of the best.
+    pub ablates: Option<String>,
 }
 
 /// Fields for a new idea or an edit; `None` leaves a field as it is.
@@ -203,20 +207,28 @@ pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
              closed_at     INTEGER
          );
          CREATE INDEX IF NOT EXISTS idx_vlr_ideas_project ON vlr_ideas(project_id, status);
-         CREATE INDEX IF NOT EXISTS idx_vlr_ideas_experiment ON vlr_ideas(experiment_id);
-         CREATE TABLE IF NOT EXISTS vlr_ablations (
-             step_experiment_id TEXT PRIMARY KEY,
-             best_experiment_id TEXT NOT NULL,
-             idea_id            TEXT NOT NULL,
-             created_at         INTEGER NOT NULL
-         );",
+         CREATE INDEX IF NOT EXISTS idx_vlr_ideas_experiment ON vlr_ideas(experiment_id);",
     )?;
+    metrics::add_column(conn, "vlr_ideas", "ablates", "TEXT")?;
+    // Ablation checks were first linked to their steps in a table of their
+    // own; carry any such links over to the column.
+    let old_links = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vlr_ablations'")?
+        .exists([])?;
+    if old_links {
+        conn.execute_batch(
+            "UPDATE vlr_ideas SET ablates = (SELECT step_experiment_id FROM vlr_ablations
+                 WHERE vlr_ablations.idea_id = vlr_ideas.id)
+             WHERE ablates IS NULL AND id IN (SELECT idea_id FROM vlr_ablations);
+             DROP TABLE vlr_ablations;",
+        )?;
+    }
     Ok(())
 }
 
 const IDEA_COLUMNS: &str = "id, project_id, title, kind, class, priority, hypothesis, kill_test,
     forecast, forecast_low, forecast_high, cost_hours, status, blocked_by, author, evidence,
-    experiment_id, outcome, outcome_key, created_at, started_at, closed_at";
+    experiment_id, outcome, outcome_key, created_at, started_at, closed_at, ablates";
 
 fn from_row(row: &Row) -> rusqlite::Result<Idea> {
     let text = |index: usize| row.get::<_, String>(index);
@@ -246,6 +258,7 @@ fn from_row(row: &Row) -> rusqlite::Result<Idea> {
         created_at: row.get(19)?,
         started_at: row.get(20)?,
         closed_at: row.get(21)?,
+        ablates: row.get(22)?,
     })
 }
 
@@ -514,12 +527,14 @@ pub(crate) fn close(
                 Direction::Min => -change,
             };
             let floor = metric.noise_floor.unwrap_or(0.0);
-            // An ablation predicts a loss: it holds when taking the step out
-            // costs more than noise.
-            let held = if idea.class == Some(Class::Ablation) {
-                -gain > floor
-            } else {
-                gain > floor
+            // An ablation check predicts that taking its step back out loses
+            // about what the step gained: it holds when the change lands in
+            // that forecast's interval. Far less or far more means the steps
+            // interact.
+            let held = match (&idea.ablates, idea.forecast_low, idea.forecast_high) {
+                (Some(_), Some(low), Some(high)) => (low..=high).contains(&change),
+                (Some(_), _, _) => -gain > floor,
+                (None, _, _) => gain > floor,
             };
             if held {
                 Status::Kept
@@ -590,8 +605,7 @@ pub(crate) fn queue_ablations(
     if best.experiment_id != experiment_id || path.len() < 3 {
         return Ok(Vec::new());
     }
-    let conn = store.flavor_conn();
-    ensure_tables(conn)?;
+    let ideas = list(store, project_id)?;
     let floor = metric.noise_floor.unwrap_or(0.0);
     let best_name = path
         .last()
@@ -605,20 +619,15 @@ pub(crate) fn queue_ablations(
             Direction::Max => delta,
             Direction::Min => -delta,
         };
-        let ablated = conn
-            .query_row(
-                "SELECT 1 FROM vlr_ablations WHERE step_experiment_id = ?1",
-                [&step.experiment_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if gain > floor && gain > 0.0 && !ablated {
+        // Each step is checked once; a dropped check doesn't count.
+        let checked = ideas.iter().any(|idea| {
+            idea.ablates.as_deref() == Some(&step.experiment_id) && idea.status != Status::Dropped
+        });
+        if gain > floor && gain > 0.0 && !checked {
             steps.push((step, delta, gain));
         }
     }
     steps.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    let ideas = list(store, project_id)?;
     let mut queued = Vec::new();
     for (step, delta, gain) in steps.into_iter().take(ABLATIONS_PER_BEST) {
         let label = step.idea.clone().unwrap_or_else(|| step.experiment.clone());
@@ -652,18 +661,11 @@ pub(crate) fn queue_ablations(
                 ..IdeaFields::default()
             },
         )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO vlr_ablations
-                 (step_experiment_id, best_experiment_id, idea_id, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                step.experiment_id,
-                experiment_id,
-                idea.id,
-                crate::store::now_ms()
-            ],
+        store.flavor_conn().execute(
+            "UPDATE vlr_ideas SET ablates = ?2 WHERE id = ?1",
+            params![idea.id, step.experiment_id],
         )?;
-        queued.push(idea);
+        queued.push(require(store, &idea.id)?);
     }
     Ok(queued)
 }
@@ -696,25 +698,21 @@ pub(crate) fn ablations_by_step(
     store: &Store,
     project_id: &str,
 ) -> Result<std::collections::HashMap<String, Idea>> {
-    let conn = store.flavor_conn();
-    ensure_tables(conn)?;
-    let mut stmt = conn.prepare(
-        "SELECT a.step_experiment_id, a.idea_id FROM vlr_ablations a
-         JOIN vlr_ideas i ON i.id = a.idea_id WHERE i.project_id = ?1",
-    )?;
-    let pairs = stmt
-        .query_map([project_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let ideas: std::collections::HashMap<String, Idea> = list(store, project_id)?
-        .into_iter()
-        .map(|idea| (idea.id.clone(), idea))
-        .collect();
-    Ok(pairs
-        .into_iter()
-        .filter_map(|(step, idea)| Some((step, ideas.get(&idea)?.clone())))
-        .collect())
+    // In creation order, so a step's newest check wins, unless it was dropped
+    // and an earlier one wasn't.
+    let mut by_step = std::collections::HashMap::<String, Idea>::new();
+    for idea in list(store, project_id)? {
+        let Some(step) = idea.ablates.clone() else {
+            continue;
+        };
+        let replace = by_step
+            .get(&step)
+            .is_none_or(|kept| kept.status == Status::Dropped || idea.status != Status::Dropped);
+        if replace {
+            by_step.insert(step, idea);
+        }
+    }
+    Ok(by_step)
 }
 
 /// The idea titles behind experiments, for labeling the lineage path.
@@ -839,9 +837,12 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
     }
     let direction =
         metrics::primary(store, project_id)?.map_or(Direction::Max, |metric| metric.direction);
-    // Started ideas, newest first, for the diversity rules.
+    // Started attempts, newest first, for the diversity rules. Checks on the
+    // best and blockers say nothing about how the search is going.
+    let attempt = |idea: &&Idea| !idea.is_check() && !idea.kind.is_blocker();
     let mut started: Vec<&Idea> = ideas
         .iter()
+        .filter(attempt)
         .filter(|idea| idea.started_at.is_some())
         .collect();
     started.sort_by_key(|idea| std::cmp::Reverse(idea.started_at));
@@ -851,6 +852,7 @@ pub(crate) fn next(store: &Store, project_id: &str) -> Result<Option<Pick>> {
         .count();
     let mut tested: Vec<&Idea> = ideas
         .iter()
+        .filter(attempt)
         .filter(|idea| matches!(idea.status, Status::Kept | Status::Refuted))
         .collect();
     tested.sort_by_key(|idea| std::cmp::Reverse(idea.closed_at));
@@ -975,9 +977,14 @@ pub(crate) fn trials(
 pub(crate) fn calibration(ideas: &[Idea]) -> Calibration {
     let mut result = Calibration::default();
     let mut errors = Vec::new();
-    for idea in ideas.iter().filter(|idea| !idea.kind.is_blocker()) {
-        // The hit rate is for attempts to improve; checks on the best only
-        // add their forecasts.
+    // Ablation checks carry orx's forecasts, not the agent's, so they stay
+    // out of a calibration the agent adjusts its own forecasts by.
+    for idea in ideas
+        .iter()
+        .filter(|idea| !idea.kind.is_blocker() && idea.ablates.is_none())
+    {
+        // The hit rate is for attempts to improve; replicates only add their
+        // forecasts.
         if matches!(idea.status, Status::Kept | Status::Refuted) && !idea.is_check() {
             result.tested += 1;
             if idea.status == Status::Kept {
@@ -1116,6 +1123,7 @@ mod tests {
             created_at: 0,
             started_at: None,
             closed_at: None,
+            ablates: None,
         };
         let sure = expected_gain(&idea(0.002, 0.002, 0.002), Direction::Max).unwrap();
         assert!((sure - 0.002).abs() < 1e-12);
@@ -1490,6 +1498,164 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn val_ic_primary(store: &Store) {
+        metrics::set_primary(
+            store,
+            "p",
+            &PrimaryMetric {
+                key: "val_ic".into(),
+                direction: Direction::Max,
+                noise_floor: Some(0.001),
+                split: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ablation_checks_hold_only_inside_their_interval_and_dropped_ones_come_back() {
+        let (store, dir) = temp_store();
+        val_ic_primary(&store);
+        for (id, parent, value) in [
+            ("base", None, 0.020),
+            ("wide", Some("base"), 0.026),
+            ("best", Some("wide"), 0.030),
+        ] {
+            experiment(&store, id, parent);
+            scored_run(&store, id, value);
+        }
+        tested(&store, "Wider window", "wide", IdeaFields::default());
+        let closed = tested(&store, "Sector neutral", "best", IdeaFields::default());
+        let check = &closed.ablations[0];
+        assert_eq!(check.ablates.as_deref(), Some("wide"));
+
+        // Taking the window out costs far less than it gained: the steps
+        // interact, so the check is refuted even though the loss beats noise.
+        experiment(&store, "best_minus_wide", Some("best"));
+        scored_run(&store, "best_minus_wide", 0.0285);
+        start(&store, &check.id, "best_minus_wide").unwrap();
+        let checked = close(&store, &check.id, Verdict::Measured, None).unwrap();
+        assert_eq!(checked.idea.status, Status::Refuted);
+
+        // A new best queues a check of the best's old step; drop it, and the
+        // next best queues it again, beside its own predecessor's.
+        experiment(&store, "best2", Some("best"));
+        scored_run(&store, "best2", 0.034);
+        let second = tested(&store, "Turnover penalty", "best2", IdeaFields::default());
+        assert_eq!(second.ablations.len(), 1);
+        assert_eq!(second.ablations[0].ablates.as_deref(), Some("best"));
+        close(&store, &second.ablations[0].id, Verdict::Dropped, None).unwrap();
+        experiment(&store, "best3", Some("best2"));
+        scored_run(&store, "best3", 0.038);
+        let third = tested(&store, "Shorter lookback", "best3", IdeaFields::default());
+        let mut steps: Vec<&str> = third
+            .ablations
+            .iter()
+            .filter_map(|idea| idea.ablates.as_deref())
+            .collect();
+        steps.sort_unstable();
+        assert_eq!(steps, ["best", "best2"]);
+        let by_step = ablations_by_step(&store, "p").unwrap();
+        assert_eq!(by_step["best"].status, Status::Open);
+        assert_eq!(by_step["wide"].status, Status::Refuted);
+
+        // An agent's own `--class ablation` idea is an attempt like any other:
+        // judged by its gain, kept, and not a check.
+        experiment(&store, "lean", Some("best3"));
+        scored_run(&store, "lean", 0.042);
+        let lean = tested(
+            &store,
+            "Drop the noisy volume feature",
+            "lean",
+            IdeaFields {
+                class: Some(Class::Ablation),
+                forecast: Some(0.002),
+                ..IdeaFields::default()
+            },
+        );
+        assert_eq!(lean.idea.status, Status::Kept);
+        assert_eq!(lean.idea.status_label(), "kept");
+        assert!(!lean.idea.is_check());
+        // orx's forecasts for its checks stay out of the agent's calibration.
+        let report = calibration(&list(&store, "p").unwrap());
+        assert_eq!((report.tested, report.kept), (5, 5));
+        assert_eq!(report.scored, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_search_widening_rules_count_attempts_not_checks() {
+        let (store, dir) = temp_store();
+        val_ic_primary(&store);
+        let conn = store.flavor_conn();
+        let close_at = |idea: &Idea, status: &str, at: i64, ablates: Option<&str>| {
+            conn.execute(
+                "UPDATE vlr_ideas SET status = ?2, started_at = ?3, closed_at = ?3, ablates = ?4
+                 WHERE id = ?1",
+                params![idea.id, status, at, ablates],
+            )
+            .unwrap();
+        };
+        let kept = add(&store, "p", fields("Kept attempt")).unwrap();
+        close_at(&kept, "kept", 1, None);
+        for at in [2, 3] {
+            let check = add(&store, "p", fields("Ablate a step")).unwrap();
+            close_at(&check, "refuted", at, Some("step"));
+        }
+        let failed = add(&store, "p", fields("Failed attempt")).unwrap();
+        close_at(&failed, "refuted", 4, None);
+        let incremental = add(
+            &store,
+            "p",
+            IdeaFields {
+                class: Some(Class::Incremental),
+                forecast: Some(0.01),
+                ..fields("Strong incremental")
+            },
+        )
+        .unwrap();
+        add(
+            &store,
+            "p",
+            IdeaFields {
+                class: Some(Class::Orthogonal),
+                forecast: Some(0.001),
+                ..fields("Weak orthogonal")
+            },
+        )
+        .unwrap();
+        // One failed attempt since a kept one: no reason to widen the search.
+        let pick = next(&store, "p").unwrap().unwrap();
+        assert_eq!(pick.idea.id, incremental.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ablation_links_move_from_their_old_table_to_the_ideas() {
+        let (store, dir) = temp_store();
+        let idea = add(&store, "p", fields("Ablate \"x\" from the best")).unwrap();
+        let conn = store.flavor_conn();
+        conn.execute_batch(
+            "CREATE TABLE vlr_ablations (
+                 step_experiment_id TEXT PRIMARY KEY, best_experiment_id TEXT NOT NULL,
+                 idea_id TEXT NOT NULL, created_at INTEGER NOT NULL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vlr_ablations VALUES ('step_x', 'best', ?1, 1)",
+            [&idea.id],
+        )
+        .unwrap();
+        let moved = require(&store, &idea.id).unwrap();
+        assert_eq!(moved.ablates.as_deref(), Some("step_x"));
+        assert!(!conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'vlr_ablations'")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_scoreboard_compares_classes_of_tested_ideas() {
         let idea =
@@ -1516,7 +1682,11 @@ mod tests {
                 created_at: 1,
                 started_at: None,
                 closed_at: None,
+                ablates: None,
             };
+        // A check orx queued, which isn't an attempt to improve.
+        let mut check = idea(Some(Class::Ablation), Status::Kept, Some(-0.006), Some(1.0));
+        check.ablates = Some("wide".into());
         let ideas = [
             idea(Some(Class::Data), Status::Kept, Some(-0.004), Some(2.0)),
             idea(Some(Class::Data), Status::Refuted, Some(0.001), Some(2.0)),
@@ -1527,7 +1697,7 @@ mod tests {
                 Some(0.0005),
                 None,
             ),
-            idea(Some(Class::Ablation), Status::Kept, Some(0.006), Some(1.0)),
+            check,
             idea(None, Status::Kept, None, None),
         ];
         // A loss metric: a fall is a gain.

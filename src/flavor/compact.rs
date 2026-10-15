@@ -1,24 +1,31 @@
 //! Autocompaction. When a chat's context window is nearly full, orx compacts
 //! the chat as soon as the turn that filled it ends and nothing else is
 //! waiting to run, instead of leaving the agent to run out of room in the
-//! middle of a task. That matters most for harnesses that never compact on
-//! their own: OpenResearch turns OpenCode's compaction off, and Cursor has
-//! none. Claude Code and Codex also compact mid-turn when they must; this
-//! compacts at a quiet moment, before they have to.
+//! middle of a task. Claude Code and Codex also compact mid-turn when they
+//! must; this compacts at a quiet moment, before they have to. OpenResearch
+//! turns OpenCode's own compaction off, so for an OpenCode chat on a local
+//! model this is the only compaction there is.
+//!
+//! It needs to know how full the window is. Claude Code and Codex report the
+//! window; OpenCode reports only the tokens, so its window is known for local
+//! models (entered when connecting them) and not for cloud ones; Cursor and
+//! Antigravity report neither.
 //!
 //! The compaction is OpenResearch's own (`ChatHost::compact_session`): the
 //! harness's native compaction where it has one, otherwise a summary that the
 //! next turn is reseeded with. It shows in the chat as a manual one does and
 //! runs as a turn. Stop cancels it, and messages sent meanwhile wait for it.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection as Db, OptionalExtension};
 use serde_json::Value;
 
 use crate::error::Result;
 use crate::local::chat::{ChatHost, ContextUsage};
-use crate::store::Store;
+use crate::local::local_models::Connection;
+use crate::store::{Store, StoredChatSession};
 
 /// The share of the context window at which a chat is compacted.
 pub(crate) const AUTO_COMPACT_ENV: &str = "VLR_AUTO_COMPACT";
@@ -62,29 +69,29 @@ fn parse_threshold(value: Option<&str>) -> Option<f64> {
 
 /// Called after a chat turn has ended and any queued message has started.
 /// Compacts the chat if its context is at least the threshold full, it is
-/// idle, and the turn didn't end on a card waiting for the user's answer.
-pub(crate) async fn after_turn(host: &Arc<ChatHost>, session_id: &str, message_id: &str) {
+/// idle, and no card is waiting for the user's answer.
+pub(crate) async fn after_turn(host: &Arc<ChatHost>, session_id: &str) {
     let Some(threshold) = threshold() else {
         return;
     };
     let now = crate::store::now_ms();
-    let due =
-        match Store::open().and_then(|store| due(&store, session_id, message_id, threshold, now)) {
-            Ok(Some(due)) => due,
-            Ok(None) => return,
-            Err(err) => {
-                eprintln!("vlresearch: autocompaction check for chat {session_id}: {err}");
-                return;
-            }
-        };
+    let due = match Store::open().and_then(|store| due(&store, session_id, threshold, now)) {
+        Ok(Some(due)) => due,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("vlresearch: autocompaction check for chat {session_id}: {err}");
+            return;
+        }
+    };
     let compacted = host.compact_session(session_id).await;
     let (marker_id, error) = match compacted {
         Ok(marker) => (Some(marker.id), None),
         Err(err) => {
             // A queued message, a wake-up or the user got there first; the end
-            // of that turn decides again. (The turn may already be over by
-            // the time the slot is checked, hence the refusal's wording too.)
-            if host.is_busy(session_id).await || err.to_string().contains("busy") {
+            // of that turn decides again. Any other refusal is a failure. (The
+            // turn map can't tell them apart: a refusal that comes after the
+            // slot was claimed still holds it for a moment.)
+            if err.to_string().contains("busy") {
                 return;
             }
             eprintln!("vlresearch: could not compact chat {session_id}: {err}");
@@ -114,18 +121,11 @@ struct Due {
 }
 
 /// Whether the chat should be compacted now. Not when it is a delegated
-/// helper, whose parent reads its last reply; not when the turn that just
-/// ended left a plan, question or permission card for the user, since
-/// answering it starts a turn that a running compaction would refuse; not when
-/// the harness hasn't said how large the window is; and not while an earlier
-/// automatic compaction holds it back.
-fn due(
-    store: &Store,
-    session_id: &str,
-    message_id: &str,
-    threshold: f64,
-    now: i64,
-) -> Result<Option<Due>> {
+/// helper, whose parent reads its last reply; not while a plan, question or
+/// permission card waits for the user, since answering it starts a turn that
+/// a running compaction would refuse; not when the window's size is unknown;
+/// and not while an earlier automatic compaction holds it back.
+fn due(store: &Store, session_id: &str, threshold: f64, now: i64) -> Result<Option<Due>> {
     let Some(session) = store.get_chat_session(session_id)? else {
         return Ok(None);
     };
@@ -139,13 +139,22 @@ fn due(
     else {
         return Ok(None);
     };
-    let Some(window) = usage.context_window.filter(|window| *window > 0) else {
+    let window = usage
+        .context_window
+        .filter(|window| *window > 0)
+        .or_else(|| {
+            local_window(
+                &session,
+                &crate::local::local_models::read().unwrap_or_default(),
+            )
+        });
+    let Some(window) = window else {
         return Ok(None);
     };
     if (usage.used_tokens as f64) < threshold * window as f64 {
         return Ok(None);
     }
-    if awaits_answer(store, message_id)? {
+    if awaits_answer(store, session_id)? {
         return Ok(None);
     }
     if previous(store, session_id)?.is_some_and(|previous| previous.holds_back(now)) {
@@ -157,13 +166,39 @@ fn due(
     }))
 }
 
-/// Whether a turn's reply holds a card the user hasn't answered yet.
-fn awaits_answer(store: &Store, message_id: &str) -> Result<bool> {
-    let Some(message) = store.get_chat_message(message_id)? else {
-        return Ok(false);
-    };
-    let parts = serde_json::from_str::<Value>(&message.parts_json).unwrap_or(Value::Null);
-    Ok(has_open_prompt(&parts))
+/// The window of an OpenCode chat on a local model, which OpenCode doesn't
+/// report: the one entered when the model was connected.
+fn local_window(
+    session: &StoredChatSession,
+    connections: &BTreeMap<String, Connection>,
+) -> Option<u64> {
+    if session.harness != "opencode" {
+        return None;
+    }
+    let model = session.model.as_deref()?;
+    connections.iter().find_map(|(id, connection)| {
+        let name = model.strip_prefix(id.as_str())?.strip_prefix('/')?;
+        connection.models.get(name).map(|window| *window as u64)
+    })
+}
+
+/// Whether a card waits for the user's answer in the agent's replies since
+/// the user last wrote. A card can outlive its turn (a wake-up turn may have
+/// run since), and one left behind when the user wrote something else instead
+/// no longer waits.
+fn awaits_answer(store: &Store, session_id: &str) -> Result<bool> {
+    for message in store.list_chat_messages(session_id)?.iter().rev() {
+        if message.role == "user" {
+            return Ok(false);
+        }
+        if message.role == "assistant" {
+            let parts = serde_json::from_str::<Value>(&message.parts_json).unwrap_or(Value::Null);
+            if has_open_prompt(&parts) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn has_open_prompt(parts: &Value) -> bool {
@@ -287,7 +322,7 @@ fn record(
     Ok(())
 }
 
-fn ensure_tables(conn: &Connection) -> Result<()> {
+fn ensure_tables(conn: &Db) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS vlr_auto_compactions (
              session_id     TEXT NOT NULL,
@@ -308,10 +343,13 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
 
+    use std::collections::BTreeMap;
+
     use super::{
-        due, has_open_prompt, parse_threshold, previous, record, Due, Outcome, Previous,
-        DEFAULT_THRESHOLD, MIN_TURNS_BETWEEN, RETRY_AFTER_MS,
+        due, has_open_prompt, local_window, parse_threshold, previous, record, Due, Outcome,
+        Previous, DEFAULT_THRESHOLD, MIN_TURNS_BETWEEN, RETRY_AFTER_MS,
     };
+    use crate::local::local_models::Connection;
     use crate::store::{Store, StoredChatMessage, StoredChatSession};
 
     const NOW: i64 = 1_800_000_000_000;
@@ -330,30 +368,7 @@ mod tests {
 
         fn chat(&self, id: &str, usage: Option<&str>, parent: Option<&str>) {
             self.store
-                .create_chat_session(&StoredChatSession {
-                    id: id.into(),
-                    project_id: "proj_1".into(),
-                    harness: "opencode".into(),
-                    native_session_id: Some("native".into()),
-                    title: None,
-                    title_source: None,
-                    model: None,
-                    service_tier: None,
-                    permission_mode: None,
-                    plan_mode: false,
-                    plan_reset_pending: false,
-                    reasoning_level: None,
-                    archived: false,
-                    context_usage_json: None,
-                    bootstrap_context: None,
-                    goal: None,
-                    autonomy: None,
-                    active_leaf_id: None,
-                    parent_session_id: parent.map(str::to_owned),
-                    side_parent_session_id: None,
-                    created_at: 1,
-                    updated_at: 1,
-                })
+                .create_chat_session(&session_row(id, parent))
                 .unwrap();
             // Written as a turn's end writes it; creating a chat leaves it out.
             if let Some(usage) = usage {
@@ -364,13 +379,24 @@ mod tests {
         }
 
         fn message(&self, id: &str, session_id: &str, parts: serde_json::Value) {
+            self.message_at(id, session_id, "assistant", 1, parts);
+        }
+
+        fn message_at(
+            &self,
+            id: &str,
+            session_id: &str,
+            role: &str,
+            created_at: i64,
+            parts: serde_json::Value,
+        ) {
             self.store
                 .upsert_chat_message(&StoredChatMessage {
                     id: id.into(),
                     session_id: session_id.into(),
-                    role: "assistant".into(),
+                    role: role.into(),
                     parts_json: parts.to_string(),
-                    created_at: 1,
+                    created_at,
                     completed_at: Some(2),
                     parent_id: None,
                     base_native_session_id: None,
@@ -394,7 +420,34 @@ mod tests {
         }
 
         fn due(&self, session_id: &str, now: i64) -> Option<Due> {
-            due(&self.store, session_id, "msg_reply", 0.8, now).unwrap()
+            due(&self.store, session_id, 0.8, now).unwrap()
+        }
+    }
+
+    fn session_row(id: &str, parent: Option<&str>) -> StoredChatSession {
+        StoredChatSession {
+            id: id.into(),
+            project_id: "proj_1".into(),
+            harness: "opencode".into(),
+            native_session_id: Some("native".into()),
+            title: None,
+            title_source: None,
+            model: None,
+            service_tier: None,
+            permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: None,
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            goal: None,
+            autonomy: None,
+            active_leaf_id: None,
+            parent_session_id: parent.map(str::to_owned),
+            side_parent_session_id: None,
+            created_at: 1,
+            updated_at: 1,
         }
     }
 
@@ -465,25 +518,29 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_waiting_on_the_users_answer_is_left_alone() {
+    fn a_card_waiting_on_the_user_holds_compaction_back() {
         let fixture = Fixture::new();
         fixture.chat(
             "chat_1",
             Some(r#"{"usedTokens":190000,"contextWindow":200000}"#),
             None,
         );
-        fixture.message(
-            "msg_reply",
-            "chat_1",
-            json!([{"id": "p1", "type": "prompt", "prompt": {"kind": "plan", "resolved": false}}]),
-        );
+        let card = |resolved: bool| json!([{"id": "p1", "type": "prompt", "prompt": {"kind": "plan", "resolved": resolved}}]);
+        let text = |words: &str| json!([{"id": "t", "type": "text", "text": words}]);
+        fixture.message_at("msg_ask", "chat_1", "user", 1, text("Plan the next run"));
+        fixture.message_at("msg_plan", "chat_1", "assistant", 2, card(false));
         assert_eq!(fixture.due("chat_1", NOW), None);
 
-        fixture.message(
-            "msg_reply",
-            "chat_1",
-            json!([{"id": "p1", "type": "prompt", "prompt": {"kind": "plan", "resolved": true}}]),
-        );
+        // A wake-up turn since then doesn't answer the card.
+        fixture.message_at("msg_wake", "chat_1", "assistant", 3, text("Run finished."));
+        assert_eq!(fixture.due("chat_1", NOW), None);
+
+        fixture.message_at("msg_plan", "chat_1", "assistant", 2, card(true));
+        assert!(fixture.due("chat_1", NOW).is_some());
+
+        // A card the user wrote past is no longer waiting.
+        fixture.message_at("msg_plan", "chat_1", "assistant", 2, card(false));
+        fixture.message_at("msg_other", "chat_1", "user", 4, text("Do something else"));
         assert!(fixture.due("chat_1", NOW).is_some());
 
         // A card nested under a sub-agent's part counts too.
@@ -492,9 +549,37 @@ mod tests {
                 {"id": "q", "type": "prompt", "prompt": {"kind": "question"}}
             ]}])
         ));
-        assert!(!has_open_prompt(
-            &json!([{"id": "t", "type": "text", "text": "done"}])
-        ));
+        assert!(!has_open_prompt(&text("done")));
+    }
+
+    #[test]
+    fn an_opencode_chat_on_a_local_model_uses_the_window_it_was_connected_with() {
+        let connections = BTreeMap::from([(
+            "orx-local-1".to_string(),
+            Connection {
+                name: "LM Studio".into(),
+                base_url: "http://127.0.0.1:1234/v1".into(),
+                api_key: String::new(),
+                models: BTreeMap::from([("qwen/qwen3-8b".to_string(), 32_768)]),
+            },
+        )]);
+        let session = |harness: &str, model: Option<&str>| StoredChatSession {
+            harness: harness.into(),
+            model: model.map(str::to_owned),
+            ..session_row("chat_1", None)
+        };
+        let window = |harness, model| local_window(&session(harness, model), &connections);
+        assert_eq!(
+            window("opencode", Some("orx-local-1/qwen/qwen3-8b")),
+            Some(32_768)
+        );
+        assert_eq!(window("opencode", Some("orx-local-1/other")), None);
+        assert_eq!(
+            window("opencode", Some("anthropic/claude-sonnet-4-5")),
+            None
+        );
+        assert_eq!(window("opencode", None), None);
+        assert_eq!(window("codex", Some("orx-local-1/qwen/qwen3-8b")), None);
     }
 
     #[test]

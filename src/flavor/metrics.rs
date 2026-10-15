@@ -273,7 +273,7 @@ pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
 }
 
 /// Adds a column that tables made by an earlier VLResearch version lack.
-fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+pub(crate) fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
     let exists = conn
         .prepare(&format!(
             "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
