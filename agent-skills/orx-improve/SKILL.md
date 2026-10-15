@@ -19,8 +19,9 @@ one, scope the work first with `orx-grill`.
    Edit the forecast (`orx idea edit <ideaId> --forecast ... --interval ...`)
    before the run, never after.
 3. **Build.** Create the experiment as a child of the current best
-   (`orx metric best <projectId>` names it), changing only what the brief
-   allows. Locked files are checked at launch.
+   (`orx metric best <projectId>` prints its experiment id), changing only
+   what the brief allows. Locked files are checked against the exact commit
+   that runs.
 4. **Run.** `orx idea start <ideaId> <expId>`, then launch. When the full
    idea is expensive, run its kill test first. The chat is woken when runs
    finish, and told if one stalls or diverges.

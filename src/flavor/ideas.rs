@@ -343,14 +343,39 @@ pub(crate) fn add(store: &Store, project_id: &str, fields: IdeaFields) -> Result
     require(store, &id)
 }
 
+/// A blocker must be another idea in the same project that doesn't wait on
+/// this one, directly or through others.
+fn check_blocker(store: &Store, idea: &Idea, blocker_id: &str) -> Result<()> {
+    let blocker = require(store, blocker_id)?;
+    if blocker.project_id != idea.project_id {
+        return Err(anyhow!("Idea {} belongs to another project.", blocker.id));
+    }
+    let mut cursor = Some(blocker);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(current) = cursor {
+        if current.id == idea.id {
+            return Err(anyhow!(
+                "Idea {} already waits on {}, so it can't block it.",
+                blocker_id,
+                idea.id
+            ));
+        }
+        if !seen.insert(current.id.clone()) {
+            break;
+        }
+        cursor = match &current.blocked_by {
+            Some(next) => get(store, next)?,
+            None => None,
+        };
+    }
+    Ok(())
+}
+
 pub(crate) fn edit(store: &Store, id: &str, fields: IdeaFields) -> Result<Idea> {
     validate(&fields)?;
     let idea = require(store, id)?;
     if let Some(blocker) = &fields.blocked_by {
-        if blocker == &idea.id {
-            return Err(anyhow!("An idea can't block itself."));
-        }
-        require(store, blocker)?;
+        check_blocker(store, &idea, blocker)?;
     }
     let conn = store.flavor_conn();
     conn.execute(
@@ -453,8 +478,11 @@ pub(crate) fn close(
             let (Some(change), Some(metric)) = (measured, &primary) else {
                 return Err(anyhow!(
                     "Idea {} has no measured result to judge it by (it needs a started experiment \
-                     with a finished, scored run, its parent's score, and a primary metric). Close \
-                     it with --kept, --refuted or --drop instead.",
+                     with a finished, scored run that isn't a probe, a scored parent, and a \
+                     primary metric). Close it with `orx idea done {} --kept` or `--refuted`, or \
+                     `orx idea drop {}`.",
+                    idea.id,
+                    idea.id,
                     idea.id
                 ));
             };
@@ -498,21 +526,13 @@ fn measured_change(
     let Some(parent) = experiment.parent_experiment_id else {
         return Ok(None);
     };
-    let runs = metrics::scored_runs(store, project_id, &metric.key)?;
-    let best = |experiment: &str| {
-        runs.iter()
-            .filter(|run| run.experiment_id == experiment && run.counts())
-            .filter_map(|run| run.score)
-            .max_by(|a, b| {
-                metric
-                    .direction
-                    .gain(*a, *b)
-                    .partial_cmp(&0.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    };
-    Ok(match (best(&experiment.id), best(&parent)) {
-        (Some(score), Some(parent_score)) => Some(score - parent_score),
+    let runs = metrics::scored_runs(store, project_id, &metric.key, metric.split.as_deref())?;
+    // The idea's own experiment needs a counted run; its parent may be scored
+    // by probe runs alone (a baseline measured with seed runs, say).
+    let tested = metrics::experiment_reference(&runs, &experiment.id, metric, false);
+    let reference = metrics::experiment_reference(&runs, &parent, metric, true);
+    Ok(match (tested, reference) {
+        (Some(tested), Some(reference)) => Some(tested.score - reference.score),
         _ => None,
     })
 }
@@ -973,6 +993,7 @@ mod tests {
                 key: "val_ic".into(),
                 direction: Direction::Max,
                 noise_floor: Some(0.001),
+                split: None,
             },
         )
         .unwrap();

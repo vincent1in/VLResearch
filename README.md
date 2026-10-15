@@ -33,7 +33,7 @@ orx metric best <projectId>     # best run against the baseline, step by step
 orx metric show <runId>         # everything one run reported
 ```
 
-A run's score is the last value it reported. Choose a validation metric as primary, and keep test splits for final reports. Coding agents in VLResearch chats get these instructions as the `orx-metrics` skill.
+A run's score is the last value it reported. Choose a validation metric as primary, and keep test splits for final reports; when a key is reported under several splits, `orx metric primary` asks which one to score (`--split val`). Coding agents in VLResearch chats get these instructions as the `orx-metrics` skill.
 
 ## Tracking ideas
 
@@ -59,7 +59,7 @@ orx brief set <projectId> --objective "..." --lock eval/score.py --budget-runs 2
 orx brief confirm <projectId>    # only after you have agreed to it
 ```
 
-Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the run would change a locked file, or once the run or day budget is spent. Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder.
+Once a project has a brief, orx refuses a launch until the brief is confirmed, while a blocker idea is open, when the commit about to run changes a locked file or folder, or once the run or day budget is spent. The budget counts from the first confirmation; editing and reconfirming the brief doesn't reset it unless you ask (`--reset-budget`). Smoke tests, baseline checks and seed runs for the noise floor go through as probes (`VLR_PROBE=1 orx exp run <expId>`), which never count as results. Projects without a brief launch as before, with a reminder.
 
 Findings record what the loop learns:
 

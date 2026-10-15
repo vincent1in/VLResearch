@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{anyhow, Result};
 use crate::local::model::LocalExperiment;
@@ -61,7 +62,7 @@ pub(crate) fn parse_line(line: &str) -> Vec<MetricPoint> {
         {
             continue;
         }
-        let json = sanitize_non_finite(&rest[open..]);
+        let (json, _) = sanitize_non_finite(&rest[open..]);
         let mut stream = serde_json::Deserializer::from_str(&json).into_iter::<Record>();
         if let Some(Ok(record)) = stream.next() {
             points.extend(points_from_record(&record));
@@ -161,12 +162,28 @@ fn points_from_record(record: &Record) -> Vec<MetricPoint> {
         .collect()
 }
 
-/// Python's `json.dumps` writes NaN, Infinity and -Infinity bare, which is not
-/// JSON. Outside strings they become `null`.
-fn sanitize_non_finite(text: &str) -> String {
+/// Spellings of non-finite numbers that code prints where JSON wants a number:
+/// Python's `json.dumps` writes `NaN` and `Infinity`, and an f-string writes
+/// `nan` and `inf`. Longer spellings come first so they win.
+const NON_FINITE: [&str; 8] = [
+    "-infinity",
+    "+infinity",
+    "infinity",
+    "-inf",
+    "+inf",
+    "inf",
+    "-nan",
+    "nan",
+];
+
+/// Replaces non-finite number tokens outside strings with `null`. Returns the
+/// text and whether anything was replaced.
+fn sanitize_non_finite(text: &str) -> (String, bool) {
     let mut out = String::with_capacity(text.len());
     let mut in_string = false;
     let mut escaped = false;
+    let mut replaced = false;
+    let mut previous: Option<char> = None;
     let mut rest = text;
     while let Some(c) = rest.chars().next() {
         if in_string {
@@ -178,23 +195,48 @@ fn sanitize_non_finite(text: &str) -> String {
             } else if c == '"' {
                 in_string = false;
             }
+            previous = Some(c);
             rest = &rest[c.len_utf8()..];
             continue;
         }
         if c == '"' {
             in_string = true;
-        } else if let Some(token) = ["-Infinity", "Infinity", "NaN"]
-            .into_iter()
-            .find(|token| rest.starts_with(token))
-        {
-            out.push_str("null");
-            rest = &rest[token.len()..];
-            continue;
+        } else if !previous.is_some_and(|p| p.is_ascii_alphanumeric()) {
+            let token = NON_FINITE.into_iter().find(|token| {
+                rest.get(..token.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(token))
+                    && !rest[token.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next.is_ascii_alphanumeric())
+            });
+            if let Some(token) = token {
+                out.push_str("null");
+                replaced = true;
+                previous = Some('l');
+                rest = &rest[token.len()..];
+                continue;
+            }
         }
         out.push(c);
+        previous = Some(c);
         rest = &rest[c.len_utf8()..];
     }
-    out
+    (out, replaced)
+}
+
+/// Whether a metrics line reports a NaN or an infinity.
+pub(crate) fn has_non_finite(line: &str) -> bool {
+    let mut rest = line;
+    while let Some(index) = rest.find(MARKER) {
+        rest = &rest[index + MARKER.len()..];
+        if let Some(open) = rest.find('{') {
+            if sanitize_non_finite(&rest[open..]).1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
@@ -211,18 +253,35 @@ pub(crate) fn ensure_tables(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_vlr_run_metrics_key ON vlr_run_metrics(run_id, key);
          CREATE TABLE IF NOT EXISTS vlr_metric_offsets (
-             run_id   TEXT PRIMARY KEY,
-             offset   INTEGER NOT NULL,
-             next_seq INTEGER NOT NULL
+             run_id    TEXT PRIMARY KEY,
+             offset    INTEGER NOT NULL,
+             next_seq  INTEGER NOT NULL,
+             head_hash TEXT
          );
          CREATE TABLE IF NOT EXISTS vlr_project_metric (
              project_id  TEXT PRIMARY KEY,
              key         TEXT NOT NULL,
              direction   TEXT NOT NULL,
              noise_floor REAL,
-             updated_at  INTEGER NOT NULL
+             updated_at  INTEGER NOT NULL,
+             split       TEXT
          );",
     )?;
+    add_column(conn, "vlr_metric_offsets", "head_hash", "TEXT")?;
+    add_column(conn, "vlr_project_metric", "split", "TEXT")?;
+    Ok(())
+}
+
+/// Adds a column that tables made by an earlier VLResearch version lack.
+fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let exists = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))?
+        .exists([column])?;
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+    }
     Ok(())
 }
 
@@ -245,6 +304,17 @@ fn immediate<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Result<T
     }
 }
 
+/// How much of a log's start identifies it: a supervisor that restarts
+/// rewrites its log from the top, and a changed start means a new log.
+const HEAD_BYTES: u64 = 4096;
+
+fn head_hash(mut file: &std::fs::File, length: u64) -> Result<String> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut head = Vec::new();
+    Read::take(&mut file, length.min(HEAD_BYTES)).read_to_end(&mut head)?;
+    Ok(format!("{:x}", Sha256::digest(&head)))
+}
+
 /// Records the metrics a run has printed since the last call. A finished run's
 /// last line counts even without a trailing newline.
 pub(crate) fn ingest(store: &Store, run: &StoredRun) -> Result<usize> {
@@ -254,23 +324,39 @@ pub(crate) fn ingest(store: &Store, run: &StoredRun) -> Result<usize> {
     let Ok(file) = std::fs::File::open(&path) else {
         return Ok(0);
     };
-    let length = file.metadata()?.len();
     let finished = crate::store::is_terminal_status(&run.status);
     immediate(conn, || {
-        let (mut offset, mut seq): (u64, i64) = conn
+        // Measured inside the transaction, so a reader that waited for
+        // another one sees the log as it is now.
+        let length = file.metadata()?.len();
+        let stored: Option<(u64, i64, Option<String>)> = conn
             .query_row(
-                "SELECT offset, next_seq FROM vlr_metric_offsets WHERE run_id = ?1",
+                "SELECT offset, next_seq, head_hash FROM vlr_metric_offsets WHERE run_id = ?1",
                 [&run.id],
-                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u64,
+                        row.get(1)?,
+                        row.get(2)?,
+                    ))
+                },
             )
-            .optional()?
-            .unwrap_or((0, 0));
-        if length < offset {
-            // The log was replaced; start it over.
+            .optional()?;
+        let (mut offset, mut seq) = stored
+            .as_ref()
+            .map_or((0, 0), |(offset, seq, _)| (*offset, *seq));
+        let replaced = match &stored {
+            Some((stored_offset, _, _)) if length < *stored_offset => true,
+            Some((stored_offset, _, Some(hash))) if *stored_offset > 0 => {
+                *hash != head_hash(&file, *stored_offset)?
+            }
+            _ => false,
+        };
+        if replaced {
             conn.execute("DELETE FROM vlr_run_metrics WHERE run_id = ?1", [&run.id])?;
             (offset, seq) = (0, 0);
         }
-        if length == offset {
+        if length == offset && !replaced {
             return Ok(0);
         }
         let mut reader = BufReader::new(&file);
@@ -314,11 +400,13 @@ pub(crate) fn ingest(store: &Store, run: &StoredRun) -> Result<usize> {
                 recorded += 1;
             }
         }
+        let hash = head_hash(&file, offset)?;
         conn.execute(
-            "INSERT INTO vlr_metric_offsets (run_id, offset, next_seq) VALUES (?1, ?2, ?3)
+            "INSERT INTO vlr_metric_offsets (run_id, offset, next_seq, head_hash)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(run_id) DO UPDATE SET offset = excluded.offset,
-                                               next_seq = excluded.next_seq",
-            params![run.id, offset as i64, seq],
+                 next_seq = excluded.next_seq, head_hash = excluded.head_hash",
+            params![run.id, offset as i64, seq, hash],
         )?;
         Ok(recorded)
     })
@@ -364,6 +452,8 @@ pub(crate) struct PrimaryMetric {
     pub direction: Direction,
     /// The smallest gain that counts as an improvement rather than noise.
     pub noise_floor: Option<f64>,
+    /// The split the key is scored on, when runs report it under several.
+    pub split: Option<String>,
 }
 
 pub(crate) fn primary(store: &Store, project_id: &str) -> Result<Option<PrimaryMetric>> {
@@ -371,22 +461,25 @@ pub(crate) fn primary(store: &Store, project_id: &str) -> Result<Option<PrimaryM
     ensure_tables(conn)?;
     let row = conn
         .query_row(
-            "SELECT key, direction, noise_floor FROM vlr_project_metric WHERE project_id = ?1",
+            "SELECT key, direction, noise_floor, split FROM vlr_project_metric
+             WHERE project_id = ?1",
             [project_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
         .optional()?;
-    Ok(row.and_then(|(key, direction, noise_floor)| {
+    Ok(row.and_then(|(key, direction, noise_floor, split)| {
         Some(PrimaryMetric {
             key,
             direction: Direction::parse(&direction)?,
             noise_floor,
+            split,
         })
     }))
 }
@@ -404,20 +497,40 @@ pub(crate) fn set_primary(store: &Store, project_id: &str, metric: &PrimaryMetri
     let conn = store.flavor_conn();
     ensure_tables(conn)?;
     conn.execute(
-        "INSERT INTO vlr_project_metric (project_id, key, direction, noise_floor, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO vlr_project_metric (project_id, key, direction, noise_floor, updated_at, split)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(project_id) DO UPDATE SET key = excluded.key,
              direction = excluded.direction, noise_floor = excluded.noise_floor,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at, split = excluded.split",
         params![
             project_id,
             metric.key.trim(),
             metric.direction.as_str(),
             metric.noise_floor,
-            crate::store::now_ms()
+            crate::store::now_ms(),
+            metric.split.as_deref().map(str::trim).filter(|split| !split.is_empty()),
         ],
     )?;
     Ok(())
+}
+
+/// The splits a key has been reported under across the project's runs
+/// (`None` for points without a split).
+pub(crate) fn key_splits(
+    store: &Store,
+    project_id: &str,
+    key: &str,
+) -> Result<Vec<Option<String>>> {
+    let conn = store.flavor_conn();
+    ensure_tables(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT m.split FROM vlr_run_metrics m JOIN runs r ON r.id = m.run_id
+         WHERE r.project_id = ?1 AND m.key = ?2 ORDER BY m.split",
+    )?;
+    let splits = stmt
+        .query_map(params![project_id, key], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(splits)
 }
 
 /// What a run reported for one key.
@@ -477,17 +590,24 @@ pub(crate) fn run_summary(store: &Store, run_id: &str) -> Result<Vec<KeySummary>
     Ok(summaries)
 }
 
-/// A run's score on `key`: the last finite value it reported. Code that keeps
-/// the best checkpoint should report that checkpoint's score last.
-pub(crate) fn final_value(store: &Store, run_id: &str, key: &str) -> Result<Option<f64>> {
+/// A run's score on `key` (and `split`, when given): the last finite value it
+/// reported. Code that keeps the best checkpoint should report that
+/// checkpoint's score last.
+pub(crate) fn final_value(
+    store: &Store,
+    run_id: &str,
+    key: &str,
+    split: Option<&str>,
+) -> Result<Option<f64>> {
     let conn = store.flavor_conn();
     ensure_tables(conn)?;
     Ok(conn
         .query_row(
             "SELECT value FROM vlr_run_metrics
              WHERE run_id = ?1 AND key = ?2 AND value IS NOT NULL
+               AND (?3 IS NULL OR split = ?3)
              ORDER BY seq DESC LIMIT 1",
-            params![run_id, key],
+            params![run_id, key, split],
             |row| row.get(0),
         )
         .optional()?)
@@ -514,16 +634,25 @@ impl ScoredRun {
     pub(crate) fn counts(&self) -> bool {
         self.status == "done" && !self.probe
     }
+
+    fn ended(&self) -> i64 {
+        self.ended_at.unwrap_or(self.created_at)
+    }
 }
 
-/// Every run in the project, newest first, scored on `key` after reading any
-/// new output.
-pub(crate) fn scored_runs(store: &Store, project_id: &str, key: &str) -> Result<Vec<ScoredRun>> {
+/// Every run in the project, newest first, scored on `key` (in `split`, when
+/// given) after reading any new output.
+pub(crate) fn scored_runs(
+    store: &Store,
+    project_id: &str,
+    key: &str,
+    split: Option<&str>,
+) -> Result<Vec<ScoredRun>> {
     let names = experiment_names(store, project_id)?;
     let mut scored = Vec::new();
     for run in store.list_runs_by_project(project_id)? {
         ingest(store, &run)?;
-        let score = final_value(store, &run.id, key)?;
+        let score = final_value(store, &run.id, key, split)?;
         let probe = super::scope::is_probe(store, &run.id)?;
         scored.push(ScoredRun {
             experiment: names
@@ -577,13 +706,92 @@ fn display_name(experiment: &LocalExperiment) -> String {
         .to_owned()
 }
 
+/// The one rule for "best": walking finished, counted runs in the order they
+/// ended, a run takes over only when it gains more than the noise floor on the
+/// current best. Used for the project and for each experiment alike.
+fn best_by_rule<'a>(
+    runs: impl Iterator<Item = &'a ScoredRun>,
+    metric: &PrimaryMetric,
+) -> Option<&'a ScoredRun> {
+    let mut finished: Vec<&ScoredRun> = runs
+        .filter(|run| run.counts() && run.score.is_some())
+        .collect();
+    finished.sort_by_key(|run| (run.ended(), run.created_at));
+    let floor = metric.noise_floor.unwrap_or(0.0);
+    let mut best: Option<&ScoredRun> = None;
+    for run in finished {
+        let takes_over = match best.and_then(|incumbent| incumbent.score) {
+            None => true,
+            Some(incumbent) => {
+                metric
+                    .direction
+                    .gain(run.score.unwrap_or_default(), incumbent)
+                    > floor
+            }
+        };
+        if takes_over {
+            best = Some(run);
+        }
+    }
+    best
+}
+
+/// What an experiment scores: its best run by the same rule as the project's
+/// running best. An experiment whose runs are all probes (a baseline measured
+/// only with seed runs, say) can fall back to their mean.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Reference {
+    pub experiment_id: String,
+    pub experiment: String,
+    /// The run behind the score; `None` when it is a mean of probe runs.
+    pub run_id: Option<String>,
+    pub score: f64,
+    /// How many probe runs the score averages (0 for a single counted run).
+    pub probe_runs: usize,
+}
+
+pub(crate) fn experiment_reference(
+    runs: &[ScoredRun],
+    experiment_id: &str,
+    metric: &PrimaryMetric,
+    allow_probes: bool,
+) -> Option<Reference> {
+    let of_experiment = || runs.iter().filter(|run| run.experiment_id == experiment_id);
+    if let Some(run) = best_by_rule(of_experiment(), metric) {
+        return Some(Reference {
+            experiment_id: run.experiment_id.clone(),
+            experiment: run.experiment.clone(),
+            run_id: Some(run.run_id.clone()),
+            score: run.score?,
+            probe_runs: 0,
+        });
+    }
+    if !allow_probes {
+        return None;
+    }
+    let probes: Vec<&ScoredRun> = of_experiment()
+        .filter(|run| run.probe && run.status == "done")
+        .filter(|run| run.score.is_some())
+        .collect();
+    let first = probes.first()?;
+    let mean = probes.iter().filter_map(|run| run.score).sum::<f64>() / probes.len() as f64;
+    Some(Reference {
+        experiment_id: first.experiment_id.clone(),
+        experiment: first.experiment.clone(),
+        run_id: None,
+        score: mean,
+        probe_runs: probes.len(),
+    })
+}
+
 /// Where a project stands on its primary metric.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Standing {
-    /// The best finished run of the best experiment's root experiment: the
-    /// baseline every gain is measured from.
-    pub baseline: Option<ScoredRun>,
+    /// The best experiment's root, scored by the same rule: the baseline every
+    /// gain is measured from.
+    pub baseline: Option<Reference>,
     pub best: Option<ScoredRun>,
     /// Finished, scored runs in the order they ended, with the best so far.
     pub history: Vec<HistoryPoint>,
@@ -601,42 +809,33 @@ pub(crate) struct HistoryPoint {
     pub new_best: bool,
 }
 
-/// The running best over finished runs. A run only takes over as best when it
-/// gains more than the noise floor, so noise can't crown a run.
+/// The running best over finished, counted runs.
 pub(crate) fn running_best(runs: &[ScoredRun], metric: &PrimaryMetric) -> Standing {
     let mut finished: Vec<&ScoredRun> = runs
         .iter()
         .filter(|run| run.counts() && run.score.is_some())
         .collect();
-    finished.sort_by_key(|run| (run.ended_at.unwrap_or(run.created_at), run.created_at));
-    let floor = metric.noise_floor.unwrap_or(0.0);
-    let mut best: Option<&ScoredRun> = None;
-    let mut history = Vec::new();
-    for run in finished {
-        let score = run.score.unwrap_or_default();
-        let new_best = match best.and_then(|incumbent| incumbent.score) {
-            None => true,
-            Some(incumbent) => metric.direction.gain(score, incumbent) > floor,
-        };
-        if new_best {
-            best = Some(run);
-        }
+    finished.sort_by_key(|run| (run.ended(), run.created_at));
+    let mut history = Vec::with_capacity(finished.len());
+    for (index, run) in finished.iter().enumerate() {
+        let best = best_by_rule(finished[..=index].iter().copied(), metric);
+        let new_best = best.is_some_and(|best| best.run_id == run.run_id);
         history.push(HistoryPoint {
             run_id: run.run_id.clone(),
-            ended_at: run.ended_at.unwrap_or(run.created_at),
-            score,
-            best_so_far: best.and_then(|run| run.score).unwrap_or(score),
+            ended_at: run.ended(),
+            score: run.score.unwrap_or_default(),
+            best_so_far: best.and_then(|best| best.score).unwrap_or_default(),
             new_best,
         });
     }
     Standing {
         baseline: None,
-        best: best.cloned(),
+        best: best_by_rule(runs.iter(), metric).cloned(),
         history,
     }
 }
 
-/// One experiment on the path from the baseline to the best experiment.
+/// One experiment on the path from the baseline to the best run.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PathStep {
@@ -644,20 +843,22 @@ pub(crate) struct PathStep {
     pub experiment: String,
     /// The title of the idea the experiment tested, when one is linked.
     pub idea: Option<String>,
-    /// The experiment's best finished run.
+    /// The run behind the step's score (the best run itself on the last step).
     pub run_id: Option<String>,
     pub score: Option<f64>,
+    /// How many probe runs the score averages, when it is such a mean.
+    pub probe_runs: usize,
     /// Change from the previous scored step, in the metric's raw units.
     pub delta: Option<f64>,
 }
 
-/// The lineage from the root of `experiment_id` down to it, each step scored
-/// by its experiment's best finished run. Deltas between scored steps add up
-/// to the total change from the baseline.
+/// The lineage from the root of the best run's experiment down to that run.
+/// The last step is the best run itself and the first is the baseline, so
+/// the deltas between scored steps add up to the gain the headline reports.
 pub(crate) fn lineage(
     store: &Store,
     project_id: &str,
-    experiment_id: &str,
+    best: &ScoredRun,
     runs: &[ScoredRun],
     metric: &PrimaryMetric,
 ) -> Result<Vec<PathStep>> {
@@ -667,7 +868,7 @@ pub(crate) fn lineage(
         .map(|experiment| (experiment.id.clone(), experiment))
         .collect();
     let mut chain = Vec::new();
-    let mut cursor = Some(experiment_id.to_owned());
+    let mut cursor = Some(best.experiment_id.clone());
     while let Some(id) = cursor {
         if chain.contains(&id) || chain.len() > 10_000 {
             break;
@@ -681,18 +882,18 @@ pub(crate) fn lineage(
     let mut steps = Vec::with_capacity(chain.len());
     let mut previous: Option<f64> = None;
     for id in chain {
-        let best_run = runs
-            .iter()
-            .filter(|run| run.experiment_id == id && run.counts())
-            .filter_map(|run| run.score.map(|score| (run, score)))
-            .max_by(|(_, a), (_, b)| {
-                metric
-                    .direction
-                    .gain(*a, *b)
-                    .partial_cmp(&0.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        let score = best_run.map(|(_, score)| score);
+        let (run_id, score, probe_runs) = if id == best.experiment_id {
+            (Some(best.run_id.clone()), best.score, 0)
+        } else {
+            match experiment_reference(runs, &id, metric, true) {
+                Some(reference) => (
+                    reference.run_id,
+                    Some(reference.score),
+                    reference.probe_runs,
+                ),
+                None => (None, None, 0),
+            }
+        };
         let delta = match (score, previous) {
             (Some(score), Some(previous)) => Some(score - previous),
             _ => None,
@@ -706,9 +907,10 @@ pub(crate) fn lineage(
                 .map(display_name)
                 .unwrap_or_else(|| id.clone()),
             idea: None,
-            run_id: best_run.map(|(run, _)| run.run_id.clone()),
-            experiment_id: id,
+            run_id,
             score,
+            probe_runs,
+            experiment_id: id,
             delta,
         });
     }
@@ -722,10 +924,10 @@ pub(crate) fn standing(
     project_id: &str,
     metric: &PrimaryMetric,
 ) -> Result<(Standing, Vec<PathStep>, Vec<ScoredRun>)> {
-    let runs = scored_runs(store, project_id, &metric.key)?;
+    let runs = scored_runs(store, project_id, &metric.key, metric.split.as_deref())?;
     let mut standing = running_best(&runs, metric);
     let mut path = match &standing.best {
-        Some(best) => lineage(store, project_id, &best.experiment_id, &runs, metric)?,
+        Some(best) => lineage(store, project_id, best, &runs, metric)?,
         None => Vec::new(),
     };
     let ideas = super::ideas::titles_by_experiment(store, project_id)?;
@@ -733,10 +935,13 @@ pub(crate) fn standing(
         step.idea = ideas.get(&step.experiment_id).cloned();
     }
     if let Some(root) = path.first() {
-        standing.baseline = root
-            .run_id
-            .as_ref()
-            .and_then(|run_id| runs.iter().find(|run| &run.run_id == run_id).cloned());
+        standing.baseline = root.score.map(|score| Reference {
+            experiment_id: root.experiment_id.clone(),
+            experiment: root.experiment.clone(),
+            run_id: root.run_id.clone(),
+            score,
+            probe_runs: root.probe_runs,
+        });
     }
     Ok((standing, path, runs))
 }
@@ -807,6 +1012,23 @@ mod tests {
                 point("lr", None, None),
             ]
         );
+    }
+
+    #[test]
+    fn printed_nan_and_inf_spellings_are_missing_values_too() {
+        assert_eq!(
+            parse_line(r#"ORX_METRIC {"loss": nan, "ic": -inf, "note": "inference", "acc": 0.5}"#),
+            [
+                point("loss", None, None),
+                point("ic", None, None),
+                point("acc", Some(0.5), None),
+            ]
+        );
+        assert!(has_non_finite(
+            r#"ORX_METRIC {"sharpe_ratio_annualized_net": NaN}"#
+        ));
+        assert!(!has_non_finite(r#"ORX_METRIC {"tag": "NaN", "info": 1}"#));
+        assert!(!has_non_finite("loss nan, but no marker"));
     }
 
     #[test]
@@ -884,7 +1106,7 @@ mod tests {
         assert_eq!(summary[0].last, Some(0.025));
         assert_eq!(summary[0].last_step, Some(3));
         assert_eq!(
-            final_value(&store, "run_live", "val_ic").unwrap(),
+            final_value(&store, "run_live", "val_ic", None).unwrap(),
             Some(0.025)
         );
 
@@ -895,7 +1117,7 @@ mod tests {
         std::io::Write::write_all(&mut file, b"\nORX_METRIC {\"val_ic\": 0.03}\n").unwrap();
         assert_eq!(ingest(&store, &finished).unwrap(), 1);
         assert_eq!(
-            final_value(&store, "run_live", "val_ic").unwrap(),
+            final_value(&store, "run_live", "val_ic", None).unwrap(),
             Some(0.03)
         );
 
@@ -932,6 +1154,7 @@ mod tests {
             key: "val_ic".into(),
             direction: Direction::Max,
             noise_floor: Some(0.001),
+            split: None,
         };
         let standing = running_best(&runs, &metric);
         assert_eq!(standing.best.unwrap().run_id, "c");
@@ -979,8 +1202,9 @@ mod tests {
             key: "val_ic".into(),
             direction: Direction::Max,
             noise_floor: None,
+            split: None,
         };
-        let path = lineage(&store, "proj_1", "e2", &runs, &metric).unwrap();
+        let path = lineage(&store, "proj_1", &runs[3], &runs, &metric).unwrap();
         let ids: Vec<_> = path
             .iter()
             .map(|step| step.experiment_id.as_str())
@@ -1011,6 +1235,7 @@ mod tests {
             key: "val_ic".into(),
             direction: Direction::Max,
             noise_floor: Some(0.002),
+            split: Some("val".into()),
         };
         set_primary(&store, "proj_1", &metric).unwrap();
         assert_eq!(primary(&store, "proj_1").unwrap(), Some(metric.clone()));

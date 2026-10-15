@@ -148,9 +148,6 @@ const METRIC_WORDS: &[&str] = &[
     "returns",
     "ppl",
     "perplexity",
-    "grad",
-    "gradient",
-    "norm",
     "lr",
     "logits",
     "kl",
@@ -162,9 +159,14 @@ const METRIC_WORDS: &[&str] = &[
     "err",
 ];
 
-/// `loss=nan`, `val_loss: NaN`, `{"sharpe": Infinity}`, `grad_norm tensor(inf)`:
-/// a NaN or infinite value within three words after a metric name.
+/// `loss=nan`, `val_loss: NaN`, `sharpe -inf`: a NaN or infinite value within
+/// three words after a metric name. Gradient norms are left out: with mixed
+/// precision an infinite gradient just skips a step. `ORX_METRIC` lines are
+/// read exactly, whatever their keys are called.
 fn line_has_nonfinite_metric(line: &str) -> bool {
+    if line.contains(super::metrics::MARKER) {
+        return super::metrics::has_non_finite(line);
+    }
     let lower = line.to_ascii_lowercase();
     let words: Vec<&str> = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -239,7 +241,7 @@ pub(crate) fn scan(store: &Store, wakeups: &[RunWakeup], now: i64) -> Result<()>
         let log = super::wake::run_log_path(store, &run.id);
         let since = quiet_since(run, super::wake::modified_ms(&log));
         let mut found = Vec::new();
-        if now - since >= minutes * 60_000 && !unmonitored(run) {
+        if now - since >= minutes.saturating_mul(60_000) && !unmonitored(run) {
             found.push(AlertKind::Quiet);
         } else {
             // Output resumed (or never stopped): a past quiet alert no longer
@@ -425,8 +427,8 @@ mod tests {
             "epoch 3 | loss=nan | acc=0.51",
             "step 1200 val_loss: NaN",
             "{\"sharpe\": Infinity, \"turnover\": 0.3}",
-            "train/grad_norm tensor(inf, device='cuda:0')",
             "ORX_METRIC {\"ic\": -inf}",
+            "ORX_METRIC {\"sharpe_ratio_annualized_net\": NaN}",
         ] {
             assert_eq!(scan_tail(line), [AlertKind::NonFinite], "{line}");
         }
@@ -435,6 +437,9 @@ mod tests {
             "loss=0.42 acc=0.91",
             "nan values dropped from the price table",
             "Info: banana count 3",
+            // Mixed precision skips a step when gradients overflow.
+            "train/grad_norm tensor(inf, device='cuda:0')",
+            "ORX_METRIC {\"loss\": 0.4, \"tag\": \"nan\"}",
         ] {
             assert!(scan_tail(line).is_empty(), "{line}");
         }

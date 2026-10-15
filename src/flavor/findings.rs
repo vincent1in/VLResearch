@@ -522,11 +522,13 @@ pub(crate) fn assessments(store: &Store, id: &str) -> Result<Vec<Assessment>> {
         .collect())
 }
 
-/// Locks or unlocks a finding. Only the user may unlock: an agent session is
-/// refused, so a settled claim can't be reopened by the agent that disputes it.
-pub(crate) fn set_locked(store: &Store, id: &str, locked: bool) -> Result<Finding> {
+/// Locks or unlocks a finding. Unlocking needs `by_user` (see
+/// [`super::by_user`]), so a settled claim isn't reopened by the agent that
+/// disputes it. This keeps a well-behaved agent from slipping; it is not a
+/// security boundary against one that sets out to get around it.
+pub(crate) fn set_locked(store: &Store, id: &str, locked: bool, by_user: bool) -> Result<Finding> {
     let finding = require(store, id)?;
-    if !locked && finding.locked && crate::local::chat::in_local_session() {
+    if !locked && finding.locked && !by_user {
         return Err(anyhow!(
             "Only the user can unlock finding {}. Ask them to run `orx finding unlock {}` in a \
              terminal.",
@@ -641,7 +643,7 @@ mod tests {
         .is_err());
 
         // Locked: no more verdicts or rewording, but evidence still lands.
-        set_locked(&store, &claim.id, true).unwrap();
+        set_locked(&store, &claim.id, true, false).unwrap();
         assert!(assess(&store, &claim.id, Verdict::Refuted, None, None, None, None).is_err());
         assert!(edit(&store, &claim.id, Some("Reworded"), None).is_err());
         add_evidence(
@@ -658,7 +660,8 @@ mod tests {
             require(&store, &claim.id).unwrap().status,
             Status::Supported
         );
-        set_locked(&store, &claim.id, false).unwrap();
+        assert!(set_locked(&store, &claim.id, false, false).is_err());
+        set_locked(&store, &claim.id, false, true).unwrap();
         edit(&store, &claim.id, Some("Reworded"), None).unwrap();
 
         assert_eq!(list(&store, "p").unwrap().len(), 2);

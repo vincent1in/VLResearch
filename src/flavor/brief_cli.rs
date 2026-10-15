@@ -22,6 +22,7 @@ pub(crate) fn run(command: BriefCommand) -> Result<()> {
             budget_runs,
             budget_gpu_hours,
             budget_days,
+            reset_budget,
             pointers,
             sources,
             stop_rule,
@@ -39,6 +40,7 @@ pub(crate) fn run(command: BriefCommand) -> Result<()> {
                     budget_runs,
                     budget_gpu_hours,
                     budget_days,
+                    reset_budget,
                     pointers,
                     sources,
                     stop_rule,
@@ -58,11 +60,7 @@ pub(crate) fn run(command: BriefCommand) -> Result<()> {
         }
         BriefCommand::Confirm { project_id } => {
             let project = crate::local::resolve::resolve_project(&store, &project_id)?;
-            let by = if crate::local::chat::in_local_session() {
-                "agent"
-            } else {
-                "user"
-            };
+            let by = if super::by_user() { "user" } else { "agent" };
             let brief = scope::confirm(&store, &project, by)?;
             let locked = if brief.locked.is_empty() {
                 String::new()

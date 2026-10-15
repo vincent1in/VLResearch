@@ -255,6 +255,8 @@ impl LocalPlane {
     }
 
     pub async fn launch(&self, mut args: ExpRunArgs) -> Result<()> {
+        // VLResearch: pass a probe request on to the gate, and remind about briefs.
+        let _vlr_launch = crate::flavor::scope::before_launch(&args.exp_id);
         // Fill backend/flavor from the persisted default
         // BEFORE the flag validations below, so e.g. `--host box1` with a default
         // of `ssh` is a valid launch, and before `backend_label` is captured, so

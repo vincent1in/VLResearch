@@ -15,6 +15,7 @@ pub(crate) mod findings;
 pub(crate) mod harness;
 pub(crate) mod idea_cli;
 pub(crate) mod ideas;
+pub(crate) mod metric_cli;
 pub(crate) mod metrics;
 pub(crate) mod scope;
 pub(crate) mod skills;
@@ -40,6 +41,15 @@ pub(crate) fn set_env_defaults(cmd: &mut tokio::process::Command, defaults: &[(&
             cmd.env(key, value);
         }
     }
+}
+
+/// Whether the person, not a coding agent, is running this command: outside
+/// an agent's chat session, at an interactive terminal (an agent's shell tool
+/// has none). Used to attribute brief confirmations and to reserve unlocking
+/// findings for the user.
+pub(crate) fn by_user() -> bool {
+    use std::io::IsTerminal;
+    !crate::local::chat::in_local_session() && std::io::stdin().is_terminal()
 }
 
 /// Reads a boolean switch from the environment: `1`, `true`, `yes` or `on`

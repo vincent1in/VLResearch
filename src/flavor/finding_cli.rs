@@ -104,12 +104,12 @@ pub(crate) fn run(command: FindingCommand) -> Result<()> {
             Ok(())
         }
         FindingCommand::Lock { finding_id } => {
-            let finding = findings::set_locked(&store, &finding_id, true)?;
+            let finding = findings::set_locked(&store, &finding_id, true, super::by_user())?;
             println!("Finding {} is locked.", finding.id);
             Ok(())
         }
         FindingCommand::Unlock { finding_id } => {
-            let finding = findings::set_locked(&store, &finding_id, false)?;
+            let finding = findings::set_locked(&store, &finding_id, false, super::by_user())?;
             println!("Finding {} is unlocked.", finding.id);
             Ok(())
         }
