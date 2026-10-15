@@ -54,6 +54,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/local/opencode.rs` | Test expects the new wake-up wording |
 | `agent-skills/orx-compute/SKILL.md` | Wake-up and `exp wait` guidance for agents |
 | `.github/workflows/release-on-bump.yml`, `linked-issue.yml` | Run only in alphaXiv/OpenResearch |
+| `.github/workflows/ci.yml` | The Windows test step keeps its output, and `flavor/scripts/test-failures.sh` names failing tests in annotations |
 | `.gitattributes`, `.gitignore` | Keep our README; ignore credential files |
 
 ## Taking an OpenResearch release

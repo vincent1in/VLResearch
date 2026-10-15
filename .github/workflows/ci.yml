@@ -196,7 +196,16 @@ jobs:
         run: cargo build --locked
 
       - name: Test
-        run: cargo test --locked
+        id: test
+        # VLResearch: keep the output for the step below.
+        run: cargo test --locked 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/cargo-test.log"
+
+      # VLResearch: name the failing tests in annotations, which GitHub's API
+      # serves even where the log itself can't be downloaded.
+      - name: Name the failing tests
+        if: failure() && steps.test.outcome == 'failure'
+        shell: bash
+        run: bash flavor/scripts/test-failures.sh "$RUNNER_TEMP/cargo-test.log"
 
       # A debug orx.exe is slow enough to colour a tester's impression of the
       # dashboard, so the artifact is the build they would actually be given.
