@@ -121,8 +121,7 @@ struct Due {
     context_window: u64,
 }
 
-/// Whether the chat should be compacted now. Not when it is a delegated
-/// helper, whose parent reads its last reply; not while a plan, question or
+/// Whether the chat should be compacted now. Not while a plan, question or
 /// permission card waits for the user, since answering it starts a turn that
 /// a running compaction would refuse; not when the window's size is unknown;
 /// and not while an earlier automatic compaction holds it back.
@@ -130,9 +129,6 @@ fn due(store: &Store, session_id: &str, threshold: f64, now: i64) -> Result<Opti
     let Some(session) = store.get_chat_session(session_id)? else {
         return Ok(None);
     };
-    if session.parent_session_id.is_some() {
-        return Ok(None);
-    }
     let Some(usage) = session
         .context_usage_json
         .as_deref()
@@ -367,10 +363,8 @@ mod tests {
             Self { dir, store }
         }
 
-        fn chat(&self, id: &str, usage: Option<&str>, parent: Option<&str>) {
-            self.store
-                .create_chat_session(&session_row(id, parent))
-                .unwrap();
+        fn chat(&self, id: &str, usage: Option<&str>) {
+            self.store.create_chat_session(&session_row(id)).unwrap();
             // Written as a turn's end writes it; creating a chat leaves it out.
             if let Some(usage) = usage {
                 self.store
@@ -425,7 +419,7 @@ mod tests {
         }
     }
 
-    fn session_row(id: &str, parent: Option<&str>) -> StoredChatSession {
+    fn session_row(id: &str) -> StoredChatSession {
         StoredChatSession {
             id: id.into(),
             project_id: "proj_1".into(),
@@ -445,7 +439,6 @@ mod tests {
             goal: None,
             autonomy: None,
             active_leaf_id: None,
-            parent_session_id: parent.map(str::to_owned),
             side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
@@ -491,20 +484,13 @@ mod tests {
         fixture.chat(
             "full",
             Some(r#"{"usedTokens":160000,"contextWindow":200000}"#),
-            None,
         );
         fixture.chat(
             "roomy",
             Some(r#"{"usedTokens":120000,"contextWindow":200000}"#),
-            None,
         );
-        fixture.chat("no_window", Some(r#"{"usedTokens":190000}"#), None);
-        fixture.chat("fresh", None, None);
-        fixture.chat(
-            "helper",
-            Some(r#"{"usedTokens":199000,"contextWindow":200000}"#),
-            Some("full"),
-        );
+        fixture.chat("no_window", Some(r#"{"usedTokens":190000}"#));
+        fixture.chat("fresh", None);
 
         assert_eq!(
             fixture.due("full", NOW),
@@ -513,7 +499,7 @@ mod tests {
                 context_window: 200_000
             })
         );
-        for session in ["roomy", "no_window", "fresh", "helper", "missing"] {
+        for session in ["roomy", "no_window", "fresh", "missing"] {
             assert_eq!(fixture.due(session, NOW), None, "session {session}");
         }
     }
@@ -524,7 +510,6 @@ mod tests {
         fixture.chat(
             "chat_1",
             Some(r#"{"usedTokens":190000,"contextWindow":200000}"#),
-            None,
         );
         let card = |resolved: bool| json!([{"id": "p1", "type": "prompt", "prompt": {"kind": "plan", "resolved": resolved}}]);
         let text = |words: &str| json!([{"id": "t", "type": "text", "text": words}]);
@@ -567,7 +552,7 @@ mod tests {
         let session = |harness: &str, model: Option<&str>| StoredChatSession {
             harness: harness.into(),
             model: model.map(str::to_owned),
-            ..session_row("chat_1", None)
+            ..session_row("chat_1")
         };
         let window = |harness, model| local_window(&session(harness, model), &connections);
         assert_eq!(
@@ -589,7 +574,6 @@ mod tests {
         fixture.chat(
             "chat_1",
             Some(r#"{"usedTokens":170000,"contextWindow":200000}"#),
-            None,
         );
         let due = fixture.due("chat_1", NOW).unwrap();
         record(
@@ -623,12 +607,10 @@ mod tests {
         fixture.chat(
             "stopped",
             Some(r#"{"usedTokens":170000,"contextWindow":200000}"#),
-            None,
         );
         fixture.chat(
             "refused",
             Some(r#"{"usedTokens":170000,"contextWindow":200000}"#),
-            None,
         );
         let due = Due {
             used_tokens: 170_000,
