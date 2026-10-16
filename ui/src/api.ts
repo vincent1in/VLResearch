@@ -380,10 +380,6 @@ export const getProjectStarterPrompts = (
     signal,
   );
 
-/** Record a visit so the backend can persist project-level UI recency. */
-export const openProject = (projectId: string) =>
-  post<{ project: Project }>(`/api/projects/${projectId}/open`).then((r) => r.project);
-
 export const deleteProject = (projectId: string) =>
   writeResponse(`/api/projects/${projectId}`, { method: "DELETE" }).then(async (r) => {
     if (!r.ok) {
@@ -1127,6 +1123,10 @@ export interface SlurmSettings {
   partition: string | null;
   account: string | null;
   timeLimit: string | null;
+  /** `--cpus-per-task` default; null = the partition decides (often one core). */
+  cpusPerTask: number | null;
+  /** `--mem` default in Slurm syntax ("64G"); null = the partition decides. */
+  mem: string | null;
   /** Login-node candidates, from ~/.ssh/config (same source as SSH). */
   hosts: SshHost[];
 }
@@ -1139,6 +1139,9 @@ export const saveSlurmSettings = (body: {
   partition?: string;
   account?: string;
   timeLimit?: string;
+  /** 0 clears it back to the partition default. */
+  cpusPerTask?: number;
+  mem?: string;
 }) => post<SlurmSettings>("/api/settings/slurm", body);
 
 export interface SlurmPreflight {
@@ -1514,10 +1517,13 @@ export const captureUiEvent = (event: UiEvent): void => {
   void post<{ ok: boolean }>("/api/telemetry/event", event).catch(() => {});
 };
 
-/** Tells orx which language the dashboard displays, for usage analytics. Fire-and-forget. */
-export const reportLocale = (locale: string): void => {
-  void post<{ locale: string }>("/api/telemetry/locale", { locale }).catch(() => {});
-};
+export const reportLocale = (locale: string, signal?: AbortSignal) =>
+  writeResponse("/api/telemetry/locale", {
+    method: "POST",
+    signal,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ locale }),
+  }).then((r) => json<{ locale: string }>(r));
 
 export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity";
 
@@ -1725,10 +1731,11 @@ export interface HarnessSetupCommands {
 export const getHarnessSetupCommands = (signal?: AbortSignal) =>
   get<Record<HarnessId, HarnessSetupCommands>>("/api/harnesses/setup/commands", signal);
 
-export const getHarnesses = (refresh = false, retryRejected = false, signal?: AbortSignal) => {
+export const getHarnesses = (refresh = false, retryRejected = false, signal?: AbortSignal, harness?: HarnessId) => {
   const params = new URLSearchParams();
   if (refresh) params.set("refresh", "1");
   if (retryRejected) params.set("retry", "1");
+  if (harness) params.set("harness", harness);
   const query = params.size > 0 ? `?${params.toString()}` : "";
   return get<{ harnesses: Harness[] }>(`/api/harnesses${query}`, signal).then((r) => r.harnesses);
 };
@@ -1926,9 +1933,6 @@ export interface ChatSession {
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
-  /** Session whose agent spawned this one with `orx agent spawn`; null for
-   * sessions the user started themselves. */
-  parentSessionId?: string | null;
   /** Chat this side chat branched from. Side chats share its worktree and
    * stay out of history; closing the tab deletes one. */
   sideParentSessionId?: string | null;
@@ -1996,6 +2000,9 @@ export const createChatSession = (
   post<{ session: ChatSession }>("/api/chat/sessions", { projectId, harness, ...opts }).then(
     (r) => r.session,
   );
+
+export const getChatSession = (sessionId: string) =>
+  get<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`).then((r) => r.session);
 
 export const deleteChatSession = (sessionId: string) =>
   writeResponse(`/api/chat/sessions/${sessionId}`, { method: "DELETE" }).then((r) =>
@@ -2169,23 +2176,6 @@ export const respondChat = (sessionId: string, answer: PromptAnswer) =>
   post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/respond`, answer);
 
 // --- helpers shared across views --------------------------------------------
-
-export function statusColor(status: string): string {
-  switch (status) {
-    case "done":
-      return "var(--green)";
-    case "running":
-      return "var(--teal)";
-    case "starting":
-      return "var(--amber)";
-    case "failed":
-      return "var(--red)";
-    case "cancelled":
-      return "var(--muted)";
-    default:
-      return "var(--muted)";
-  }
-}
 
 export function timeAgo(ms: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
