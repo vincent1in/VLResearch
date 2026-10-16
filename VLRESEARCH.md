@@ -74,15 +74,6 @@ To try a merge before upstream releases it, run the script on upstream's main an
 
 Upstream merges are never rebased, so `main` is never force-pushed.
 
-### Known for the next release
-
-From a dry run against upstream's main on 2026-10-15 (the 0.2.19 version bump):
-
-- `src/local/chat/mod.rs`, `src/local/git.rs`, `src/local/harness/claude.rs` and `ui/src/components/ChatPanel.tsx` conflict around their `VLResearch:` hooks; keep upstream's code and the hook lines.
-- OpenResearch #633 makes `orx agent spawn` create ordinary chats and removes `StoredChatSession.parent_session_id`. Remove the helper-chat check in `src/flavor/compact.rs` (`due`) and the field from the test fixtures in `compact.rs`, `scope.rs` and `start.rs`.
-
-Delete this list once those are merged.
-
 ## The egress audit
 
 `flavor/scripts/egress_audit.py` counts code that can open a connection without going through `src/net.rs`: websocket clients, raw sockets, spawned network tools, piped installers, and dashboard fetches to absolute URLs. A count above `flavor/egress-baseline.txt` fails CI. When an upstream merge adds one, check where it connects. If it is acceptable, or already blocked by the gate, accept it with `python3 flavor/scripts/egress_audit.py --update`.
