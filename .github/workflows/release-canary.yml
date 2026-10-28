@@ -16,7 +16,7 @@ concurrency:
 jobs:
   identity:
     # VLResearch: canary releases are alphaXiv's; never build or publish them here.
-    if: github.repository == 'alphaXiv/OpenResearch' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.repository == 'alphaXiv/OpenResearch'
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.identity.outputs.tag }}

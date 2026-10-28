@@ -222,7 +222,8 @@ test('Windows PR lanes execute the full test suite alongside lint; full validati
       const lane = { ...context, matrix: { mode } }
       assert.equal(runInNewContext(saveExpression, lane), mode === 'all')
       for (const [, , condition, command] of steps) {
-        if (!condition || runInNewContext(condition, lane)) commands.push(command)
+        // VLResearch: ci.yml tees the Windows test output to a log for annotations.
+        if (!condition || runInNewContext(condition, lane)) commands.push(command.replace(/ 2>&1 \| Tee-Object .*$/, ''))
       }
     }
     assert.equal(commands.filter(command => command === 'cargo clippy --all-targets --locked -- -D warnings').length, 1)

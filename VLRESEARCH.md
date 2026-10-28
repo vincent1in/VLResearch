@@ -53,8 +53,8 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/store.rs` | `flavor_conn()` accessor |
 | `src/local/opencode.rs` | Test expects the new wake-up wording |
 | `agent-skills/orx-compute/SKILL.md` | Wake-up and `exp wait` guidance for agents |
-| `.github/workflows/release-on-bump.yml`, `linked-issue.yml` | Run only in alphaXiv/OpenResearch |
-| `.github/workflows/ci.yml` | The Windows test step keeps its output, and `flavor/scripts/test-failures.sh` names failing tests in annotations |
+| `.github/workflows/release-on-bump.yml`, `release-canary.yml`, `linked-issue.yml` | Run only in alphaXiv/OpenResearch |
+| `.github/workflows/ci.yml`, `scripts/ci-workflows.test.mjs` | The Windows test step keeps its output, and `flavor/scripts/test-failures.sh` names failing tests in annotations; upstream's workflow test ignores the `Tee-Object` |
 | `.gitattributes`, `.gitignore` | Keep our README; ignore credential files |
 
 ## Taking an OpenResearch release
