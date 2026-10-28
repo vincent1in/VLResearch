@@ -21,7 +21,7 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 - Put new code in `src/flavor/` (or `ui/src/flavor/` for the dashboard). Upstream files get only short hooks that call into it, each marked with a `VLResearch:` comment.
 - New tables and SQL go in `src/flavor/` too, through `Store::flavor_conn()`.
 - Write dashboard strings in English inline. Upstream's `ui/messages/*.json` change in almost every release, and edits there would conflict constantly.
-- Keep generated files (`ui/dist/`, `ui/src/routeTree.gen.ts`, lockfiles) out of feature commits; rebuild them in a commit of their own.
+- Keep generated files (`ui/src/routeTree.gen.ts`, lockfiles) out of feature commits; rebuild them in a commit of their own. `ui/dist/` is no longer committed (upstream stopped in v0.2.22); build it with `pnpm install --frozen-lockfile && pnpm build` in `ui/` before a release build.
 - One commit per feature, so a merge conflict points at the feature it touches.
 - Commit no keys, tokens, hostnames or dataset paths. Run `flavor/scripts/install-hooks.sh` once per clone.
 
@@ -64,7 +64,7 @@ flavor/scripts/sync-upstream.sh            # newest release, on branch sync/<tag
 git push origin sync/<tag>                 # then open a pull request into main
 ```
 
-The script fetches upstream's tags and merges the release on a `sync/<tag>` branch. It takes upstream's dashboard bundle and other generated files, refuses a merge that lost a `VLResearch:` hook line from an upstream file, rebuilds the bundle if VLResearch changed the dashboard, and runs fmt, clippy, the egress audit and the tests.
+The script fetches upstream's tags and merges the release on a `sync/<tag>` branch. It takes upstream's generated files, refuses a merge that lost a `VLResearch:` hook line from an upstream file, builds the dashboard bundle if VLResearch changed the dashboard, and runs fmt, clippy, the egress audit and the tests.
 
 If it stops on a conflict, resolve the listed files: keep upstream's new code and put back the lines marked `VLResearch:`. Then run `git commit --no-edit` and the script again; it picks up on the sync branch. Git remembers each resolution (`rerere`) in the clone that made it. When upstream changes an API VLResearch's code uses, fix `src/flavor/` or `ui/src/flavor/` in a commit of its own that says what upstream changed.
 
