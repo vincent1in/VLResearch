@@ -12,4 +12,5 @@ piped installer	src/local/harness/opencode.rs	2
 piped installer	src/local/opencode.rs	1
 piped installer	src/updates.rs	2
 raw socket	src/commands/app.rs	1
+raw socket	src/jobs/ssh/service/mod.rs	2
 websocket client	src/local/overleaf_live.rs	1
