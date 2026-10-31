@@ -1,3 +1,4 @@
+import { EscapeScope } from "./EscapeScope";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Menu } from "@base-ui/react/menu";
 import { Popover } from "@base-ui/react/popover";
@@ -5,7 +6,7 @@ import { DirectionProvider } from "@base-ui/react/direction-provider";
 import { getHarnessesQuery } from "../queries/settings";
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
-import { Check, ChevronDown, ChevronRight, Lock, Plus, Settings, Zap } from "lucide-react";
+import { CircleAlert, Check, ChevronDown, ChevronRight, Plus, Settings, Zap } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type ReactNode, type RefObject } from "react";
 import {
   fmtNumber,
@@ -30,7 +31,8 @@ import { HarnessLogo } from "./HarnessLogo";
 import { IconButton, MenuItem, SwitchIndicator, Tooltip } from "./ui";
 import { cn } from "./ui/cn";
 
-import { LocalModelSetup } from "./LocalModelSetup";
+import { LocalModelDialog } from "./LocalModelSetup";
+import { showCustomDialog } from "../dialog";
 import { formatCodexModel, groupModels, resolveHarnessDefaultModel } from "../modelSelection";
 
 const MODEL_GROUP_CLASS_NAME = [
@@ -84,25 +86,9 @@ export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>) {
     const onDown = (e: MouseEvent) => {
       if (e.target instanceof Node && !ref.current?.contains(e.target) && !triggerRef?.current?.contains(e.target)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      // Escape closes the picker and must NOT bubble to other document-level
-      // Escape handlers (e.g. ChatPanel's stop-streaming listener) — closing an
-      // open picker shouldn't also interrupt an in-flight turn. Capture phase +
-      // stopPropagation makes this order-independent: relying on registration
-      // order and defaultPrevented among bubble-phase document listeners is
-      // fragile, since whichever registered first runs first.
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        setOpen(false);
-        triggerRef?.current?.focus();
-      }
-    };
     document.addEventListener("mousedown", onDown, true);
-    document.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("mousedown", onDown, true);
-      document.removeEventListener("keydown", onKey, true);
     };
   }, [open, triggerRef]);
   return { open, setOpen, ref };
@@ -126,8 +112,10 @@ function SettingsSubmenu({
   defaultId?: string | null;
   onSelect: (id: string) => void;
 }) {
+  const [open, setOpen] = useState(false);
+
   return (
-    <Menu.SubmenuRoot>
+    <Menu.SubmenuRoot open={open} onOpenChange={setOpen}>
       <Menu.SubmenuTrigger delay={0} label={label} className={SETTINGS_ROW}>
         <span>{label}</span>
         <span className="ms-auto max-w-36 truncate text-muted">{detail}</span>
@@ -179,6 +167,7 @@ function SettingsSubmenu({
           </Menu.Popup>
         </Menu.Positioner>
       </Menu.Portal>
+      <EscapeScope enabled={open} onEscape={() => setOpen(false)} />
     </Menu.SubmenuRoot>
   );
 }
@@ -230,8 +219,10 @@ export function ModelPicker({
     [catalog, sessionHarness],
   );
   const queryClient = useQueryClient();
-  const [addingLocalModel, setAddingLocalModel] = useState(false);
+  const localModelConnected = useRef<(model: string) => void>(() => {});
+  useEffect(() => () => { localModelConnected.current = () => {}; }, []);
   const [menu, setMenu] = useState<"model" | "settings" | null>(null);
+  const [legacyMenu, setLegacyMenu] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -299,6 +290,11 @@ export function ModelPicker({
     close();
   };
 
+  localModelConnected.current = (model) => {
+    const harness = queryClient.getQueryData(getHarnessesQuery().queryKey)?.find((entry) => entry.id === "opencode");
+    if (harness && (!lockHarness || value?.harness === "opencode")) pick(harness, model);
+  };
+
   const selectedHarness = harnesses.find((harness) => harness.id === value?.harness);
   const selected = selectedHarness?.models.find((model) => model.id === value?.model);
   const displayModel = (harness: Harness, model: Harness["models"][number]) => harness.id === "codex" ? formatCodexModel(harnessModelLabel(model)) : harnessModelLabel(model);
@@ -352,18 +348,8 @@ export function ModelPicker({
     !!onSelectAutonomy;
 
   useEffect(() => {
-    if (!menu) return;
-    if (menu === "settings" && !hasSettings) {
-      setMenu(null);
-      return;
-    }
-
-    const onKey = (event: KeyboardEvent) => {
-      // ChatPanel's interrupt listener can precede Base UI's document listener.
-      if (event.key === "Escape") event.preventDefault();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    if (menu === "settings" && !hasSettings) setMenu(null);
+    if (menu !== "model") setLegacyMenu(null);
   }, [menu, hasSettings]);
 
   return (
@@ -453,35 +439,42 @@ export function ModelPicker({
                     <Settings size={16} aria-hidden="true" />
                   </IconButton>
                 </div>
-                <div className="model-menu-list min-h-0 overflow-y-auto p-1.5">
+                <div className="model-menu-list min-h-0 overflow-x-hidden overflow-y-auto p-1.5 [&_button]:min-w-0 [&_button]:[overflow-wrap:anywhere] [&_button>span]:min-w-0">
                   {groups.map(({ harness, models, legacy, hidden }) => (
                     <div key={harness.id}>
-                      <div className={MODEL_GROUP_CLASS_NAME}>
-                        <span className="inline-flex items-center gap-1.5">
-                          <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
-                          {harness.name}
-                        </span>
-                        {!harness.agentReady && (
-                          <span className="inline-flex items-center gap-1 text-accent-amber font-normal">
-                            {harness.catalogPending ? (
-                              m.onboarding_checking()
-                            ) : (
-                              <>
-                                <Lock size={10} /> {m.model_picker_unavailable()}
-                              </>
-                            )}
+                      {harness.agentReady ? (
+                        <div className={MODEL_GROUP_CLASS_NAME}>
+                          <span className="inline-flex items-center gap-1.5">
+                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
+                            {harness.name}
                           </span>
-                        )}
-                      </div>
-                      {!harness.agentReady ? (
-                        <div className={MODEL_MORE_CLASS_NAME}>
-                          {harness.catalogPending
-                            ? m.onboarding_checking()
-                            : harness.agentNote
-                              ? renderNote(harness.agentNote)
-                              : m.model_picker_not_available()}
+                        </div>
+                      ) : harness.catalogPending ? (
+                        <div className={MODEL_GROUP_CLASS_NAME}>
+                          <span className="inline-flex items-center gap-1.5">
+                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
+                            {harness.name}
+                          </span>
+                          <span className="font-normal text-muted">{m.onboarding_checking()}</span>
                         </div>
                       ) : (
+                        <MenuItem type="button" className="font-medium" onClick={() => { close(); onOpenSettings(); }}>
+                          <span className="inline-flex min-w-0 items-center gap-1.5">
+                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
+                            {harness.name}
+                          </span>
+                          <span className="inline-flex items-center gap-1 font-normal text-accent-amber">
+                            <CircleAlert size={14} aria-hidden="true" className="shrink-0" />
+                            {!harness.installed ? m.settings_page_not_installed()
+                              : harness.installBroken ? m.settings_page_install_broken()
+                              : harness.needsConfigRepair || harness.authCheckFailed ? m.settings_page_unable_to_verify()
+                              : harness.authState === "needsLogin" ? m.model_picker_needs_login()
+                              : harness.authState === "unsupported" ? m.settings_page_update_required()
+                              : m.settings_page_unable_to_verify()}
+                          </span>
+                        </MenuItem>
+                      )}
+                      {harness.agentReady && (
                         <>
                           {!filter.trim() && harness.id !== "codex" && !(harness.id === "claude-code" && harness.models.length > 0) && !harness.id.startsWith("acp:") && (
                             <MenuItem
@@ -514,14 +507,14 @@ export function ModelPicker({
                             </Tooltip>
                           ))}
                           {legacy.length > 0 && (
-                            <Menu.Root>
+                            <Menu.Root open={legacyMenu === harness.id} onOpenChange={(open) => setLegacyMenu(open ? harness.id : null)}>
                               <Menu.Trigger openOnHover delay={200} closeDelay={300} className={cn(SETTINGS_ROW, "ps-6")}>
                                 <span>{m.model_picker_legacy()}</span>
                                 <ChevronRight size={14} aria-hidden="true" className="text-muted rtl:rotate-180" />
                               </Menu.Trigger>
                               <Menu.Portal>
                                 <Menu.Positioner side="right" align="start" sideOffset={4} collisionPadding={8} className="z-50">
-                                  <Menu.Popup onKeyDown={(event) => event.stopPropagation()} aria-label={m.model_picker_legacy()} className="max-h-80 overflow-y-auto rounded-lg border border-border bg-background p-1.5 shadow-dropdown outline-none">
+                                  <Menu.Popup onKeyDown={(event) => { if (event.key !== "Escape") event.stopPropagation(); }} aria-label={m.model_picker_legacy()} className="max-h-80 overflow-y-auto rounded-lg border border-border bg-background p-1.5 shadow-dropdown outline-none">
                                     {legacy.map((model) => (
                                       <Menu.Item key={model.id} className={SETTINGS_ROW} onClick={() => pick(harness, model.id)}>
                                         <span>{displayModel(harness, model)}</span>
@@ -549,14 +542,19 @@ export function ModelPicker({
                             )}
                         </>
                       )}
-                      {harness.id === "opencode" && (
+                      {harness.agentReady && harness.id === "opencode" && (
                         <MenuItem
                           type="button"
                           className="font-medium"
                           aria-haspopup="dialog"
                           onClick={() => {
                             close();
-                            setAddingLocalModel(true);
+                            showCustomDialog({
+                              component: LocalModelDialog,
+                              props: { onConnected: (model) => localModelConnected.current(model) },
+                              onConfirm: (connect) => connect(),
+                              onCancel: "close",
+                            });
                           }}
                         >
                           <span className="inline-flex items-center gap-1.5">
@@ -731,20 +729,9 @@ export function ModelPicker({
             </Menu.Portal>
           </Menu.Root>
         )}
-        {addingLocalModel && (
-          <LocalModelSetup
-            dialogOnly
-            installed={harnesses.find((harness) => harness.id === "opencode")?.installed ?? false}
-            onClose={() => setAddingLocalModel(false)}
-            onConnected={(model) => {
-              const harness = queryClient
-                .getQueryData(getHarnessesQuery().queryKey)
-                ?.find((entry) => entry.id === "opencode");
-              if (harness && (!lockHarness || value?.harness === "opencode")) pick(harness, model);
-            }}
-          />
-        )}
       </div>
+      <EscapeScope enabled={menu !== null} onEscape={() => setMenu(null)} />
+      <EscapeScope enabled={menu === "model" && legacyMenu !== null} onEscape={() => setLegacyMenu(null)} />
     </DirectionProvider>
   );
 }
@@ -1007,6 +994,7 @@ export function OptionPicker({
           </div>
         </div>
       )}
+      <EscapeScope enabled={open} onEscape={() => { setOpen(false); buttonRef.current?.focus(); }} />
     </div>
   );
 }

@@ -512,6 +512,7 @@ impl ProjectLifecycle {
 fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/file-manager", get(file_manager))
         .route("/api/onboarding/complete", post(complete_onboarding))
         .route("/api/project-path/status", get(project_path_status))
         .route("/api/project-path/pick", post(pick_project_folder))
@@ -1012,6 +1013,17 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "dashboardProtocol": crate::commands::up_remote::DASHBOARD_PROTOCOL,
         "instanceId": state.remote_instance_id,
     }))
+}
+
+async fn file_manager(
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let locale = query.get("locale").cloned().unwrap_or_default();
+    let name = tokio::task::spawn_blocking(move || crate::editors::file_manager_name(&locale))
+        .await
+        .ok()
+        .flatten();
+    Json(json!({ "os": std::env::consts::OS, "name": name }))
 }
 
 #[derive(Deserialize)]
@@ -6766,7 +6778,7 @@ const SETTINGS_COMMANDS: &[(&str, &[&str])] = &[
     ),
     ("devin auth login", &["devin", "auth", "login"]),
     ("grok login", &["grok", "login"]),
-    ("pi", &["pi"]),
+    ("pi-acp --terminal-login", &["pi-acp", "--terminal-login"]),
     ("zcode login zai", &["zcode", "login", "zai"]),
     ("zcode login bigmodel", &["zcode", "login", "bigmodel"]),
 ];
@@ -7131,9 +7143,10 @@ fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapsh
     else {
         return;
     };
-    // Overlaying would replace the reinstall note with advice that runs the
-    // failing binary.
-    if entry_install_broken(claude) {
+    // Cached auth cannot make a missing or broken binary runnable.
+    if claude.get("installed").and_then(Value::as_bool) == Some(false)
+        || entry_install_broken(claude)
+    {
         return;
     }
     // A provisional entry is never overlaid: the shared state would stamp an
@@ -7182,6 +7195,7 @@ fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapsh
             || !entry_was_ready
         {
             object.remove("account");
+            object.remove("accountName");
             object.remove("org");
             object.remove("plan");
         }
@@ -7437,11 +7451,14 @@ async fn delete_acp_harness(State(state): State<AppState>, Path(id): Path<String
 
 async fn test_acp_harness(Json(input): Json<AcpHarnessInput>) -> ApiResult {
     let definition = input.definition(format!("acp:{}", uuid::Uuid::new_v4()));
-    Ok(Json(
-        local::acp::test_connection(&definition)
-            .await
-            .map_err(bad_request)?,
-    ))
+    let mut result = local::acp::test_connection(&definition)
+        .await
+        .map_err(bad_request)?;
+    result["harnessId"] = json!(local::acp::registered_definitions()
+        .iter()
+        .find(|registered| local::acp::same_launch(registered, &definition))
+        .map(|registered| &registered.id));
+    Ok(Json(result))
 }
 
 /// The shared detection path behind `GET /api/harnesses` and the startup
@@ -8355,7 +8372,11 @@ async fn set_chat_configuration(
                 .ok_or_else(|| not_found("project"))?;
             let session_id = id.clone();
             let (cwd, _) = tokio::task::spawn_blocking(move || {
-                local::opencode::ensure_playbook(&project, &session_id, None)
+                local::opencode::ensure_playbook(
+                    &project,
+                    &session_id,
+                    Some(local::harness::acp::SESSION_SKILLS_DIR),
+                )
             })
             .await
             .map_err(bad_request)?
@@ -9406,6 +9427,21 @@ mod tests {
                 format!("orx up could not start the run: {expected}")
             );
         }
+    }
+
+    #[test]
+    fn missing_claude_keeps_install_guidance_when_auth_was_cached() {
+        let host = local::claude::ClaudeHost::new();
+        let ready = local::harness::claude::parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"oauth","apiProvider":"firstParty"}"#,
+            local::harness::claude::auth_barrier_sequence(),
+        );
+        host.observe_auth_probe(&ready);
+        let mut payload = json!({"harnesses": [{"id": "claude-code", "installed": false, "agentReady": false, "agentNote": "Install Claude Code"}]});
+        let expected = payload.clone();
+        overlay_claude_auth(&mut payload, &host.auth_snapshot());
+        assert_eq!(payload, expected);
     }
 
     #[test]
