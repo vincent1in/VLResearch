@@ -70,9 +70,12 @@ else
   echo "sync: merging $tag into $branch"
   if ! git merge --no-ff --no-edit -m "Merge OpenResearch $tag" "$tag"; then
     # The dashboard bundle is generated and rebuilt below, so take upstream's
-    # as a whole; a renamed asset can conflict on both sides.
+    # as a whole; a renamed asset can conflict on both sides. Since v0.2.22
+    # upstream no longer commits it, and then neither do we.
     if git diff --name-only --diff-filter=U | grep -q '^ui/dist/'; then
-      git checkout "$tag" -- ui/dist
+      if [ -n "$(git ls-tree --name-only "$tag" -- ui/dist)" ]; then
+        git checkout "$tag" -- ui/dist
+      fi
       comm -23 <(git ls-files ui/dist | sort -u) \
         <(git ls-tree -r --name-only "$tag" -- ui/dist | sort -u) | xargs -r git rm -q -f --
     fi
@@ -106,7 +109,8 @@ if [ "$after" -lt "$before" ] && [ "$hooks_checked" -eq 0 ]; then
   exit 1
 fi
 
-# If VLResearch changed the dashboard, the committed bundle must be rebuilt.
+# If VLResearch changed the dashboard, the bundle must be rebuilt: committed
+# when upstream still commits it, and in any case for the build checks below.
 if [ -n "$(git diff --name-only "$tag" HEAD -- ui/src ui/index.html)" ]; then
   echo "sync: rebuilding ui/dist"
   # The message compiler downloads its plugins; behind a proxy, Node's fetch

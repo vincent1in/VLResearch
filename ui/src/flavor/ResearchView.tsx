@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessageSquare, MessagesSquare, Play, Plus, Settings2, Target, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { sendChatMessage } from "../api";
-import { Button, IconButton } from "../components/ui";
+import { Button, IconButton, Tooltip } from "../components/ui";
 import { workspaceKey } from "../queries/client";
 import { ResearchSetup, refreshResearch } from "./ResearchSetup";
 import {
@@ -164,9 +164,11 @@ type Ask = (question: string) => void;
 
 function AskButton({ label, question, onAsk }: { label: string; question: string; onAsk: Ask }) {
   return (
-    <IconButton size="small" className="h-6 w-6 text-muted" aria-label={label} title={`${label} in a side chat; the loop keeps running`} onClick={() => onAsk(question)}>
-      <MessagesSquare size={13} />
-    </IconButton>
+    <Tooltip interactive content={`${label} in a side chat; the loop keeps running`}>
+      <IconButton size="small" className="h-6 w-6 text-muted" aria-label={label} onClick={() => onAsk(question)}>
+        <MessagesSquare size={13} />
+      </IconButton>
+    </Tooltip>
   );
 }
 
@@ -543,25 +545,26 @@ function ConfirmBar({ data, onEdit }: { data: BriefPayload; onEdit: () => void }
     <div className="flex flex-col gap-1.5">
       <div className="flex flex-wrap items-center gap-2">
         {unattended && (
-          <Button variant="primary" size="small" disabled={busy} title="Open a chat in which the agent checks the brief with you" onClick={onEdit}>
-            <Play size={13} /> Start the agent
-          </Button>
+          <Tooltip interactive content="Open a chat in which the agent checks the brief with you">
+            <Button variant="primary" size="small" disabled={busy} onClick={onEdit}>
+              <Play size={13} /> Start the agent
+            </Button>
+          </Tooltip>
         )}
-        <Button
-          variant={unattended ? "default" : "primary"}
-          size="small"
-          disabled={!ready || busy}
-          title={
+        <Tooltip
+          interactive
+          content={
             !ready
               ? `Still missing: ${data.missing.join("; ")}`
               : unattended
                 ? "Agree to the brief; then ask an agent to run the improvement loop"
                 : "Agree to the brief; the agent starts the improvement loop"
           }
-          onClick={() => void confirm()}
         >
-          <Check size={13} /> {busy ? "Confirming…" : "Confirm brief"}
-        </Button>
+          <Button variant={unattended ? "default" : "primary"} size="small" disabled={!ready || busy} onClick={() => void confirm()}>
+            <Check size={13} /> {busy ? "Confirming…" : "Confirm brief"}
+          </Button>
+        </Tooltip>
         <Button variant="ghost" size="small" disabled={busy} onClick={onEdit}>
           Edit
         </Button>
@@ -574,9 +577,11 @@ function ConfirmBar({ data, onEdit }: { data: BriefPayload; onEdit: () => void }
 function SettingsButton({ onOpen }: { onOpen?: () => void }) {
   if (!onOpen) return null;
   return (
-    <Button variant="ghost" size="small" title="Autocompaction, stall alerts, wake-ups, the brief gate and more" onClick={onOpen}>
-      <Settings2 size={13} /> Settings
-    </Button>
+    <Tooltip interactive content="Autocompaction, stall alerts, wake-ups, the brief gate and more">
+      <Button variant="ghost" size="small" onClick={onOpen}>
+        <Settings2 size={13} /> Settings
+      </Button>
+    </Tooltip>
   );
 }
 
@@ -779,13 +784,17 @@ function OptimizationBar({
         )
       )}
       {chat && onOpenChat && chat !== activeSessionId && (
-        <Button variant="ghost" size="small" title="Open the chat that runs this optimization" onClick={() => onOpenChat(chat)}>
-          <MessageSquare size={13} /> Open its chat
-        </Button>
+        <Tooltip interactive content="Open the chat that runs this optimization">
+          <Button variant="ghost" size="small" onClick={() => onOpenChat(chat)}>
+            <MessageSquare size={13} /> Open its chat
+          </Button>
+        </Tooltip>
       )}
-      <Button variant="ghost" size="small" title="Start another optimization in its own chat" onClick={onNew}>
-        <Plus size={13} /> New optimization
-      </Button>
+      <Tooltip interactive content="Start another optimization in its own chat">
+        <Button variant="ghost" size="small" onClick={onNew}>
+          <Plus size={13} /> New optimization
+        </Button>
+      </Tooltip>
       <SettingsButton onOpen={onOpenSettings} />
     </div>
   );
@@ -886,9 +895,11 @@ export function ResearchView({
                 Optimization
               </h2>
               {ask && (
-                <Button variant="ghost" size="small" title="Ask about the optimization in a side chat; the loop keeps running" onClick={() => ask("")}>
-                  <MessagesSquare size={13} /> Side chat
-                </Button>
+                <Tooltip interactive content="Ask about the optimization in a side chat; the loop keeps running">
+                  <Button variant="ghost" size="small" onClick={() => ask("")}>
+                    <MessagesSquare size={13} /> Side chat
+                  </Button>
+                </Tooltip>
               )}
             </div>
             {metrics.data ? <Headline metrics={metrics.data} /> : <Loading error={metrics.error} />}
