@@ -63,9 +63,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/setup@v1
         with:
-          version: 10
+          package-json-file: ui/package.json
+          install: false
       - run: pnpm install --frozen-lockfile && pnpm build
         working-directory: ui
       - uses: actions/upload-artifact@v4
@@ -77,7 +78,7 @@ jobs:
   macos:
     needs: [identity, ci, ui]
     if: vars.MACOS_SIGNING_ENABLED == 'true'
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 45
     environment: release-signing
     steps:

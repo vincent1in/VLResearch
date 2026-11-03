@@ -1,3 +1,7 @@
+import { showConfirmDialog, showCustomDialog } from "../dialog";
+import { Dialog } from "@base-ui/react/dialog";
+import { EscapeScope } from "./EscapeScope";
+import { commandRegion } from "../keyboardRegion";
 import { ComposerProjectPicker } from "./ComposerProjectPicker";
 import { ProjectInfoCard } from "./ProjectInfoCard";
 import { SessionHoverCard } from "./SessionHoverCard";
@@ -9,6 +13,7 @@ import { removeSession as removeCachedSession } from "../queries/invalidation";
 import { nativeOptions, sessionAcpHarness } from "../acp";
 import { resolveHarnessDefaultModel } from "../modelSelection";
 import { setChatConfiguration } from "../api";
+import { RemoteConnectionStrip, useRemoteConnection } from "../RemoteRuntime";
 import {
   isCurrentScope,
   setScopedQueryData,
@@ -38,8 +43,11 @@ import {
   type FileMentionMatch,
 } from "../fileMentions";
 import { m } from "../paraglide/messages.js";
+import { formatForDisplay, matchesKeyboardEvent, useAppHotkeys, useHotkey } from "@tanstack/react-hotkeys";
+import { appHotkeys } from "../hotkeys";
 import { copyToClipboard } from "../clipboard";
 import { autoDir, ltr } from "../i18n";
+import { navigateKeyboardList } from "../keyboardNavigation";
 import { useLocale } from "../locale";
 import {
   ArrowDown,
@@ -767,6 +775,7 @@ function AnnotationsPopover({
           <AnnotationEntries annotations={annotations} onRemove={onRemove ? removeAnnotation : undefined} />
         </div>
       )}
+      <EscapeScope enabled={popover.open} onEscape={() => { popover.setOpen(false); triggerRef.current?.focus(); }} />
     </div>
   );
 }
@@ -3166,6 +3175,7 @@ export const Message = memo(function Message({
                   return;
                 }
                 if (e.key === "Escape") {
+                  e.stopPropagation();
                   e.preventDefault();
                   setEditDraft(null);
                 } else if (e.key === "Enter" && !e.shiftKey) {
@@ -4054,11 +4064,6 @@ type SessionFilter = "active" | "archived" | "all";
 const matchesFilter = (filter: SessionFilter, archived: boolean) =>
   filter === "all" ? true : filter === "archived" ? archived : !archived;
 
-/** Whether an event target sits inside the side-chat pane. */
-function inSideChat(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest("[data-side-chat]") !== null;
-}
-
 /** Menu label + rail section heading per filter — "Recents" for the default view. */
 const SESSION_FILTERS: { id: SessionFilter; label: () => string; railLabel: () => string }[] = [
   { id: "archived", label: m.chat_panel_archived, railLabel: m.chat_panel_archived },
@@ -4118,6 +4123,7 @@ function SessionFilterMenu({
           ))}
         </div>
       )}
+      <EscapeScope enabled={open} onEscape={() => setOpen(false)} />
     </div>
   );
 }
@@ -4255,21 +4261,11 @@ function SessionRow({
         setAnchor(null);
       } else setAnchor(bounds);
     };
-    const onEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      event.stopPropagation();
-      dismissed.current = true;
-      if (cardRef.current?.contains(document.activeElement)) ref.current?.focus();
-      closeCard();
-    };
     window.addEventListener("resize", update);
     document.addEventListener("scroll", update, true);
-    document.addEventListener("keydown", onEscape, true);
     return () => {
       window.removeEventListener("resize", update);
       document.removeEventListener("scroll", update, true);
-      document.removeEventListener("keydown", onEscape, true);
     };
   }, [anchor, ref]);
 
@@ -4299,6 +4295,7 @@ function SessionRow({
       ref={ref}
       role="button"
       tabIndex={0}
+      data-sidebar-keyboard-row
       aria-label={sessionDescription}
       aria-describedby={anchor ? cardId : undefined}
       onMouseEnter={() => {
@@ -4326,7 +4323,7 @@ function SessionRow({
         if (!ref.current?.contains(event.relatedTarget) && !cardRef.current?.contains(event.relatedTarget)) dismissed.current = false;
         scheduleClose();
       }}
-      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-blue [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-1 [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
+      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:size-6 [&_.session-menu-btn]:-mx-1 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-blue [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:absolute [&_.session-title-input]:inset-0 [&_.session-title-input]:size-full [&_.session-title-input]:py-0 [&_.session-title-input]:ps-0 [&_.session-title-input]:pe-[9px] [&_.session-title-input]:indent-[9px] [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-md [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
         editing ? "editing" : ""
         }`}
       onClick={() => {
@@ -4370,6 +4367,7 @@ function SessionRow({
               e.preventDefault();
               commit();
             } else if (e.key === "Escape") {
+              e.stopPropagation();
               e.preventDefault();
               setEditing(false);
             }
@@ -4423,6 +4421,7 @@ function SessionRow({
           anchor={anchor}
           cardId={cardId}
           cardRef={cardRef}
+          container={ref.current?.closest(".mobile-rail-dialog") ?? document.body}
           onEnter={() => { pointerInside.current = true; window.clearTimeout(closeTimer.current); }}
           onLeave={() => { cardWarmUntil.current = Date.now() + 500; pointerInside.current = false; scheduleClose(); }}
           onOpenExperiment={(projectId, experimentId) => { closeCard(); onOpenExperiment(projectId, experimentId); }}
@@ -4461,6 +4460,8 @@ function SessionRow({
           </MenuItem>
         </div>
       )}
+      <EscapeScope enabled={open} onEscape={() => setOpen(false)} />
+      <EscapeScope enabled={!!anchor && !editing && !open} exclusive={false} onEscape={() => { dismissed.current = true; if (cardRef.current?.contains(document.activeElement)) ref.current?.focus(); closeCard(); }} />
     </div>
   );
 }
@@ -4537,7 +4538,12 @@ export function ChatPanel({
   contentError = null,
   onRetryContent,
   railHeader,
+  railWidth,
+  onResizeRail,
   railOpen,
+  mobileRail = false,
+  onCloseMobileRail,
+  contentInert = false,
   onShowRail,
   onNewProject,
   mainView,
@@ -4571,8 +4577,13 @@ export function ChatPanel({
   onRetryContent?: () => void;
   /** Brand and project creation controls at the top of the rail. */
   railHeader?: React.ReactNode;
+  railWidth?: number;
+  onResizeRail?: (event: React.PointerEvent) => void;
   /** Whether the agents rail is showing (collapsed via its own header icon). */
   railOpen: boolean;
+  mobileRail?: boolean;
+  onCloseMobileRail?: () => void;
+  contentInert?: boolean;
   /** Reopen the rail (from the chat header's sidebar icon). */
   onShowRail: () => void;
   onNewProject?: () => void;
@@ -4675,15 +4686,15 @@ export function ChatPanel({
   const [focusedSidebarRow, setFocusedSidebarRow] = useState<string | null>(null);
   const [chatLimits, setChatLimits] = useState<Record<string, number>>({});
   const sidebarExpanded = sidebarExpandedAll || Object.keys(chatLimits).length > 0;
-  useLayoutEffect(() => {
-    const body = railBodyRef.current;
+  const setRailBody = useCallback((body: HTMLDivElement | null) => {
+    railBodyRef.current = body;
     if (!body || embedded) return;
     const resize = () => setRailHeight(body.clientHeight);
     const observer = new ResizeObserver(resize);
     observer.observe(body);
     resize();
-    return () => observer.disconnect();
-  }, [railOpen, embedded, mainView]);
+    return () => { observer.disconnect(); railBodyRef.current = null; };
+  }, [embedded]);
   const recentActivity = new Map(projectActivity.map((activity) => [activity.projectId, activity.lastActivityAt]));
   const sortedProjects = [...sidebarProjects].sort((a, b) => Number(pinnedProjects.includes(b.id)) - Number(pinnedProjects.includes(a.id)) || Math.max(recentActivity.get(b.id) ?? 0, b.updatedAt) - Math.max(recentActivity.get(a.id) ?? 0, a.updatedAt));
   const candidateLimit = sidebarGrouping === "list" || sidebarExpanded ? sortedProjects.length : Math.max(1, Math.ceil(railHeight / 36));
@@ -4859,7 +4870,8 @@ export function ChatPanel({
   const stickToBottom = useRef(true);
   const [transcriptAtBottom, setTranscriptAtBottom] = useState(true);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const [resumeOpen, setResumeOpen] = useState(false);
+  const connection = useRemoteConnection();
+  const resumeCancelRef = useRef<(() => void) | null>(null);
   const dataSources = usePopover();
   const addTranscriptSelection = useCallback((selection: Pick<SelectionAction, "text" | "range">) => {
     setAnnotations((current) => [
@@ -4872,8 +4884,9 @@ export function ChatPanel({
   useAnnotationHighlights(annotations, embedded ? SIDE_CHAT_ANNOTATION_HIGHLIGHT_NAME : CHAT_ANNOTATION_HIGHLIGHT_NAME);
 
   useEffect(() => {
-    setResumeOpen(false);
+    resumeCancelRef.current?.();
     transcriptSelection.dismiss();
+    return () => resumeCancelRef.current?.();
   }, [activeId, projectId, transcriptSelection.dismiss]);
 
   // Slash-skills: menu state is derived from the draft — open while the token
@@ -5350,7 +5363,20 @@ export function ChatPanel({
         } else startNewTask();
         return false;
       case "resume":
-        setResumeOpen(true);
+        showCustomDialog({
+          component: ResumeDialog,
+          props: {
+            activeSessionId: activeId,
+            cancelRef: resumeCancelRef,
+            onResume: (session) => {
+              setSessionFilter("all");
+              onActiveSessionChange(session.id, { projectId: session.projectId });
+            },
+            onImport: (chat) => { void importChat(chat); },
+          },
+          onConfirm: () => {},
+          onCancel: "close",
+        });
         return true;
       case "model":
         setModelPickerRequest((request) => request + 1);
@@ -5831,12 +5857,14 @@ export function ChatPanel({
     setSkillMenuDismissed(false);
     setComposerCursor(composerPrefill.length);
   }, [composerPrefill]);
+  const [newChatFocusProject, setNewChatFocusProject] = useState<string | null>(null);
   const focusedComposerNonce = useRef(0);
   useEffect(() => {
     // The composer is inert while its chat is loading. Keep the
     // request pending until it can take focus, and consume it only once.
-    if (composerFocusNonce === 0 || composerFocusNonce === focusedComposerNonce.current
-      || contentLoading || contentError || historyLoading) return;
+    const newChatPending = newChatFocusProject === projectId && activeId === null;
+    const composerPending = composerFocusNonce !== 0 && composerFocusNonce !== focusedComposerNonce.current;
+    if ((!newChatPending && !composerPending) || mainView !== "chat" || contentLoading || contentError || historyLoading) return;
     // The welcome dialog restores its previous focus on unmount; run after that.
     const frame = window.requestAnimationFrame(() => {
       const el = composerRef.current;
@@ -5844,11 +5872,12 @@ export function ChatPanel({
       el.focus();
       if (document.activeElement !== el) return;
       focusedComposerNonce.current = composerFocusNonce;
+      if (newChatPending) setNewChatFocusProject(null);
       el.setSelectionRange(el.value.length, el.value.length);
       el.scrollIntoView({ block: "nearest" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [composerFocusNonce, contentLoading, contentError, historyLoading]);
+  }, [composerFocusNonce, newChatFocusProject, projectId, activeId, mainView, contentLoading, contentError, historyLoading]);
   const demoHintId = useId();
   const unconfirmedSendId = useId();
   const demoHintVisible =
@@ -6456,40 +6485,11 @@ export function ChatPanel({
     }
   }
 
-  const lastPointerInSide = useRef(false);
-  useEffect(() => {
-    const onDown = (e: PointerEvent) => { lastPointerInSide.current = inSideChat(e.target); };
-    document.addEventListener("pointerdown", onDown, true);
-    return () => document.removeEventListener("pointerdown", onDown, true);
-  }, []);
-
-  // Escape stops the streaming turn and drops focus back into the composer,
-  // mirroring the Claude Code desktop app. Harness-agnostic — `stop()` →
-  // `interruptChat` interrupts whichever harness (Claude, Codex, OpenCode, …)
-  // is running the active session. Only armed while chat is visible.
-  //
-  // An overlay that should swallow Escape (rather than let it stop the turn)
-  // must own the key ahead of this document-level bubble listener, by one of
-  // two means already in use — a new overlay has to pick one or it will
-  // interrupt the turn on Escape:
-  //   - the slash and @file menus preventDefault in the composer's onKeyDown (bubble),
-  //     so the `defaultPrevented` guard below defers to it;
-  //   - the composer pickers (usePopover) stopPropagation in the capture phase,
-  //     so their Escape never reaches this listener at all.
-  useEffect(() => {
-    if (!busy || mainView !== "chat") return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== "Escape" || e.defaultPrevented) return;
-      // Clicking a transcript leaves focus on body; the click says which pane it was.
-      const side = e.target === document.body ? lastPointerInSide.current : inSideChat(e.target);
-      if (side !== embedded) return;
-      e.preventDefault();
-      stop();
-      composerRef.current?.focus();
-    }
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [busy, activeId, mainView, embedded]);
+  useHotkey("Escape", () => {
+    if (commandRegion() !== (embedded ? "right" : "left")) return;
+    stop();
+    composerRef.current?.focus();
+  }, { enabled: busy && mainView === "chat", preventDefault: true, stopPropagation: false, conflictBehavior: "allow" });
 
   /** Drop every trace of a session — the local row, the open-thread selection,
    * and the cached transcript. Used on delete (ours or another dashboard's). */
@@ -6547,16 +6547,19 @@ export function ChatPanel({
     });
   }
 
-  async function removeSession(session: ChatSession) {
+  function removeSession(session: ChatSession) {
     const title = session.title?.trim() || m.chat_untitled();
-    if (!window.confirm(m.chat_delete_session_confirm({ title: autoDir(title) }))) return;
-    try {
-      await deleteChatSessionMutation.mutateAsync(session.id);
-    } catch (err) {
-      showAlert(m.chat_delete_session_failed({ title: autoDir(title), error: ltr(err instanceof Error ? err.message : String(err)) }), "error");
-      return;
-    }
-    forgetSession(session.id);
+    showConfirmDialog({
+      title: m.chat_panel_delete(),
+      description: m.chat_delete_session_confirm({ title: autoDir(title) }),
+      confirmLabel: m.chat_panel_delete(),
+      destructive: true,
+      onCancel: "close",
+      onConfirm: async () => {
+        await deleteChatSessionMutation.mutateAsync(session.id);
+        forgetSession(session.id);
+      },
+    });
   }
 
   /** Deliver a card answer; resolves `false` when delivery failed (so a
@@ -6591,20 +6594,23 @@ export function ChatPanel({
     [activeId, projectId, queueSessionMutation, sessionsOptions],
   );
 
-  const isApple = /Mac|iPhone|iPad/.test(navigator.platform);
-  const newTaskShortcut = isApple ? "⌘ N" : "Ctrl + N";
-  const queueChord = isApple ? "⌘ Enter" : "Ctrl + Enter";
+  const newTaskHotkey = useAppHotkeys()["task.new"].hotkey;
+  const newTaskShortcut = newTaskHotkey ? formatForDisplay(newTaskHotkey) : undefined;
+  const queueChord = formatForDisplay("Mod+Enter");
   const startProjectTask = useCallback(() => {
     setSessionFilter("active");
+    setNewChatFocusProject(projectId);
     onActiveSessionChange(null);
-  }, [onActiveSessionChange]);
+  }, [onActiveSessionChange, projectId]);
   const startNewTask = useCallback(async () => {
     try {
       const activity = await queryClient.fetchQuery({ ...listProjectActivityQuery(), staleTime: 0 });
       const latest = activity.reduce<(typeof activity)[number] | undefined>((current, item) =>
         !current || item.lastActivityAt > current.lastActivityAt ? item : current, undefined);
       setSessionFilter("active");
-      onActiveSessionChange(null, { projectId: latest?.projectId ?? projectId });
+      const targetProject = latest?.projectId ?? projectId;
+      setNewChatFocusProject(targetProject);
+      onActiveSessionChange(null, { projectId: targetProject });
     } catch (error) {
       showAlert(error instanceof Error ? error.message : String(error), "error");
     }
@@ -6627,23 +6633,12 @@ export function ChatPanel({
     [onActiveSessionChange],
   );
 
-  useEffect(() => {
-    if (embedded) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.repeat ||
-        (!event.metaKey && !event.ctrlKey) ||
-        event.altKey ||
-        !((event.key.toLowerCase() === "n" && !event.shiftKey) || (event.key === "Enter" && event.shiftKey)) ||
-        inSideChat(event.target)
-      )
-        return;
-      event.preventDefault();
-      startNewTask();
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [startNewTask, embedded]);
+  const newTask = () => {
+    if (commandRegion() === "right" && document.querySelector(".right-pane [data-side-chat]")) return;
+    startNewTask();
+  };
+  useHotkey(appHotkeys["task.new"], newTask, { enabled: !embedded, requireReset: true });
+  useHotkey("Mod+Shift+Enter", newTask, { enabled: !embedded, requireReset: true });
 
   const sessionWaiting = (session: ChatSession) => state.messagesBySession[session.id]
     ? waitingSessions.has(session.id) : session.awaitingInput === true;
@@ -6703,6 +6698,15 @@ export function ChatPanel({
   });
 
   const sidebarVirtualItems = sidebarVirtualizer.getVirtualItems();
+  const pendingSidebarFocus = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    if (pendingSidebarFocus.current === null) return;
+    const row = railBodyRef.current?.querySelector<HTMLElement>(`[data-index="${pendingSidebarFocus.current}"] [data-sidebar-keyboard-row]`);
+    if (row) {
+      pendingSidebarFocus.current = null;
+      row.focus();
+    }
+  });
   const lastVisibleIndex = sidebarVirtualItems.at(-1)?.index ?? -1;
   useEffect(() => {
     if (sidebarGrouping === "list" && railOpen && !embedded && lastVisibleIndex >= sidebarRows.length - 6
@@ -6712,13 +6716,19 @@ export function ChatPanel({
   }, [sidebarGrouping, railOpen, embedded, lastVisibleIndex, sidebarRows.length, flatSessions.hasNextPage, flatSessions.isFetching, flatSessions.isError, flatSessions.fetchNextPage]);
 
   const rail = (
-    <aside className="session-rail w-75 shrink-0 flex flex-col bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-2 [&_.rail-body]:pe-1 border-e border-e-border overflow-visible">
+    <aside style={mobileRail ? undefined : { width: railWidth }} className="session-rail relative shrink-0 flex flex-col bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-2 [&_.rail-body]:pe-1 border-e border-e-border overflow-visible">
+      {!mobileRail && <div
+        className="rail-resizer absolute -end-1 top-0 bottom-0 w-1.5 z-30 cursor-col-resize [&:hover]:bg-resizer-hover [&:active]:bg-resizer-hover"
+        onPointerDown={onResizeRail}
+      />}
       {railHeader}
-      <nav className="rail-nav flex flex-col gap-0.5 p-2 shrink-0">
+      <nav data-keyboard-list onKeyDown={navigateKeyboardList} className="rail-nav flex flex-col gap-0.5 p-2 shrink-0 [&_[data-tip]::after]:left-[calc(100%_+_6px)] [&_[data-tip]::after]:top-1/2 [&_[data-tip]::after]:translate-x-0 [&_[data-tip]::after]:-translate-y-1/2">
         <button
-          className="rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start hover:bg-surface [&[data-tip]::after]:top-auto [&[data-tip]::after]:bottom-[calc(100%_+_6px)]"
+          className="rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start hover:bg-surface"
           data-onboarding="new-session"
+          data-keyboard-item
           data-tip={newTaskShortcut}
+          aria-label={m.chat_panel_new_chat()}
           aria-keyshortcuts="Meta+N Control+N Meta+Shift+Enter Control+Shift+Enter"
           onClick={startNewTask}
         >
@@ -6726,6 +6736,7 @@ export function ChatPanel({
           {m.chat_panel_new_chat()}
         </button>
         <button
+          data-keyboard-item
           className={`rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium ${mainView === "skills" ? "active" : ""}`}
           aria-current={mainView === "skills" ? "page" : undefined}
           onClick={() => onSelectMainView("skills")}
@@ -6735,12 +6746,17 @@ export function ChatPanel({
         </button>
         {SETTINGS_NAV.map((item) => {
           const active = mainView !== "chat" && mainView !== "skills" && item.activeTabs.includes(mainView);
+          const shortcut = item.id === "settings" ? appHotkeys["settings.open"].hotkey : item.id === "compute" ? appHotkeys["compute.open"].hotkey : null;
           return (
             <button
               key={item.id}
+              data-keyboard-item
               className={`rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium ${active ? "active" : ""}`}
               aria-current={active ? "page" : undefined}
               data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
+              data-tip={shortcut ? formatForDisplay(shortcut) : undefined}
+              aria-label={item.label()}
+              aria-keyshortcuts={item.id === "settings" ? "Meta+, Control+," : item.id === "compute" ? "Meta+Alt+C Control+Alt+C" : undefined}
               onClick={() => onSelectMainView(item.id)}
             >
               {item.icon}
@@ -6749,11 +6765,11 @@ export function ChatPanel({
           );
         })}
       </nav>
-      <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pe-2.5 pb-0 ps-4.5">
+      <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pe-3.5 pb-0 ps-4.5">
         <div className="rail-section-label p-0 text-sm font-medium text-subtext">
           {sidebarGrouping === "projects" ? m.projects_home_projects() : m.chat_all_sessions()}
         </div>
-        <div className="rail-section-actions flex items-center gap-0.5">
+        <div className="rail-section-actions flex items-center gap-1">
           {onNewProject && <Tooltip interactive content={m.projects_home_new_project()} className="rounded-sm">
             <IconButton size="small" className="text-subtext" aria-label={m.projects_home_new_project()} onClick={onNewProject}>
               <FolderPlus size={16} className="text-subtext" />
@@ -6769,7 +6785,37 @@ export function ChatPanel({
         </div>
       </div>
       <div className="relative flex-1 min-h-0">
-      <div ref={railBodyRef} tabIndex={-1} className={`rail-body h-full overflow-x-hidden ${sidebarScrollable ? "overflow-y-auto" : "overflow-y-hidden"}`}>
+      <div ref={setRailBody} tabIndex={-1} className={`rail-body h-full overflow-x-hidden ${sidebarScrollable ? "overflow-y-auto" : "overflow-y-hidden"}`}
+        onKeyDown={(event) => {
+          if (event.defaultPrevented || event.nativeEvent.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+          const target = event.target;
+          if (!(target instanceof HTMLElement) || (target !== event.currentTarget && !target.hasAttribute("data-sidebar-keyboard-row"))) return;
+          const rows = sidebarScrollable ? sidebarRows : defaultRows;
+          const indexes = rows.flatMap((row, index) => row.kind === "project" || row.kind === "chat" ? [index] : []);
+          if (indexes.length === 0) return;
+          const rowIndex = Number(target.closest("[data-index]")?.getAttribute("data-index") ?? -1);
+          const position = indexes.indexOf(rowIndex);
+          let next: number;
+          if (event.key === "ArrowDown") next = position < 0 ? 0 : Math.min(position + 1, indexes.length - 1);
+          else if (event.key === "ArrowUp") next = position < 0 ? indexes.length - 1 : Math.max(position - 1, 0);
+          else if (event.key === "Home") next = 0;
+          else if (event.key === "End") next = indexes.length - 1;
+          else if (target instanceof HTMLButtonElement && event.key === "ArrowRight" && target.getAttribute("aria-expanded") === "false") {
+            event.preventDefault();
+            target.click();
+            return;
+          } else if (target instanceof HTMLButtonElement && event.key === "ArrowLeft" && target.getAttribute("aria-expanded") === "true") {
+            event.preventDefault();
+            target.click();
+            return;
+          } else return;
+          event.preventDefault();
+          const index = indexes[next];
+          if (index === rowIndex) return;
+          pendingSidebarFocus.current = index;
+          setFocusedSidebarRow(sidebarRowKey(rows[index]));
+          if (sidebarScrollable) sidebarVirtualizer.scrollToIndex(index, { align: "auto" });
+        }}>
         <div className="relative" style={{ height: (sidebarScrollable ? sidebarVirtualizer.getTotalSize() : defaultRowsHeight) + (showProjectMore ? 38 : 0) + (sidebarExpandedAll ? 46 : 0) }}>
           {(sidebarScrollable
             ? sidebarVirtualItems.map((item) => ({ row: sidebarRows[item.index], top: item.start, index: item.index }))
@@ -6906,10 +6952,19 @@ export function ChatPanel({
   );
 
   const headerClass = `chat-header flex items-center gap-2 py-0 px-4 bg-background shrink-0 h-12 mac-titlebar:h-titlebar relative z-4 w-full max-w-readable my-0 mx-auto [&::after]:content-[''] [&::after]:absolute [&::after]:top-full [&::after]:start-0 [&::after]:end-0 [&::after]:h-6 [&::after]:bg-[linear-gradient(to_bottom,_var(--base),_transparent)] [&::after]:pointer-events-none`;
-  const railReopen = !railOpen && !embedded && (
-    <Tooltip interactive content={m.chat_panel_show_sidebar()} className="rounded-md mac-titlebar:invisible">
+  const displayedRail = mobileRail ? (
+    <Dialog.Root open={railOpen} onOpenChange={(open) => { if (!open) onCloseMobileRail?.(); }}>
+      <Dialog.Portal>
+        <Dialog.Backdrop className="fixed inset-0 z-70 bg-modal-backdrop" />
+        <Dialog.Popup aria-modal="true" aria-label={m.chat_panel_show_sidebar()} className="mobile-rail-dialog fixed inset-y-0 start-0 z-80 outline-none">{rail}</Dialog.Popup>
+      </Dialog.Portal>
+    </Dialog.Root>
+  ) : railOpen ? rail : null;
+  const railReopen = (!railOpen || mobileRail) && !embedded && (
+    <Tooltip interactive content={`${m.chat_panel_show_sidebar()} (${formatForDisplay(appHotkeys["sidebar.toggle"].hotkey ?? [])})`} className="rounded-md mac-titlebar:invisible">
       <IconButton
         aria-label={m.chat_panel_show_sidebar()}
+        aria-expanded={railOpen}
         onClick={onShowRail}
         className="mac-titlebar:ms-titlebar-inset"
       >
@@ -6921,9 +6976,9 @@ export function ChatPanel({
   if (mainView !== "chat") {
     return (
       <>
-        {railOpen && rail}
-        <section className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
-          {!railOpen && <div className="mac-titlebar-spacer flex h-12 mac-titlebar:h-titlebar shrink-0 items-center">{railReopen}</div>}
+        {displayedRail}
+        <section inert={contentInert} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
+          {(!railOpen || mobileRail) && <div className="mac-titlebar-spacer flex h-12 mac-titlebar:h-titlebar shrink-0 items-center">{railReopen}</div>}
           {/* Keyed per view so no tab inherits the chat thread's or another tab's scroll offset. */}
           <div key={mainView} className="settings-view-scroll flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
             {contentError ? <div role="alert" className="p-6 text-subtext">{contentError}<Button onClick={onRetryContent}>{m.app_retry()}</Button></div>
@@ -6936,11 +6991,11 @@ export function ChatPanel({
 
   return (
     <>
-      {railOpen && rail}
-      <section data-side-chat={embedded || undefined} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
+      {displayedRail}
+      <section inert={contentInert} data-side-chat={embedded || undefined} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
         {/* Header — session title on the left, end-pane view switchers on the
           right, fading into the chat below (sessions live in the rail). */}
-        <div className={railOpen || embedded ? "contents" : "grid shrink-0 grid-cols-[2rem_minmax(0,1fr)_2rem] mac-titlebar:grid-cols-titlebar-chat items-center"}>
+        <div className={railOpen && !mobileRail || embedded ? "contents" : "chat-heading-row grid shrink-0 grid-cols-[2rem_minmax(0,1fr)_2rem] mac-titlebar:grid-cols-titlebar-chat items-center"}>
           {railReopen}
           <div className={headerClass}>
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -7028,7 +7083,7 @@ export function ChatPanel({
               </>
             )}
             {starterPrompts && starterPrompts.length > 0 && (
-              <div className={STARTER_GRID_CLASS} role="group" aria-label={m.chat_panel_starter_prompts()}>
+              <div className={STARTER_GRID_CLASS} role="group" aria-label={m.chat_panel_starter_prompts()} inert={connection !== null}>
                 {starterPrompts.map((item, index) => {
                   const Icon = STARTER_ICONS[index];
                   const tone = STARTER_TONES[index];
@@ -7144,14 +7199,14 @@ export function ChatPanel({
         )}
 
         {pendingQuestions.length > 0 && (
-          <div inert={contentLoading || Boolean(contentError) || historyLoading} className="mx-auto mb-2 flex max-h-96 w-full max-w-readable shrink-0 flex-col gap-2 overflow-y-auto px-3">
+          <div inert={contentLoading || Boolean(contentError) || historyLoading || connection !== null} className="mx-auto mb-2 flex max-h-96 w-full max-w-readable shrink-0 flex-col gap-2 overflow-y-auto px-3">
             {pendingQuestions.map((part) => <PromptCard key={`${activeId}-${part.id}`} part={part} onRespond={respond} />)}
           </div>
         )}
 
         {/* Docked while a plan awaits a decision, so the approval controls never
           scroll away. Actions mirror the (now compact) inline card's wire. */}
-        <div inert={contentLoading || Boolean(contentError) || historyLoading} className="composer px-3 pb-5 shrink-0 relative z-4 bg-background w-full max-w-readable my-0 mx-auto [&_textarea]:border-0 [&_textarea]:bg-none [&_textarea]:bg-transparent [&_textarea]:resize-none [&_textarea]:pt-2.5 [&_textarea]:px-3 [&_textarea]:pb-1 [&_textarea]:text-base [&_textarea]:field-sizing-content [&_textarea]:min-h-18 [&_textarea]:max-h-45">
+        <div inert={contentLoading || Boolean(contentError) || historyLoading} className="composer px-3 pb-3 shrink-0 relative z-4 bg-background w-full max-w-readable my-0 mx-auto [&_textarea]:border-0 [&_textarea]:bg-none [&_textarea]:bg-transparent [&_textarea]:resize-none [&_textarea]:pt-2.5 [&_textarea]:px-3 [&_textarea]:pb-1 [&_textarea]:text-base [&_textarea]:field-sizing-content [&_textarea]:min-h-18 [&_textarea]:max-h-45">
           {threadMounted && (
             <Tooltip interactive content={m.chat_scroll_to_bottom()} className={`absolute bottom-full left-1/2 z-5 mb-6 -translate-x-1/2 transition-opacity duration-150 ease-standard ${transcriptAtBottom ? "pointer-events-none opacity-0" : "opacity-100"}`}>
               <IconButton
@@ -7172,6 +7227,7 @@ export function ChatPanel({
             key={activeId}
             runs={activeRuns.filter((item) => item.sessionId === activeId)}
             onOpenRun={onOpenRun}
+            onOpenExperiment={onOpenExperiment}
           />
           {/* Inside the composer so the composer's popovers (mode/model pickers,
             z 50 within this stacking context) layer above the strip — as a
@@ -7312,7 +7368,8 @@ export function ChatPanel({
               }}
             />
           )}
-          <div className={`composer-box relative flex flex-col border ${bashMode ? "border-accent-amber" : "border-border"} rounded-lg bg-background shadow-control-subtle`} data-onboarding="composer">
+          <RemoteConnectionStrip />
+          <div inert={connection !== null} className={`composer-box relative flex flex-col border ${bashMode ? "border-accent-amber" : "border-border"} rounded-lg bg-background shadow-control-subtle${connection ? " opacity-60" : ""}`} data-onboarding="composer">
             {unconfirmedSend !== null && (
               <div id={unconfirmedSendId} role="alert" className="flex items-start gap-2 pt-2 px-3 text-sm text-text">
                 <span className="flex-1" dir="auto">{m.chat_send_unconfirmed({ error: ltr(unconfirmedSend) })}</span>
@@ -7359,21 +7416,6 @@ export function ChatPanel({
                 activeIndex={activeMentionIdx}
                 onPick={pickFileMention}
                 onHover={setMentionIdx}
-              />
-            )}
-            {resumeOpen && (
-              <ResumeDialog
-                activeSessionId={activeId}
-                onClose={() => setResumeOpen(false)}
-                onResume={(session) => {
-                  setResumeOpen(false);
-                  setSessionFilter("all");
-                  onActiveSessionChange(session.id, { projectId: session.projectId });
-                }}
-                onImport={(chat) => {
-                  setResumeOpen(false);
-                  void importChat(chat);
-                }}
               />
             )}
             {annotations.length > 0 && (
@@ -7509,6 +7551,7 @@ export function ChatPanel({
                       return;
                     }
                     if (e.key === "Escape") {
+                      e.stopPropagation();
                       e.preventDefault();
                       setSkillMenuDismissed(true);
                       return;
@@ -7526,21 +7569,20 @@ export function ChatPanel({
                     // A bare trailing `@` still sends on Enter; `@` is common in prose.
                     if (
                       e.key === "Tab"
-                      || (e.key === "Enter" && mentionQuery !== "" && !e.shiftKey && !e.metaKey && !e.ctrlKey)
+                      || (mentionQuery !== "" && matchesKeyboardEvent(e.nativeEvent, "Enter"))
                     ) {
                       e.preventDefault();
                       pickFileMention(mentionMatches[activeMentionIdx]);
                       return;
                     }
                     if (e.key === "Escape") {
+                      e.stopPropagation();
                       e.preventDefault();
                       setSkillMenuDismissed(true);
                       return;
                     }
                   }
                   // Backspace just behind a chip deletes the whole command.
-                  // (Escape deliberately doesn't touch it — that's the
-                  // stop-the-turn gesture, see the document listener above.)
                   if (e.key === "Backspace" && deleteCommandBehindCaret(e.currentTarget)) {
                     e.preventDefault();
                     return;
@@ -7551,7 +7593,7 @@ export function ChatPanel({
                       void runShell();
                       return;
                     }
-                    void send({ queue: e.metaKey || e.ctrlKey });
+                    void send({ queue: matchesKeyboardEvent(e.nativeEvent, "Mod+Enter") });
                   }
                 }}
               />
@@ -7722,6 +7764,8 @@ export function ChatPanel({
           </div>
         </div>
       </section>
+      <EscapeScope enabled={dataSources.open} onEscape={() => dataSources.setOpen(false)} />
+      <EscapeScope enabled={skillMenuOpen || mentionMenuOpen} onEscape={() => setSkillMenuDismissed(true)} />
     </>
   );
 }

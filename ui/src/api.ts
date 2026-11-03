@@ -563,6 +563,9 @@ export const openFileInEditor = (
     sessionId: opts.sessionId,
   });
 
+export const getFileManager = (locale: string, signal?: AbortSignal) =>
+  get<{ os: string; name: string | null }>(`/api/file-manager?locale=${encodeURIComponent(locale)}`, signal);
+
 /** Reveal a checkout file in the OS file manager on the machine running `orx up`. */
 export const revealFileInManager = (
   projectId: string,
@@ -1772,6 +1775,7 @@ export interface Harness {
   authCheckFailed?: boolean;
   accountLoading?: boolean;
   account?: string;
+  accountName?: string;
   org?: string;
   plan?: string;
   agentReady: boolean;
@@ -1833,7 +1837,7 @@ export const saveAcpHarness = (definition: Omit<AcpDefinition, "id">, id?: strin
   ? put<AcpDefinition>(`/api/harnesses/acp/${encodeURIComponent(id)}`, definition)
   : post<AcpDefinition>("/api/harnesses/acp", definition);
 export const removeAcpHarness = (id: string) => writeResponse(`/api/harnesses/acp/${encodeURIComponent(id)}`, { method: "DELETE" }).then((response) => json<{ ok: boolean }>(response));
-export const testAcpHarness = (definition: Omit<AcpDefinition, "id">) => post<{ status: string; agentInfo?: { version?: string } }>("/api/harnesses/acp/test", definition);
+export const testAcpHarness = (definition: Omit<AcpDefinition, "id">) => post<{ status: string; agentInfo?: { version?: string }; harnessId: AcpDefinition["id"] | null }>("/api/harnesses/acp/test", definition);
 export const setChatConfiguration = (sessionId: string, optionId: string, value: string) => post<ChatSession>(`/api/chat/sessions/${sessionId}/configuration`, { optionId, value });
 
 /** Slash-skill offered in the composer's `/` dropdown; expanded server-side. */
