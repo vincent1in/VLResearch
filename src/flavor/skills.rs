@@ -42,8 +42,24 @@ pub(crate) const FINDINGS: AgentSkill = AgentSkill {
     resources: &[],
 };
 
+pub(crate) const WRITING: AgentSkill = AgentSkill {
+    name: "orx-writing",
+    description: "Edit prose for precision and economy and strip machine-writing patterns: inflated claims, vague attribution, stock phrasing, staged reveals, counted lists, slogans, recap boxes. Use before finishing a paper, report, finding, brief, README or long reply, when revising the user's manuscript, or when asked to remove AI slop or tighten writing. LaTeX builds stay with `orx-paper`.",
+    content: include_str!("../../agent-skills/orx-writing/SKILL.md"),
+    resources: &[
+        AgentSkillResource {
+            path: "references/patterns.md",
+            content: include_str!("../../agent-skills/orx-writing/references/patterns.md"),
+        },
+        AgentSkillResource {
+            path: "assets/prose_scan.py",
+            content: include_str!("../../agent-skills/orx-writing/assets/prose_scan.py"),
+        },
+    ],
+};
+
 /// VLResearch's skills, in the order they are listed.
-const SKILLS: [&AgentSkill; 5] = [&METRICS, &IDEAS, &FINDINGS, &GRILL, &IMPROVE];
+const SKILLS: [&AgentSkill; 6] = [&METRICS, &IDEAS, &FINDINGS, &GRILL, &IMPROVE, &WRITING];
 
 /// Adds VLResearch's skills to an upstream skill list, right after
 /// `orx-results` (or at the end if upstream renames it).
@@ -72,13 +88,14 @@ mod tests {
                 .position(|name| *name == "orx-results")
                 .unwrap();
             assert_eq!(
-                names[results + 1..results + 6],
+                names[results + 1..results + 7],
                 [
                     "orx-metrics",
                     "orx-ideas",
                     "orx-findings",
                     "orx-grill",
-                    "orx-improve"
+                    "orx-improve",
+                    "orx-writing"
                 ]
             );
         }
@@ -94,5 +111,23 @@ mod tests {
         let keys: Vec<_> = points.iter().map(|point| point.key.as_str()).collect();
         assert_eq!(keys, ["train_loss", "lr"]);
         assert!(points.iter().all(|point| point.step == Some(3)));
+    }
+
+    #[test]
+    fn the_writing_skill_links_its_bundled_files() {
+        let skill = &super::WRITING;
+        for resource in skill.resources {
+            assert!(
+                skill.content.contains(resource.path),
+                "SKILL.md never mentions {}",
+                resource.path
+            );
+        }
+        let scanner = skill.resources[1].content;
+        assert!(scanner.starts_with("#!/usr/bin/env python3"));
+        assert!(
+            !scanner.contains("open(path, \"w"),
+            "the scanner must not edit files"
+        );
     }
 }
