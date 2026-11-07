@@ -13,6 +13,8 @@ VLResearch is OpenResearch plus a thin layer of changes. Keeping that layer thin
 | `flavor/scripts/` | `sync-upstream.sh`, `egress_audit.py`, `secret-scan.sh`, `install-hooks.sh` |
 | `flavor/bench/loop.md` | The improvement-loop benchmark's last report. Rerun it after changing the selector, the keep rule or how the best is scored: `cargo test --release --bin orx flavor::bench::report -- --ignored --nocapture` |
 | `flavor/egress-baseline.txt` | Accepted network call sites outside the egress gate |
+| `flavor/EFFICIENCY.md` | The efficiency ledger: every change that makes research cheaper on any install, its evidence, and the consensus rule by which one becomes a default |
+| `flavor/USAGE.md` | The format of each researcher's usage profile, which lives in `~/.config/openresearch/vlresearch/usage.md` outside the repository, and how updates treat it |
 | `.github/workflows/vlresearch.yml` | Secret scan and egress audit; upstream's `ci.yml` still runs fmt, clippy and tests |
 | `README.md`, `NOTICE`, this file | VLResearch's own docs; `README.md` never takes upstream's edits |
 
