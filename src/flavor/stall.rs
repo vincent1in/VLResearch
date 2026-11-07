@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
-use crate::store::{RunWakeup, Store, StoredRun};
+use crate::store::{Store, StoredRun};
 
 /// Minutes a running job may print nothing before it is flagged; `0` turns
 /// stall alerts off.
@@ -229,8 +229,9 @@ fn unmonitored(run: &StoredRun) -> bool {
         .is_ok_and(|descriptor| descriptor.monitoring_error.is_some())
 }
 
-/// Updates the alerts for the live runs these wake-ups wait on.
-pub(crate) fn scan(store: &Store, wakeups: &[RunWakeup], now: i64) -> Result<()> {
+/// Updates the alerts for the live runs chats are watching, given as
+/// (chat, run) pairs.
+pub(crate) fn scan(store: &Store, watched: &[(String, StoredRun)], now: i64) -> Result<()> {
     let minutes = stall_minutes(store);
     if minutes == 0 {
         return Ok(());
@@ -238,8 +239,7 @@ pub(crate) fn scan(store: &Store, wakeups: &[RunWakeup], now: i64) -> Result<()>
     let conn = store.flavor_conn();
     ensure_tables(conn)?;
     let mut seen = std::collections::HashSet::new();
-    for wakeup in wakeups {
-        let run = &wakeup.run;
+    for (_, run) in watched {
         if run.status != "running" || !seen.insert(run.id.clone()) {
             continue;
         }
@@ -417,13 +417,8 @@ mod tests {
         }
     }
 
-    fn wakeup(run: StoredRun) -> RunWakeup {
-        RunWakeup {
-            run,
-            chat_session_id: "chat_A".into(),
-            state: "pending".into(),
-            monitoring_alerted: false,
-        }
+    fn wakeup(run: StoredRun) -> (String, StoredRun) {
+        ("chat_A".into(), run)
     }
 
     #[test]

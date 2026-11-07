@@ -1,12 +1,15 @@
 //! VLResearch glue that needs the chat host's private turn machinery. It is
 //! compiled as a child of `local::chat` (the `#[path]` module declaration
-//! there), which lets it start hidden wake-up turns the way upstream's run
-//! watcher does, while the file itself stays with the rest of the flavor.
+//! there), which lets it start hidden turns the way upstream's run notices
+//! do, while the file itself stays with the rest of the flavor.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use super::{ChatHost, TurnGuard, TurnSubmission};
+use super::{
+    AnnotatedText, ChatHost, SendTurnRequest, TranscriptDisplay, TurnAdmission, TurnAttachments,
+    TurnGuard, TurnOverrides, TurnState, TurnSubmission,
+};
 use crate::flavor::stall;
 use crate::store::{Store, StoredRun};
 
@@ -62,25 +65,27 @@ async fn deliver_stall_alerts(
     store: Store,
     now: i64,
 ) -> crate::error::Result<()> {
-    let wakeups = store.list_active_run_wakeups()?;
-    stall::scan(&store, &wakeups, now)?;
+    let watched = store.chat_active_runs()?;
+    stall::scan(&store, &watched, now)?;
     let mut runs_by_session: BTreeMap<String, Vec<StoredRun>> = BTreeMap::new();
-    for wakeup in wakeups {
-        runs_by_session
-            .entry(wakeup.chat_session_id)
-            .or_default()
-            .push(wakeup.run);
+    for (session_id, run) in watched {
+        runs_by_session.entry(session_id).or_default().push(run);
     }
     for (session_id, runs) in runs_by_session {
         let pending = stall::undelivered(&store, &session_id, &runs)?;
         if pending.is_empty() {
             continue;
         }
-        let Some(guard) = TurnGuard::claim_hidden(chat, &session_id).await else {
+        let Some(guard) =
+            TurnGuard::claim_idle(chat, &session_id, TurnState::Reserved { turn_id: None }).await
+        else {
             continue;
         };
         let text = stall::agent_text(&pending, stall::stall_minutes(&store));
-        let delivered = match chat.send_hidden_message(&session_id, text, guard).await {
+        let delivered = match chat
+            .send_message_showing(&session_id, hidden_turn(text, guard))
+            .await
+        {
             Ok(TurnSubmission::Started(_)) => {
                 forget_failures(&session_id);
                 true
@@ -101,6 +106,29 @@ async fn deliver_stall_alerts(
         }
     }
     Ok(())
+}
+
+/// A turn the agent sees and the transcript doesn't.
+fn hidden_turn(text: String, guard: TurnGuard) -> SendTurnRequest {
+    SendTurnRequest {
+        messages: vec![AnnotatedText {
+            text,
+            annotations: Vec::new(),
+        }],
+        prepared_input: None,
+        replace_settings: false,
+        transcript: TranscriptDisplay {
+            text: Some(String::new()),
+            annotations: None,
+            orx: Vec::new(),
+            record_user_message: false,
+        },
+        overrides: TurnOverrides::default(),
+        images: TurnAttachments::Uploaded(Vec::new()),
+        admission: TurnAdmission::Preclaimed(guard),
+        client_turn_id: None,
+        request_hash: None,
+    }
 }
 
 #[cfg(test)]
@@ -149,7 +177,6 @@ mod tests {
             chat_session_id: Some("chat_A".into()),
         };
         store.upsert_run(&run).unwrap();
-        store.register_run_wakeup("run_quiet", "chat_A").unwrap();
         let host = Arc::new(ChatHost::new(
             Arc::new(crate::local::opencode::AgentHost::new(None)),
             Arc::new(crate::local::codex::CodexHost::new()),

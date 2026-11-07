@@ -5,7 +5,7 @@ description: "Report run metrics as ORX_METRIC lines and compare runs on this ch
 
 ## Report metrics from run code
 
-orx records every line of run output that carries `ORX_METRIC` followed by a
+`orx` records every line of run output that carries `ORX_METRIC` followed by a
 JSON object. Print one line per measurement, flushed, from the process that
 owns the result (rank 0 in distributed training):
 

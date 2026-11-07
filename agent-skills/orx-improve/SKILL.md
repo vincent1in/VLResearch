@@ -22,7 +22,7 @@ one, scope the work first with `orx-grill`; `orx idea next` and
    past misses suggest reading it: shifted by your mean error, with the
    interval stretched until about 80% of past outcomes would have landed
    inside. Take that reading unless you know something it can't. Edit the
-   forecast (`orx idea edit <ideaId> --forecast ... --interval ...`) before
+   forecast (`orx idea edit <ideaId> --forecast <forecast> --interval <interval>`) before
    the run, never after.
 3. **Build.** Create the experiment as a child of the current best
    (`orx metric best <projectId>` prints its experiment id), changing only
@@ -32,7 +32,7 @@ one, scope the work first with `orx-grill`; `orx idea next` and
    idea is expensive, run its kill test first. The chat is woken when runs
    finish, and told if one stalls or diverges.
 5. **Verify.** `orx idea done <ideaId> --evidence "<runs and numbers>"`.
-   orx measures the change against the parent, compares it with the noise
+   `orx` measures the change against the parent, compares it with the noise
    floor (0 unless the brief set one), and keeps or refutes the idea.
 6. **Learn.** Record what the result says beyond this one idea as a finding,
    with the runs as evidence (`orx-findings`), whether the idea was kept or
@@ -45,7 +45,7 @@ one, scope the work first with `orx-grill`; `orx idea next` and
    runs: if the gain was luck, the mean falls back, the best returns to what
    it was, and the idea it repeated is refuted. Build only on a best whose
    replicate held. When ablation checks are turned on (`VLR_AUTO_ABLATE`),
-   orx queues those too (`orx-ideas`), and drops them if the replicate
+   `orx` queues those too (`orx-ideas`), and drops them if the replicate
    fails.
 
 Report each round in two or three lines: the idea, forecast against
