@@ -200,7 +200,6 @@ async fn wait(
     // VLResearch: a shorter default under Claude Code; see flavor::wake.
     let deadline = Instant::now()
         + Duration::from_secs(timeout.unwrap_or_else(crate::flavor::wake::default_wait_secs));
-    let (waited_exp, waited_project) = (exp_id.clone(), project.clone());
 
     let result = match (exp_id, project) {
         (Some(_), Some(_)) => Err(anyhow!("Pass either <expId> or --project, not both.")),
@@ -237,13 +236,8 @@ async fn wait(
             plane.wait(deadline).await
         }
     };
-    // VLResearch: a timed-out wait in a chat points the agent at its wake-up.
-    crate::flavor::wake::after_wait(
-        result,
-        Instant::now() >= deadline,
-        waited_exp.as_deref(),
-        waited_project.as_deref(),
-    )
+    // VLResearch: a timed-out wait in a chat points the agent at the result message.
+    crate::flavor::wake::after_wait(result, Instant::now() >= deadline)
 }
 
 const SUPERVISOR_LOG_MAX_BYTES: u64 = 1024 * 1024;

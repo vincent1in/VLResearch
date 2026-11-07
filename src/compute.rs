@@ -813,6 +813,7 @@ where
     .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?
     .to_string();
     let source = backend.stage_source(&project, &experiment).await?.0;
+    crate::flavor::scope::check_snapshot(&store, &project, &vlr_launch, &source.revision)?; // VLResearch: locked paths.
     let run_id = uuid::Uuid::new_v4().to_string();
     let launch = backend.prepare(args, &source, &run_id, &command).await?;
 
@@ -871,6 +872,7 @@ where
         launch,
     })
     .await?;
+    crate::flavor::scope::after_launch(&store, &run_id, &vlr_launch); // VLResearch: a probe run is recorded as one.
     if project.github_enabled() {
         if let Err(error) = crate::local::git::spawn_branch_publication(
             Path::new(&project.repo_path),
@@ -1017,6 +1019,14 @@ pub async fn submit_supervised(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     let project = store
         .get_local_project(&experiment.project_id)?
         .ok_or_else(|| anyhow!("Local project {} not found.", experiment.project_id))?;
+    // VLResearch: the scoping gate, before any compute is spent.
+    let vlr_launch = crate::flavor::scope::check_launch(
+        &store,
+        &project,
+        &experiment,
+        args.forwarded,
+        args.launching_chat_session().as_deref(),
+    )?;
     let source = backend.stage_source(&project, &experiment).await?;
     crate::flavor::scope::check_snapshot(&store, &project, &vlr_launch, &source.0.revision)?; // VLResearch: locked paths.
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -1160,13 +1170,7 @@ pub async fn submit_supervised(args: &crate::ExpRunArgs) -> Result<StoredRun> {
                     );
                 }
             }
-            // VLResearch: wake the launching chat when this run finishes, and
-            // record a probe run as one.
-            crate::flavor::wake::register_on_submit(
-                &store,
-                &run_id,
-                pending.chat_session_id.as_deref(),
-            );
+            // VLResearch: record a probe run as one.
             crate::flavor::scope::after_launch(&store, &run_id, &vlr_launch);
             Ok(run)
         }

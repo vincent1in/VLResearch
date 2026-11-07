@@ -3,15 +3,13 @@
 // scope, the budget, where to start) and the seed ideas, then opens the chat
 // that runs it, which scopes the rest with the user and waits for their
 // confirmation before the loop. It edits an optimization's brief the same way.
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import { Plus, X } from "lucide-react";
 import { useMemo, useRef, useState, type ReactNode } from "react";
-import { createChatSession, sendChatMessage, type Harness, type HarnessId } from "../api";
+import type { Harness, HarnessId } from "../api";
 import { Button, Input } from "../components/ui";
-import { workspaceKey } from "../queries/client";
-import { getUiStateQuery } from "../queries/projects";
-import { getHarnessesQuery } from "../queries/settings";
+import { useWorkspace, type Workspace } from "../workspace";
 import { taskLocation } from "../workspaceState";
 import {
   EMPTY_GUARD,
@@ -40,7 +38,7 @@ const GUARD_FIELDS = [
 ] as const;
 
 /** Refetches everything the Research view shows about optimizations. */
-export function refreshResearch(queryClient: QueryClient) {
+export function refreshResearch({ queryClient, workspaceKey }: Pick<Workspace, "queryClient" | "workspaceKey">) {
   return Promise.all(
     ["vlresearchOptimizations", "vlresearchIdeas", "vlresearchMetrics"].map((family) =>
       queryClient.invalidateQueries({ queryKey: workspaceKey(family) }),
@@ -48,8 +46,8 @@ export function refreshResearch(queryClient: QueryClient) {
   );
 }
 
-async function write(method: "PUT" | "POST", url: string, body?: unknown): Promise<unknown> {
-  const response = await fetch(url, {
+async function write(request: Workspace["request"], method: "PUT" | "POST", url: string, body?: unknown): Promise<unknown> {
+  const response = await request(url, {
     method,
     headers: body === undefined ? {} : { "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -126,7 +124,9 @@ export function ResearchSetup({
   // the optimization it started, and its chat.
   const created = useRef<string | null>(optimizationId);
   const started = useRef<string | null>(null);
-  const queryClient = useQueryClient();
+  const workspace = useWorkspace();
+  const { api, request } = workspace;
+  const { getHarnessesQuery, getUiStateQuery } = workspace.queries;
   const router = useRouter();
   const harnesses = useQuery(getHarnessesQuery());
   const uiState = useQuery(getUiStateQuery());
@@ -148,7 +148,7 @@ export function ResearchSetup({
       guards: current.guards.map((guard, at) => (at === index ? { ...guard, ...change } : guard)),
     }));
 
-  const refresh = () => refreshResearch(queryClient);
+  const refresh = () => refreshResearch(workspace);
 
   const save = async (start: boolean) => {
     setTried(true);
@@ -165,24 +165,24 @@ export function ResearchSetup({
     try {
       let id = created.current;
       if (id === null) {
-        const made = parseBrief(await write("POST", `/api/vlresearch/projects/${encodeURIComponent(projectId)}/optimizations`, briefPayload(draft)));
+        const made = parseBrief(await write(request, "POST", `/api/vlresearch/projects/${encodeURIComponent(projectId)}/optimizations`, briefPayload(draft)));
         id = made.brief?.id ?? null;
         if (!id) throw new Error("The new optimization came back without an id.");
         created.current = id;
       } else {
-        await write("PUT", `/api/vlresearch/optimizations/${encodeURIComponent(id)}/brief`, briefPayload(draft));
+        await write(request, "PUT", `/api/vlresearch/optimizations/${encodeURIComponent(id)}/brief`, briefPayload(draft));
       }
       const base = `/api/vlresearch/optimizations/${encodeURIComponent(id)}`;
       for (const [index, idea] of draft.ideas.entries()) {
         const body = ideaPayload(idea);
         if (!body) continue;
-        await write("POST", `${base}/ideas`, body);
+        await write(request, "POST", `${base}/ideas`, body);
         saved.add(index);
       }
       if (start && chosen) {
         const sameAgent = preferred?.harness === chosen;
         started.current ??= (
-          await createChatSession(projectId, chosen, {
+          await api.createChatSession(projectId, chosen, {
             model: sameAgent ? preferred?.model ?? null : null,
             serviceTier: sameAgent ? preferred?.serviceTier ?? null : null,
             permissionMode: sameAgent ? preferred?.permissionMode ?? null : null,
@@ -190,8 +190,8 @@ export function ResearchSetup({
           })
         ).id;
         const sessionId = started.current;
-        await write("PUT", `${base}/brief/chat`, { sessionId });
-        await sendChatMessage(sessionId, kickoffMessage(projectId, id, queued.length + saved.size));
+        await write(request, "PUT", `${base}/brief/chat`, { sessionId });
+        await api.sendChatMessage(sessionId, kickoffMessage(projectId, id, queued.length + saved.size));
         await refresh();
         onSaved(id);
         const pane = new URLSearchParams(window.location.search).get("pane");
