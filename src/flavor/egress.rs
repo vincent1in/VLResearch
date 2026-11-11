@@ -275,7 +275,7 @@ mod tests {
         {
             return;
         }
-        let mut command = std::process::Command::new("git");
+        let mut command = crate::process::command("git");
         restrict_git(&mut command);
         let value = command
             .get_envs()
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn agent_defaults_never_override_a_value_on_the_command() {
-        let mut cmd = tokio::process::Command::new("true");
+        let mut cmd = crate::process::tokio_command("true");
         cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "custom");
         apply_agent_env_defaults(&mut cmd);
         let value = cmd

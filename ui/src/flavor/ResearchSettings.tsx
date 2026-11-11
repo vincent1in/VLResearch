@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { Input, LoadingRow, Spinner, Switch } from "../components/ui";
 import { cn } from "../components/ui/cn";
-import { workspaceKey } from "../queries/client";
+import { useWorkspace, type Workspace } from "../workspace";
 import {
   COMPACT_DEFAULT,
   COMPACT_MAX,
@@ -35,8 +35,8 @@ import {
 
 const SETTINGS_URL = "/api/vlresearch/settings";
 
-async function request(init?: RequestInit): Promise<Settings> {
-  const response = await fetch(SETTINGS_URL, init);
+async function requestSettings(request: Workspace["request"], init?: RequestInit): Promise<Settings> {
+  const response = await request(SETTINGS_URL, init);
   if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
   return parseSettings(await response.json());
 }
@@ -124,8 +124,9 @@ function Row({
 
 export function ResearchSettings({ cardClassName, rowClassName }: { cardClassName: string; rowClassName: string }) {
   const queryClient = useQueryClient();
+  const { workspaceKey, request } = useWorkspace();
   const queryKey = workspaceKey("vlresearchSettings");
-  const query = useQuery({ queryKey, queryFn: ({ signal }) => request({ signal }), retry: false });
+  const query = useQuery({ queryKey, queryFn: ({ signal }) => requestSettings(request, { signal }), retry: false });
   const [saving, setSaving] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const settings = query.data;
@@ -135,7 +136,7 @@ export function ResearchSettings({ cardClassName, rowClassName }: { cardClassNam
     setProblem(null);
     // Choosing the default drops the saved value, so a later default applies.
     const body = { [entry.key]: value === entry.default ? null : value };
-    void request({ method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
+    void requestSettings(request, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
       .then((next) => queryClient.setQueryData(queryKey, next))
       .catch((failure) => setProblem(failure instanceof Error ? failure.message : String(failure)))
       .finally(() => setSaving(false));

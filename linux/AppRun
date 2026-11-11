@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The AppImage's entry point: start the bundled orx as the desktop app (see
-# src/commands/app.rs). Only an openresearch: link (the desktop entry's %u) is
-# passed on; the CLI is `orx`, not this.
+# src/commands/app.rs). Only an openresearch: link or a .orx file (the desktop
+# entry's %u) is passed on; the CLI is `orx`, not this.
 set -e
 
 export APPDIR="${APPDIR:-"$(dirname "$(realpath "$0")")"}"
@@ -26,6 +26,12 @@ for hook in "$APPDIR"/apprun-hooks/*.sh; do
     . "$hook"
   fi
 done
+# Let GTK choose the session's backend unless the user selected one; the plugin
+# forces X11 even in a Wayland session.
+case "$ORX_HOST_GDK_BACKEND" in
+  =*) export GDK_BACKEND="${ORX_HOST_GDK_BACKEND#=}" ;;
+  -) unset GDK_BACKEND ;;
+esac
 # Only the bundled GIO modules (TLS): the host's need a newer GLib than the image's.
 export GIO_MODULE_DIR="$APPDIR/usr/lib/gio/modules"
 unset GIO_EXTRA_MODULES
@@ -38,7 +44,7 @@ link=()
 shopt -s nocasematch
 for arg in "$@"; do
   case "$arg" in
-    openresearch:*) link=("$arg"); break ;;
+    openresearch:* | *.orx) link=("$arg"); break ;;
   esac
 done
 shopt -u nocasematch
