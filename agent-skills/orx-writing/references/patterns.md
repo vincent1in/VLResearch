@@ -1,7 +1,8 @@
 # Writing patterns: examples and sources
 
 Contents: 1. Exposition and structure · 2. Claims and evidence ·
-3. Word choice · 4. Replies in chat · 5. Sources
+3. Word choice · 4. Equations, figures and notation · 5. Replies in chat ·
+6. Sources
 
 Each entry gives the pattern, an example, and why it weakens the text. These
 are editing prompts, not rules: keep an instance that serves the argument.
@@ -129,7 +130,57 @@ concrete problem.
 population-level trend. One occurrence says nothing; change a word only when
 a plainer one is more precise.
 
-## 4. Replies in chat
+## 4. Equations, figures and notation
+
+**An equation where a sentence does.** "The final score is
+$s = \frac{1}{K}\sum_{k=1}^{K} s_k$", when $s$, $s_k$ and $K$ never appear
+again. Write "the final score is the mean of the five fold scores".
+
+**An equation where a figure does.** The bias-variance decomposition is
+displayed, then a paragraph describes how each term moves as $\lambda$
+grows. Plot squared bias, variance and their sum against $\lambda$ with the
+minimum marked, and state the decomposition only if later steps use it.
+
+**A figure and an equation together.** To explain ridge shrinkage, plot the
+factor $d_j^2/(d_j^2 + \lambda)$ against $d_j^2$, the squared singular
+values of $X$, for three values of $\lambda$. Label each curve with its
+$\lambda$ and give the formula in the caption. The plot shows that
+directions with small $d_j$ shrink most, the formula gives the exact amount,
+and both use the same symbols.
+
+**A derivation without words.** Four displays in a row, each rearranging
+the last. Give each display one move and a clause saying what it did:
+"expand the square"; "the cross term has mean zero because $\varepsilon$ is
+independent of $x$"; "$\mathbb{E}[\varepsilon^2] = \sigma^2$ by assumption
+(A2)".
+
+**Case collisions.** "$k$ indexes folds" and later "$K$ is the number of
+features". Write "$k = 1, \dots, K$ indexes the folds" and use $p$ for the
+number of features. Likewise, with $T$ periods, write a transpose as
+$X^\top$, not $X^T$.
+
+**One symbol, two meanings.** $\lambda$ is the ridge penalty in one section
+and an eigenvalue of $X^\top X$ in another, and the two meet in the
+shrinkage factor. Write the eigenvalues as $d_j^2$ so the factor reads
+$d_j^2/(d_j^2 + \lambda)$. Clashes common in finance: $r$ for a return and
+for a correlation, $t$ for a period and for a $t$-statistic, $p$ for the
+number of features and for a $p$-value.
+
+**A silent change between steps.** "Center the columns of $X$. Then
+$X^\top X / n$ is the covariance of the features." $X$ now names two
+matrices. Write "let $\tilde{X}$ be $X$ with each column centered; then
+$\tilde{X}^\top \tilde{X} / n$ is the empirical covariance of the
+features".
+
+**Names from code.** The text calls the penalty $\lambda$ and the figure's
+axis says `alpha`. Label the axis $\lambda$ and say once that scikit-learn
+calls it `alpha`.
+
+**A symbol back after a gap.** $\kappa$ is defined in Section 2 and used in
+Section 5 with no reminder. Write "the condition number $\kappa$" where it
+returns.
+
+## 5. Replies in chat
 
 - Open with the answer, not with praise for the question or a restatement
   of it.
@@ -139,11 +190,23 @@ a plainer one is more precise.
   every reply. Two short paragraphs often beat six bullets.
 - Do not narrate effort ("I carefully reviewed..."); report what was found.
 - When you are unsure, say what you checked and what you did not, once.
+- Answer a conceptual question in words, with a figure or worked numbers
+  where they help. Add notation only when the user needs the exact form,
+  and define each symbol in the reply.
 
-## 5. Sources
+## 6. Sources
 
 - William Zinsser, *On Writing Well* (30th anniversary ed., Harper
   Perennial, 2006): clutter, simplicity and the plain style.
+- D. E. Knuth, T. Larrabee and P. M. Roberts, *Mathematical Writing*, MAA
+  Notes 14 (Mathematical Association of America, 1989). Rule 14: "Don't use
+  the same notation for two different things. Conversely, use consistent
+  notation for the same thing when it appears in several places." Rule 11:
+  "Try to state things twice, in complementary ways, especially when giving
+  a definition", which is the case for pairing a figure with an equation.
+- P. R. Halmos, "How to write mathematics", *L'Enseignement Mathématique*
+  16 (1970), section "Think about the alphabet": settle notation before
+  writing rather than mid-sentence, keep it consistent, and avoid clashes.
 - Wikipedia, "Wikipedia:Signs of AI writing" (WikiProject AI Cleanup):
   inflated importance, trailing present participles, promotional language,
   vague attribution. The guide treats the signs as a field guide for

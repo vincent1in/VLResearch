@@ -44,7 +44,7 @@ pub(crate) const FINDINGS: AgentSkill = AgentSkill {
 
 pub(crate) const WRITING: AgentSkill = AgentSkill {
     name: "orx-writing",
-    description: "Edit prose for precision and economy and strip machine-writing patterns: inflated claims, vague attribution, stock phrasing, staged reveals, counted lists, slogans, recap boxes. Use before finishing a paper, report, finding, brief, README or long reply, when revising the user's manuscript, or when asked to remove AI slop or tighten writing. LaTeX builds stay with `orx-paper`.",
+    description: "Edit prose for precision and strip machine-writing patterns: inflated claims, vague attribution, stock phrasing, staged reveals, slogans, recap boxes. Use equations only when needed, prefer figures, derive step by step with one meaning per symbol. Use before finishing a paper, report, finding, brief, README or long reply, when explaining math, or when revising a manuscript or removing AI slop.",
     content: include_str!("../../agent-skills/orx-writing/SKILL.md"),
     resources: &[
         AgentSkillResource {
