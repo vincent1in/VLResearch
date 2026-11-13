@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Turns a saved `cargo test` log into GitHub Actions error annotations: each
+# Turns a saved `cargo test` or `cargo nextest` log into GitHub Actions error annotations: each
 # failing test with where it panicked and why, and any test binary that
 # crashed. GitHub's API serves annotations even where the log itself can't be
 # downloaded, so a failure on a runner nobody can reach still names its test.
 #
-#   cargo test --locked 2>&1 | tee test.log
+#   cargo test --locked 2>&1 | tee test.log    # or cargo nextest run
 #   flavor/scripts/test-failures.sh test.log
 set -euo pipefail
 
@@ -40,9 +40,25 @@ awk '
   }
   # A test binary that crashed or was killed prints no failure section.
   /^error: test failed/ || /process didn.t exit successfully/ { print "::error::" message($0); shown++ }
+  # nextest runs each test alone, so a panic names its test as the thread,
+  # with the message on the next line; its verdict is a status line ending in
+  # the binary id and the test name, repeated in its summary.
+  /^thread .* panicked at / {
+    split($0, quoted, "\047"); panicked = quoted[2]
+    panic[panicked] = $0; sub(/^thread .* panicked at /, "panicked at ", panic[panicked]); sub(/:$/, "", panic[panicked])
+    next
+  }
+  panicked != "" { if ($0 != "") panic[panicked] = panic[panicked] "\n" $0; panicked = ""; next }
+  /^ *(FAIL|TIMEOUT|ABORT|LEAK-FAIL|SIG[A-Z]+) +\[/ { failed[$NF] = $1 }
   { tail[NR % 8] = $0 }
   END {
     flush()
+    for (test in failed) {
+      if (shown >= 20) break
+      detail = test in panic ? message(panic[test]) : tolower(failed[test]); gsub(/\n/, "%0A", detail)
+      print "::error title=" property(test) "::" detail
+      shown++
+    }
     if (!shown) {
       text = ""
       for (i = NR - 7; i <= NR; i++) if (i > 0 && tail[i % 8] != "") text = text (text == "" ? "" : "%0A") message(tail[i % 8])
