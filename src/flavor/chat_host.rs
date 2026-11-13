@@ -128,6 +128,7 @@ fn hidden_turn(text: String, guard: TurnGuard) -> SendTurnRequest {
         admission: TurnAdmission::Preclaimed(guard),
         client_turn_id: None,
         request_hash: None,
+        continuation: false,
     }
 }
 
