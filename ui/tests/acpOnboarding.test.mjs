@@ -1,81 +1,86 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import ts from "typescript";
-import { dialogHarness } from "./dialogHarness.mjs";
+import test from "node:test";
+import { act } from "react";
+import { m } from "../src/paraglide/messages.js";
+import { find, renderApp, serveApp, settle, type } from "./render.mjs";
+import { model } from "./models.mjs";
 
-function component(name) {
-  return ts.createSourceFile(name, readFileSync(new URL(`../src/components/${name}`, import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+// The onboarding installs OpenCode for its free models over a socket this test never answers.
+globalThis.WebSocket = class extends EventTarget {
+  static OPEN = 1;
+  readyState = 0;
+  send() {}
+  close() {}
+};
+
+const harness = (id, name, extra = {}) => ({
+  id, name, installed: true, installBroken: false, authenticated: true, authState: "ready", agentReady: true, models: [model("model")], defaultModel: "model", ...extra,
+});
+const codex = harness("codex", "Codex");
+const opencodeMissing = harness("opencode", "OpenCode", { installed: false, authenticated: false, authState: "needsLogin", agentReady: false, models: [], defaultModel: undefined });
+const custom = (extra) => harness("acp:custom", "My agent", extra);
+const checking = { catalogPending: true, models: [], defaultModel: undefined };
+
+const click = async (element) => {
+  await act(async () => element.click());
+  await settle();
+};
+const proceed = () => find("button", m.onboarding_continue());
+
+/** The local walkthrough over `others`, after connecting a custom ACP agent whose check is still running. */
+async function connectCustom(others) {
+  const state = { harnesses: others, refreshes: 0, completions: [] };
+  serveApp({
+    "GET /api/settings/ui-state": () => ({ onboardingCompleted: false, preferredAgent: null }),
+    "GET /api/harnesses": (init, path) => {
+      if (path.includes("retry=1")) state.refreshes++;
+      return { harnesses: state.harnesses };
+    },
+    "GET /api/project-path/status": () => ({ gitVersion: "2.50.0", resolvedPath: null, exists: null, directory: null, empty: null, initialized: null }),
+    "GET /api/harnesses/acp": () => [],
+    "GET /api/harnesses/acp/presets": () => [],
+    "POST /api/harnesses/acp": (init) => ({ ...JSON.parse(init.body), id: "acp:custom" }),
+    "POST /api/onboarding/complete": (init) => {
+      state.completions.push(JSON.parse(init.body));
+      return { project: { id: "demo" }, selection: JSON.parse(init.body) };
+    },
+  });
+  await renderApp("/projects");
+  await click(proceed());
+
+  state.harnesses = [...others, custom(checking)];
+  await click(find("button", m.add_agent_other_providers()));
+  await click(find('[role="dialog"] button', m.add_agent_more()));
+  await click(find('[role="dialog"] button', m.harness_custom_acp()));
+  await type(find('[role="dialog"] label', m.acp_name()).querySelector("input"), "My agent");
+  await type(find('[role="dialog"] label', m.acp_executable()).querySelector("input"), "my-agent acp");
+  await click(find('[role="dialog"] button', m.common_save()));
+  assert.equal(document.querySelectorAll('[role="dialog"]').length, 0);
+  assert.equal(state.refreshes, 1, "saving re-checks the agents");
+  return state;
 }
 
-function find(node, predicate) {
-  if (predicate(node)) return node;
-  return ts.forEachChild(node, (child) => find(child, predicate));
+/** Re-checks to find `harnesses`, then finishes the walkthrough; returns the selection it completed with. */
+async function finish(state, harnesses) {
+  state.harnesses = harnesses;
+  await click(find("button", m.onboarding_re_check()));
+  await click(proceed());
+  await click(find("button", m.onboarding_skip()));
+  return state.completions[0];
 }
 
-function evaluate(code, bindings) {
-  const js = ts.transpileModule(`return (${code});`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  return new Function(...Object.keys(bindings), js)(...Object.values(bindings));
-}
+test("an ACP agent connected during onboarding starts the first chat once its check finishes", async () => {
+  const state = await connectCustom([codex]);
+  assert.equal((await finish(state, [codex, custom()])).harness, "acp:custom");
+});
 
-test("onboarding selects the registered profile after a preset connects and refreshes", async () => {
-  const dialog = component("AcpHarnessDialog.tsx");
-  const run = find(dialog, (node) => ts.isVariableDeclaration(node) && node.name.getText(dialog) === "run").initializer.getText(dialog);
-  const onboarding = component("Onboarding.tsx");
-  const savedCallback = find(onboarding, (node) => ts.isPropertyAssignment(node) && node.name.getText(onboarding) === "onSaved").initializer.getText(onboarding);
-  const selectionEffect = find(onboarding, (node) => ts.isCallExpression(node) && node.expression.getText(onboarding) === "useEffect" && node.getText(onboarding).includes("const added = ready.find")).arguments[0].getText(onboarding);
-  const preset = { id: "acp:preset", name: "Kimi Code", executable: "kimi", arguments: ["acp"] };
-  const addedAcpHarness = { current: null };
-  let preferred = "codex", refreshes = 0, saved = 0, closed = 0;
-  let harnesses = [{ id: "codex", agentReady: true }, { id: "acp:saved", agentReady: true, catalogPending: true }];
-  const setPreferredHarness = (update) => { preferred = typeof update === "function" ? update(preferred) : update; };
-  const onSaved = evaluate(savedCallback, { queryClient: { getQueryData: () => harnesses }, getHarnessesQuery: () => ({ queryKey: [] }), addedAcpHarness, setPreferredHarness, load: (refresh, retry) => { assert.deepEqual([refresh, retry], [true, true]); refreshes++; } });
-  const harness = dialogHarness();
-  const connect = async (launch, harnessId) => {
-    const save = evaluate(run, {
-      cancelled: { current: false }, busy: false, valid: true, launch, preset: preset.id, presets: { data: [preset] }, definition: undefined,
-      setBusy: () => {}, setConnected: () => {}, setError: (error) => { if (error) assert.fail(error); },
-      testAcpHarness: async () => ({ harnessId }), saveAcpHarness: async (value) => { saved++; return { ...value, id: "acp:new" }; },
-      onSaved, name: launch.name, m: {},
-    });
-    harness.showCustomDialog({ component: () => null, props: {}, onConfirm: (submit) => submit(), onCancel: "close" });
-    const opened = harness.render()[0];
-    opened.props.children.props.confirm(() => save(false));
-    assert.equal(harness.render()[0].props.children.props.isDisabled, true);
-    assert.equal(harness.render()[0].props.onOpenChange, undefined);
-    await new Promise(setImmediate);
-    const closing = harness.render()[0];
-    assert.equal(closing.props.open, false);
-    assert.equal(harness.render().length, 1);
-    closing.props.onOpenChangeComplete(false);
-    assert.equal(harness.render().length, 0);
-    closed++;
-  };
-  const refresh = (snapshot) => {
-    harnesses = snapshot;
-    evaluate(selectionEffect, { harnesses, addedAcpHarness, preferredAgent: null, setPreferredHarness })();
-  };
+test("an ACP agent still being checked leaves the first chat on an agent that's ready", async () => {
+  const state = await connectCustom([codex]);
+  assert.equal((await finish(state, [codex, custom(checking)])).harness, "codex");
+});
 
-  await connect({ name: preset.name, executable: preset.executable, arguments: preset.arguments }, "acp:saved");
-  assert.equal(addedAcpHarness.current, "acp:saved");
-  assert.equal(saved, 0);
-  refresh([{ id: "codex", agentReady: true }, { id: "acp:saved", agentReady: true, catalogPending: true }]);
-  assert.equal(preferred, "codex");
-  refresh([{ id: "codex", agentReady: true }, { id: "acp:saved", agentReady: true, catalogPending: false }]);
-  assert.equal(preferred, "acp:saved");
-  assert.equal(addedAcpHarness.current, null);
-  preferred = "codex";
-  refresh([{ id: "codex", agentReady: true }, { id: "acp:saved", agentReady: true }]);
-  assert.equal(preferred, "codex");
-  await connect({ name: preset.name, executable: preset.executable, arguments: preset.arguments }, "acp:saved");
-  assert.equal(preferred, "acp:saved");
-  assert.equal(addedAcpHarness.current, null);
-
-  await connect({ name: preset.name, executable: preset.executable, arguments: preset.arguments }, "acp:preset");
-  assert.equal(addedAcpHarness.current, "acp:preset");
-  await connect({ name: "My configuration", executable: preset.executable, arguments: preset.arguments }, "acp:saved");
-  assert.equal(addedAcpHarness.current, "acp:new");
-  assert.equal(saved, 1);
-  assert.equal(refreshes, 4);
-  assert.equal(closed, 4);
+test("an agent being added holds Continue rather than falling back to the free models", async () => {
+  const state = await connectCustom([opencodeMissing]);
+  assert.ok(proceed().disabled);
+  assert.equal((await finish(state, [opencodeMissing, custom()])).harness, "acp:custom");
 });

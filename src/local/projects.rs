@@ -43,7 +43,7 @@ pub(crate) fn expand_path(path: &str) -> Result<PathBuf> {
         return Err(crate::error::anyhow!("project path is required"));
     }
     if trimmed == "~" || trimmed.starts_with("~/") {
-        let home = dirs::home_dir()
+        let home = crate::config::home_dir()
             .ok_or_else(|| crate::error::anyhow!("Could not resolve the home directory"))?;
         return Ok(if trimmed == "~" {
             home
@@ -64,7 +64,7 @@ pub(crate) fn expand_path(path: &str) -> Result<PathBuf> {
 pub fn relative_base() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     let in_image = crate::paths::in_appimage_mount(&cwd, std::env::var_os("APPDIR").as_deref());
-    Ok(match dirs::home_dir() {
+    Ok(match crate::config::home_dir() {
         Some(home) if in_image => home,
         _ => cwd,
     })
@@ -243,14 +243,13 @@ pub struct CreateProjectOptions {
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::process::Command;
 
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!("orx-local-project-{}", uuid::Uuid::new_v4()))
     }
 
     fn run_git(path: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = crate::process::command("git")
             .current_dir(path)
             .args(args)
             .status()
@@ -259,7 +258,7 @@ mod tests {
     }
 
     fn git_output(path: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = crate::process::command("git")
             .current_dir(path)
             .args(args)
             .output()
@@ -970,8 +969,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn managed_initial_commit_bypasses_signing_and_hooks() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = root();
         let project_path = root.join("project");
         std::fs::create_dir_all(&project_path).unwrap();
@@ -980,10 +977,7 @@ mod tests {
         run_git(&project_path, &["config", "gpg.program", "false"]);
         std::fs::write(project_path.join("README.md"), "# test\n").unwrap();
         let hook = project_path.join(".git/hooks/post-commit");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).unwrap();
+        orx_test_support::write_executable(&hook, "#!/bin/sh\nexit 1\n", 0o755).unwrap();
         let store = Store::open_at(root.join("data")).unwrap();
 
         create_project(

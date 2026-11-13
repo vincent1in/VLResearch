@@ -45,7 +45,7 @@ pub fn launched_as_app_bundle() -> bool {
 }
 
 /// The argument the Windows launcher and the Linux AppImage's AppRun start `orx`
-/// with, followed by nothing or the `openresearch:` link that opened the app.
+/// with, followed by nothing or the `openresearch:` link or `.orx` file that opened the app.
 #[cfg_attr(not(all(desktop_app, not(target_os = "macos"))), allow(dead_code))]
 pub const APP_ARG: &str = "app";
 
@@ -67,7 +67,7 @@ fn launch_link() -> Option<String> {
     app_launch(std::env::args_os().skip(1)).flatten()
 }
 
-/// `None` unless `args` are `app` or `app <openresearch: link>`; then `Some` of the link, if any.
+/// `None` unless `args` are `app` or `app <link or .orx file>`; then `Some` of the link, if any.
 #[cfg_attr(not(all(desktop_app, not(target_os = "macos"))), allow(dead_code))]
 fn app_launch(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Option<String>> {
     if args.next()? != APP_ARG {
@@ -75,24 +75,42 @@ fn app_launch(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Opti
     }
     let link = match args.next() {
         None => None,
-        Some(arg) => Some(arg.into_string().ok().filter(|arg| is_app_link(arg))?),
+        Some(arg) => match arg.to_str().and_then(app_link) {
+            Some(link) => Some(link),
+            // The launchers pass any `.orx` along; one the app cannot open still starts it.
+            None if arg.to_string_lossy().to_ascii_lowercase().ends_with(".orx") => None,
+            None => return None,
+        },
     };
     args.next().is_none().then_some(link)
 }
 
-/// Whether `arg` is an `openresearch:` link, the only argument the app takes.
+/// `arg` as a link the app opens: an `openresearch:` link, or a `.orx` file as a `file:` URL.
 #[cfg_attr(not(all(desktop_app, not(target_os = "macos"))), allow(dead_code))]
-fn is_app_link(arg: &str) -> bool {
-    arg.get(..LINK_SCHEME.len())
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(LINK_SCHEME))
+fn app_link(arg: &str) -> Option<String> {
+    let starts_with = |prefix: &str| {
+        arg.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    };
+    if starts_with(LINK_SCHEME) {
+        return Some(arg.to_string());
+    }
+    let url = if starts_with("file:") {
+        url::Url::parse(arg).ok()?
+    } else {
+        url::Url::from_file_path(arg).ok()?
+    };
+    link_path(url.as_str()).map(|_| url.into())
 }
 
 /// The dock and app grid name and icon a window only through a desktop entry.
 /// Rewritten whenever it points elsewhere; `TryExec` hides it once the file goes.
 #[cfg(all(desktop_app, target_os = "linux"))]
 fn install_desktop_entry() {
-    let (Some(appimage), Some(data)) = (crate::updates::running_appimage(), dirs::data_dir())
-    else {
+    let (Some(appimage), Some(data)) = (
+        crate::updates::running_appimage(),
+        crate::config::data_local_dir(),
+    ) else {
         return;
     };
     let icon = data.join("icons/hicolor/256x256/apps/openresearch.png");
@@ -100,31 +118,46 @@ fn install_desktop_entry() {
         return;
     };
     let entry = desktop_entry(appimage, icon_path);
-    let entry_changed = || -> std::io::Result<bool> {
+    let mime = data.join("mime");
+    let registration_changed = || -> std::io::Result<bool> {
         write_if_changed(&icon, include_bytes!("../../linux/OpenResearch.png"))?;
-        write_if_changed(
+        let file_type = write_if_changed(
+            &mime.join("packages/openresearch.xml"),
+            include_bytes!("../../linux/openresearch-mime.xml"),
+        )?;
+        let listed = write_if_changed(
             &data.join("applications/openresearch.desktop"),
             entry.as_bytes(),
-        )
+        )?;
+        Ok(file_type || listed)
     };
-    match entry_changed() {
-        // The entry's MimeType offers it; this makes it the handler for openresearch: links.
+    match registration_changed() {
+        // The entry's MimeType offers it; this makes it the handler for openresearch: links and .orx files.
         Ok(true) => {
-            let mut handler = std::process::Command::new("xdg-mime");
+            let mut update_mime = crate::process::command("update-mime-database");
+            update_mime.arg(&mime);
+            let mut handler = crate::process::command("xdg-mime");
             handler.args([
                 "default",
                 "openresearch.desktop",
                 "x-scheme-handler/openresearch",
+                "application/x-openresearch-project",
             ]);
-            crate::local::shell_env::restore_host_gui_env(&mut handler);
-            std::thread::spawn(move || match handler.output() {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => eprintln!(
-                    "openresearch app: could not register openresearch: links: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                Err(err) => {
-                    eprintln!("openresearch app: could not register openresearch: links: {err}")
+            for command in [&mut update_mime, &mut handler] {
+                crate::local::shell_env::restore_host_gui_env(command);
+            }
+            std::thread::spawn(move || {
+                for mut command in [update_mime, handler] {
+                    match command.output() {
+                        Ok(out) if out.status.success() => {}
+                        Ok(out) => eprintln!(
+                            "openresearch app: could not register OpenResearch links and files: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        Err(err) => eprintln!(
+                            "openresearch app: could not register OpenResearch links and files: {err}"
+                        ),
+                    }
                 }
             });
         }
@@ -178,6 +211,90 @@ fn desktop_entry(appimage: &str, icon: &str) -> String {
         .collect()
 }
 
+/// The user's choice when a close or quit finds work pending.
+#[cfg_attr(not(desktop_app), allow(dead_code))]
+#[derive(Clone, Copy)]
+enum CloseAnswer {
+    /// Keep working without the window: hidden on macOS, where the Dock still shows the app, minimized elsewhere.
+    Background,
+    Quit,
+    Cancel,
+}
+
+/// The native alert's text, for when the page cannot ask. `None` is work that could not be counted.
+#[cfg_attr(not(desktop_app), allow(dead_code))]
+fn close_alert_description(pending: Option<&crate::store::PendingWork>) -> String {
+    use crate::store::AfterQuit;
+
+    let Some(work) = pending else {
+        return "OpenResearch couldn't check for running agents and experiments. Quitting stops any agent that is working."
+            .into();
+    };
+    let mut lines = Vec::new();
+    if work.blocks_quit() {
+        lines.push("Force Quit stops the experiments that need OpenResearch open.".to_string());
+    }
+    let mut section = |heading: &str, items: Vec<String>| {
+        if !items.is_empty() {
+            lines.push(format!("\n{heading}"));
+            lines.extend(items.into_iter().map(|item| format!("• {item}")));
+        }
+    };
+
+    let agents = work.agents.iter().map(|agent| {
+        let title = agent.title.as_deref().unwrap_or("Untitled");
+        match &agent.project {
+            Some(project) => format!("{title} ({project})"),
+            None => title.to_string(),
+        }
+    });
+    section("Agents stop when you quit:", agents.collect());
+    let runs = |fate| work.runs.iter().filter(move |run| run.after_quit == fate);
+    let needs_app = runs(AfterQuit::NeedsApp).map(|run| {
+        let reason = match run.backend.as_deref() {
+            Some("local_job") => "runs on this computer",
+            Some("tinker_job") => "runs on this computer and trains on Tinker",
+            Some("vercel_job") => {
+                "without OpenResearch, the sandbox bills until its time limit and the log is lost"
+            }
+            Some("openresearch_job") => {
+                "without OpenResearch, the result is lost when the box shuts down"
+            }
+            _ => return run.name.clone(),
+        };
+        format!("{}: {reason}", run.name)
+    });
+    section(
+        "Experiments that need OpenResearch open until they finish:",
+        needs_app.collect(),
+    );
+    section(
+        "Experiments that keep running and report when OpenResearch next opens:",
+        runs(AfterQuit::Continues)
+            .map(|run| run.name.clone())
+            .collect(),
+    );
+    section(
+        "Finished experiments whose results haven't been sent to their chat yet:",
+        runs(AfterQuit::Reports)
+            .map(|run| run.name.clone())
+            .collect(),
+    );
+    lines.join("\n").trim_start().to_string()
+}
+
+static WINDOWLESS: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(false).0);
+
+pub(crate) fn windowless() -> bool {
+    *WINDOWLESS.borrow()
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn native_quit_needs_confirmation(pending: bool, system_reason: Option<u32>) -> bool {
+    pending && system_reason.is_none()
+}
+
 #[cfg(desktop_app)]
 const APP_PORT: u16 = 4792;
 
@@ -228,6 +345,29 @@ pub async fn run() {
             return;
         }
     };
+    let discovered = match crate::commands::remote_host::canonical_data_dir() {
+        Ok(data_dir) => crate::commands::remote_host::ServerDescriptor::live(&data_dir).await,
+        Err(error) => Err(error),
+    };
+    match discovered {
+        Ok(Some(server)) => {
+            #[cfg(target_os = "macos")]
+            imp::run_event_loop(server.port, true);
+            #[cfg(not(target_os = "macos"))]
+            imp::run_event_loop(
+                server.port,
+                true,
+                focus_requests,
+                link.as_deref().and_then(link_path),
+            );
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::show_error_dialog(&error.to_string());
+            return;
+        }
+    }
     // After an update relaunch, keep the previous port. Otherwise a fixed port,
     // since the window's localStorage is keyed by origin, falling back to an
     // ephemeral one when a terminal `orx up` or another app holds it.
@@ -285,7 +425,7 @@ pub(crate) async fn hydrate_shell_env() {
         .join(" ");
     let template = "%s\\0".repeat(crate::local::shell_env::IMPORTED.len());
     let script = format!(r#"/bin/sh -c 'printf "{marker}{template}{marker}" {reads}'"#);
-    let mut probe = tokio::process::Command::new(&shell);
+    let mut probe = crate::process::tokio_command(&shell);
     probe
         .args(["-ilc".to_string(), script])
         .stdin(std::process::Stdio::null())
@@ -390,9 +530,28 @@ fn opens_in_browser(url: &str) -> bool {
 }
 
 /// The dashboard path an `openresearch://reproduce/<paper id>` link opens; the page validates the id.
+/// A `.orx` file opened with the app, or an `openresearch://p/<slug>` link from a
+/// published project's page, goes to the page that imports it.
 #[cfg_attr(not(desktop_app), allow(dead_code))]
 fn deep_link_path(url: &url::Url) -> Option<String> {
+    if url.scheme() == "file" {
+        let file = url.to_file_path().ok()?;
+        let shared = file.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case(crate::local::share::EXTENSION)
+        });
+        return shared.then(|| {
+            format!(
+                "/open?file={}",
+                urlencoding::encode(&file.to_string_lossy())
+            )
+        });
+    }
     let path = url.path();
+    if url.scheme() == "openresearch" && url.host_str() == Some("p") {
+        // Only the slug crosses over; the app fetches the file from its own API.
+        let slug = crate::client::published_project_slug(path.trim_start_matches('/'))?;
+        return Some(format!("/open?shared={slug}"));
+    }
     if url.scheme() != "openresearch" || url.host_str() != Some("reproduce") || path.len() < 2 {
         return None;
     }
@@ -427,7 +586,7 @@ mod link_file {
         std::fs::rename(dir.join(NAME), &taken).ok()?;
         let link = std::fs::read_to_string(&taken).ok();
         let _ = std::fs::remove_file(&taken);
-        link.filter(|link| super::is_app_link(link))
+        link.and_then(|link| super::app_link(&link))
     }
 
     #[cfg(test)]
@@ -484,7 +643,7 @@ mod instance {
     /// Claims the app for this process. `None` means another instance has it
     /// and was asked to come forward, opening `link`.
     pub(super) fn claim(link: Option<&str>) -> Option<FocusRequests> {
-        let link_dir = dirs::data_local_dir().map(|dir| dir.join("OpenResearch"));
+        let link_dir = crate::config::data_local_dir().map(|dir| dir.join("OpenResearch"));
         // SAFETY: plain syscalls on NUL-terminated names. The handles stay open
         // on purpose: the claim lasts until the process exits.
         // Bound before the calls, so no drop runs between CreateMutexW and GetLastError.
@@ -563,7 +722,7 @@ mod instance {
         }
         // A home on NFS is shared across machines, and so would be a lock in it.
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
-        let dir = dirs::cache_dir()?.join("openresearch");
+        let dir = crate::config::cache_dir()?.join("openresearch");
         Some((dir, format!("openresearch-app-{}", host.trim())))
     }
 
@@ -652,11 +811,11 @@ mod instance {
         socket: &Path,
         wait: Duration,
         link: Option<&str>,
-    ) -> std::io::Result<Option<File>> {
+    ) -> std::io::Result<Option<crate::file_lock::FileLock>> {
         let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Some(file)),
+                Ok(()) => return Ok(Some(crate::file_lock::FileLock::new(file))),
                 Err(TryLockError::Error(error)) => return Err(error),
                 Err(TryLockError::WouldBlock) => {}
             }
@@ -692,7 +851,7 @@ mod instance {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let mut link = String::new();
         stream.take(8192).read_to_string(&mut link).ok()?;
-        Some(link).filter(|link| super::is_app_link(link))
+        super::app_link(&link)
     }
 
     impl FocusRequests {
@@ -779,7 +938,7 @@ mod imp {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, StartCause, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     use tao::window::Theme;
     use tao::window::{Window, WindowBuilder};
     use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
@@ -802,24 +961,9 @@ mod imp {
     #[cfg(target_os = "macos")]
     use wry::{WebViewBuilderExtMacos, WebViewExtMacOS};
 
-    #[cfg(target_os = "macos")]
-    const MACOS_ESCAPE_SCRIPT: &str = r#"
-        window.addEventListener("keydown", (event) => {
-            if (event.key !== "Escape" || event.defaultPrevented) return;
-            if (event.target?.matches?.("input[type=search]:enabled:not([readonly])")) return;
-            // WebKit resends Escape to AppKit after its own dialog/popover dismissal, so dismiss here instead.
-            event.preventDefault();
-            // shortcut: last open popover stands in for the topmost; revisit if nested popovers render out of DOM order.
-            const popover = CSS.supports("selector(:popover-open)") && [...document.querySelectorAll("[popover]:popover-open:not([popover=manual])")].pop();
-            if (popover) return popover.hidePopover();
-            // shortcut: old WebKit treats open dialogs as modal; revisit if non-modal dialogs are added.
-            const dialog = [...document.querySelectorAll(CSS.supports("selector(:modal)") ? "dialog:modal" : "dialog[open]")].pop();
-            if (dialog?.dispatchEvent(new Event("cancel", { cancelable: true }))) dialog.close();
-        });
-    "#;
-
     enum UserEvent {
         ServerReady,
+        EngineBusy(bool),
         LoadTimedOut,
         SyncZoom,
         Zoom(ZoomAction),
@@ -833,8 +977,14 @@ mod imp {
         Focus(Option<String>),
         /// The dashboard page finished loading and can take `orx:open-path`.
         PageReady,
-        #[cfg(windows)]
+        /// A close or quit that did not come through the window's own close event.
+        #[cfg(any(windows, target_os = "macos"))]
         Close,
+        /// The page is showing the dialog a close asked it for.
+        CloseAsked,
+        CloseAnswer(super::CloseAnswer),
+        /// The runs a quit stops have answered, or stopped being waited on.
+        RunsStopped,
         /// Tell a newly loaded page whether the window is maximized (Windows) or fullscreen (macOS).
         #[cfg(any(windows, target_os = "macos"))]
         SyncWindowState,
@@ -859,8 +1009,22 @@ mod imp {
 
     enum Quit {
         No,
+        /// Waiting on the runs a quit stops, with the window already gone.
+        StoppingRuns,
         Flushing,
         ShuttingDown,
+    }
+
+    /// A close with work pending, waiting on the user's choice.
+    enum Ask {
+        No,
+        /// Until the page says it is asking; after the deadline a native alert asks instead.
+        Sent(Instant),
+        Page,
+        /// A windowless close brought the window back, so the page can list the work once it loads;
+        /// past the deadline a native alert asks instead.
+        #[cfg(target_os = "macos")]
+        OnLoad(Instant),
     }
 
     pub(super) fn run_event_loop(
@@ -882,14 +1046,21 @@ mod imp {
         #[cfg(target_os = "linux")]
         gtk::glib::set_prgname(Some("OpenResearch"));
         let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+        EVENT_PROXY.with(|slot| *slot.borrow_mut() = Some(event_loop.create_proxy()));
+        #[cfg(target_os = "macos")]
+        if !external_server {
+            intercept_native_quit();
+        }
 
         // Dashboard server on background workers (we're inside main's runtime).
         if !external_server {
             tokio::spawn(async move {
                 let args = crate::UpArgs {
                     port,
+                    host: std::net::Ipv4Addr::LOCALHOST.into(),
                     remote: None,
                     no_browser: true,
+                    headless: false,
                     no_agent: false,
                     model: None,
                     remote_host: false,
@@ -902,6 +1073,32 @@ mod imp {
                         eprintln!("openresearch app: dashboard server exited: {err}");
                         crate::show_error_dialog(&format!("The dashboard server stopped: {err}"));
                         std::process::exit(1);
+                    }
+                }
+            });
+        }
+
+        if !external_server {
+            let lifecycle = event_loop.create_proxy();
+            let mut visibility = super::WINDOWLESS.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    while !*visibility.borrow_and_update() {
+                        if visibility.changed().await.is_err() {
+                            return;
+                        }
+                        let _ = lifecycle.send_event(UserEvent::EngineBusy(true));
+                    }
+                    let busy = crate::commands::up::api_v2::busy().unwrap_or(true);
+                    if lifecycle.send_event(UserEvent::EngineBusy(busy)).is_err() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                        result = visibility.changed() => {
+                            if result.is_err() { return; }
+                            let _ = lifecycle.send_event(UserEvent::EngineBusy(true));
+                        }
                     }
                 }
             });
@@ -950,6 +1147,7 @@ mod imp {
                     _ => None,
                 };
                 let event = match action {
+                    _ if event.id.as_ref() == "app.quit" => UserEvent::Close,
                     Some(action) => UserEvent::Zoom(action),
                     None => UserEvent::Menu(event.id),
                 };
@@ -997,13 +1195,20 @@ mod imp {
             }
         };
 
+        // The page leaves the sidebar transparent over the window's material where there is one.
+        #[cfg(target_os = "macos")]
+        let material = true;
+        #[cfg(windows)]
+        let material = add_window_material(&window);
+        #[cfg(target_os = "linux")]
+        let material = false;
+
         let shown = Rc::new(Cell::new(false));
         let page_ready = Rc::new(Cell::new(false));
         let replaced = Rc::new(RefCell::new(HashMap::new()));
         let builder = WebViewBuilder::new()
             .with_accept_first_mouse(true)
-            // Shows the window material (`add_window_material`) where the page is transparent.
-            .with_transparent(cfg!(target_os = "macos"))
+            .with_transparent(material)
             // Lets the dashboard tell it is in the app, where pop-ups open in the browser.
             .with_initialization_script("window.__ORX_DESKTOP__ = true;")
             .with_initialization_script_for_main_only(
@@ -1076,7 +1281,10 @@ mod imp {
                     }
                     #[cfg(any(windows, target_os = "macos"))]
                     let _ = proxy.send_event(UserEvent::SyncWindowState);
-                    if super::is_dashboard_url(&url, &origin) && !shown.replace(true) {
+                    if super::is_dashboard_url(&url, &origin)
+                        && !super::windowless()
+                        && !shown.replace(true)
+                    {
                         window.set_visible(true);
                         window.set_focus();
                     }
@@ -1110,18 +1318,32 @@ mod imp {
                     "window:focus" => {
                         let _ = proxy.send_event(UserEvent::Focus(None));
                     }
+                    "close:asking" => {
+                        let _ = proxy.send_event(UserEvent::CloseAsked);
+                    }
+                    "close:background" => {
+                        let _ = proxy
+                            .send_event(UserEvent::CloseAnswer(super::CloseAnswer::Background));
+                    }
+                    "close:quit" => {
+                        let _ = proxy.send_event(UserEvent::CloseAnswer(super::CloseAnswer::Quit));
+                    }
+                    "close:cancel" => {
+                        let _ =
+                            proxy.send_event(UserEvent::CloseAnswer(super::CloseAnswer::Cancel));
+                    }
                     #[cfg(not(target_os = "linux"))]
                     "titlebar:drag" => {
                         let _ = window.drag_window();
                     }
                     #[cfg(not(target_os = "linux"))]
                     "titlebar:zoom" => window.set_maximized(!window.is_maximized()),
-                    // The window material and traffic lights follow the page's theme preference.
-                    #[cfg(target_os = "macos")]
+                    // The window material and macOS traffic lights follow the page's theme preference.
+                    #[cfg(not(target_os = "linux"))]
                     "appearance:system" => window.set_theme(None),
-                    #[cfg(target_os = "macos")]
+                    #[cfg(not(target_os = "linux"))]
                     "appearance:light" => window.set_theme(Some(Theme::Light)),
-                    #[cfg(target_os = "macos")]
+                    #[cfg(not(target_os = "linux"))]
                     "appearance:dark" => window.set_theme(Some(Theme::Dark)),
                     #[cfg(windows)]
                     "titlebar:minimize" => window.set_minimized(true),
@@ -1169,7 +1391,7 @@ mod imp {
         // Run after dashboard handlers; keep overlay dismissal, not WebKit's native fullscreen exit.
         let builder = builder
             .with_initialization_script("window.__ORX_MAC_TITLEBAR__ = true;")
-            .with_initialization_script_for_main_only(MACOS_ESCAPE_SCRIPT, false);
+            .with_initialization_script_for_main_only(include_str!("macos_escape.js"), false);
         #[cfg(target_os = "macos")]
         let builder = {
             let mtm = MainThreadMarker::new().expect("desktop app runs on the main thread");
@@ -1183,6 +1405,11 @@ mod imp {
         };
         #[cfg(windows)]
         let builder = builder.with_initialization_script("window.__ORX_WIN_TITLEBAR__ = true;");
+        let builder = if material {
+            builder.with_initialization_script("window.__ORX_WINDOW_MATERIAL__ = true;")
+        } else {
+            builder
+        };
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build(&*window);
         // `build` supports only X11 on Linux.
@@ -1224,6 +1451,9 @@ mod imp {
         #[cfg(target_os = "macos")]
         align_traffic_lights(&window, zoom_percent);
         let mut quit = Quit::No;
+        let mut ask = Ask::No;
+        let mut idle = crate::commands::up::api_v2::Idle::default();
+        let started = Instant::now();
         let mut links = DeepLinks {
             server_ready: false,
             page_ready,
@@ -1244,7 +1474,20 @@ mod imp {
                 menu.init_for_nsapp();
             }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => match quit {
-                Quit::No => {}
+                Quit::StoppingRuns => {}
+                Quit::No => {
+                    let deadline = match ask {
+                        Ask::Sent(deadline) => Some(deadline),
+                        #[cfg(target_os = "macos")]
+                        Ask::OnLoad(deadline) => Some(deadline),
+                        _ => None,
+                    };
+                    if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                        ask = Ask::No;
+                        *control_flow = ControlFlow::Wait;
+                        close_window(external_server, false, &mut quit, &mut ask, &window, &webview, control_flow);
+                    }
+                }
                 // The server's own shutdown path stops the agents and then exits
                 // the process.
                 Quit::Flushing => {
@@ -1258,19 +1501,46 @@ mod imp {
                 }
                 Quit::ShuttingDown => *control_flow = ControlFlow::Exit,
             },
+            Event::UserEvent(UserEvent::EngineBusy(value)) if matches!(quit, Quit::No) => {
+                if idle.should_exit(started.elapsed(), !super::windowless() || value) {
+                    begin_quit(&mut quit, &window, &webview, control_flow);
+                }
+            }
             Event::UserEvent(UserEvent::ServerReady) if matches!(quit, Quit::No) => {
+                if super::windowless() {
+                    links.server_ready = true;
+                    return;
+                }
                 let _ = webview.load_url(&format!("{origin}{}", links.on_server_ready()));
             }
             // A window that never appears is worse than a blank one.
             Event::UserEvent(UserEvent::LoadTimedOut)
-                if matches!(quit, Quit::No) && !shown.replace(true) =>
+                if matches!(quit, Quit::No) && !super::windowless() && !shown.replace(true) =>
             {
                 eprintln!("openresearch app: the dashboard has not finished loading; showing the window anyway");
                 window.set_visible(true);
                 window.set_focus();
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Event::UserEvent(UserEvent::Close) => {
+                let page_ready = links.page_ready.get();
+                close_window(external_server, page_ready, &mut quit, &mut ask, &window, &webview, control_flow);
+            }
+            Event::UserEvent(UserEvent::CloseAsked)
+                if matches!(quit, Quit::No) && matches!(ask, Ask::Sent(_)) =>
+            {
+                ask = Ask::Page;
+                *control_flow = ControlFlow::Wait;
+            }
+            Event::UserEvent(UserEvent::CloseAnswer(answer))
+                if matches!(quit, Quit::No) && !matches!(ask, Ask::No) =>
+            {
+                ask = Ask::No;
+                *control_flow = ControlFlow::Wait;
+                answer_close(answer, &mut quit, &window, &webview, control_flow);
+            }
+            Event::UserEvent(UserEvent::RunsStopped) if matches!(quit, Quit::StoppingRuns) => {
+                quit = Quit::No;
                 begin_quit(&mut quit, &window, &webview, control_flow);
             }
             #[cfg(windows)]
@@ -1296,6 +1566,9 @@ mod imp {
                 event: WindowEvent::Resized(_),
                 ..
             } => {
+                if super::windowless() && !in_native_fullscreen(&window) {
+                    window.set_visible(false);
+                }
                 align_traffic_lights(&window, zoom_percent);
                 if window.fullscreen().is_some() != page_fullscreen {
                     page_fullscreen = !page_fullscreen;
@@ -1303,12 +1576,9 @@ mod imp {
                 }
             }
             #[cfg(target_os = "macos")]
-            Event::UserEvent(UserEvent::Menu(id)) if id.as_ref() == "app.quit" => {
-                begin_quit(&mut quit, &window, &webview, control_flow);
-            }
-            #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::Menu(id)) if id.as_ref() == "window.close" => {
-                NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).hide(None);
+                let page_ready = links.page_ready.get();
+                close_window(external_server, page_ready, &mut quit, &mut ask, &window, &webview, control_flow);
             }
             #[cfg(target_os = "macos")]
             Event::UserEvent(UserEvent::MenuSpec(spec)) => match build_menu(&spec) {
@@ -1368,6 +1638,11 @@ mod imp {
             // Even before the page loads: a launch that brings nothing up looks
             // like a broken app. While quitting it must stay hidden.
             Event::UserEvent(UserEvent::Focus(link)) if matches!(quit, Quit::No) => {
+                if super::WINDOWLESS.send_replace(false) {
+                    shown.set(false);
+                    links.reopen(&webview, &origin, link.as_deref().and_then(super::link_path));
+                    return;
+                }
                 if let Some(path) = link.as_deref().and_then(super::link_path) {
                     links.open(path, &webview, &origin);
                 }
@@ -1380,24 +1655,27 @@ mod imp {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                #[cfg(target_os = "macos")]
-                if external_server {
-                    begin_quit(&mut quit, &window, &webview, control_flow);
-                } else {
-                    // AppKit switches Spaces when hiding the app, unlike ordering out its window.
-                    NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).hide(None);
-                }
-                #[cfg(not(target_os = "macos"))]
-                begin_quit(&mut quit, &window, &webview, control_flow);
+                let page_ready = links.page_ready.get();
+                close_window(external_server, page_ready, &mut quit, &mut ask, &window, &webview, control_flow);
             }
             #[cfg(target_os = "macos")]
-            Event::Reopen { .. } => {
+            Event::Reopen { .. } if matches!(quit, Quit::No) => {
+                if super::WINDOWLESS.send_replace(false) {
+                    shown.set(false);
+                    links.reopen(&webview, &origin, None);
+                    return;
+                }
                 shown.set(true);
                 window.set_visible(true);
                 window.set_focus();
             }
-            Event::UserEvent(UserEvent::PageReady) if matches!(quit, Quit::No) => {
+            Event::UserEvent(UserEvent::PageReady) if matches!(quit, Quit::No) && !super::windowless() => {
                 links.on_page_ready(&webview);
+                #[cfg(target_os = "macos")]
+                if matches!(ask, Ask::OnLoad(_)) {
+                    ask = Ask::No;
+                    close_window(external_server, true, &mut quit, &mut ask, &window, &webview, control_flow);
+                }
             }
             #[cfg(target_os = "macos")]
             Event::Opened { urls } if matches!(quit, Quit::No) => {
@@ -1410,7 +1688,12 @@ mod imp {
                 let Some(path) = urls.iter().find_map(super::deep_link_path) else {
                     return;
                 };
-                links.open(path, &webview, &origin);
+                if super::WINDOWLESS.send_replace(false) {
+                    shown.set(false);
+                    links.reopen(&webview, &origin, Some(path));
+                } else {
+                    links.open(path, &webview, &origin);
+                }
             }
             _ => {}
         })
@@ -1433,6 +1716,17 @@ mod imp {
         fn on_page_ready(&mut self, webview: &WebView) {
             if let Some(path) = self.pending.take() {
                 open_in_page(webview, &path);
+            }
+        }
+
+        fn reopen(&mut self, webview: &WebView, origin: &str, path: Option<String>) {
+            self.page_ready.set(false);
+            if let Some(path) = path {
+                self.pending = Some(path);
+            }
+            if self.server_ready {
+                let path = self.pending.take().unwrap_or_else(|| "/".to_string());
+                let _ = webview.load_url(&format!("{origin}{path}"));
             }
         }
 
@@ -1459,6 +1753,263 @@ mod imp {
             "window.dispatchEvent(new CustomEvent('orx:open-path', {{ detail: {} }}));",
             serde_json::Value::from(path)
         ));
+    }
+
+    thread_local! {
+        static EVENT_PROXY: RefCell<Option<tao::event_loop::EventLoopProxy<UserEvent>>> = const { RefCell::new(None) };
+    }
+
+    /// For code on the main thread with no proxy of its own: AppKit's callbacks, a windowless close, a quit's stops.
+    fn event_proxy() -> Option<tao::event_loop::EventLoopProxy<UserEvent>> {
+        EVENT_PROXY.with(|slot| slot.borrow().clone())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_later(event: UserEvent) -> bool {
+        event_proxy().is_some_and(|proxy| proxy.send_event(event).is_ok())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn intercept_native_quit() {
+        let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
+        unsafe {
+            let delegate: *mut AnyObject = objc2::msg_send![&*app, delegate];
+            let Some(delegate) = delegate.as_ref() else {
+                return;
+            };
+            let class: *const AnyClass = delegate.class();
+            type ShouldTerminate =
+                unsafe extern "C-unwind" fn(
+                    &AnyObject,
+                    Sel,
+                    &AnyObject,
+                )
+                    -> objc2_app_kit::NSApplicationTerminateReply;
+            let handler: ShouldTerminate = native_quit_requested;
+            objc2::ffi::class_addMethod(
+                class.cast_mut(),
+                objc2::sel!(applicationShouldTerminate:),
+                std::mem::transmute::<ShouldTerminate, objc2::runtime::Imp>(handler),
+                c"Q@:@".as_ptr(),
+            );
+            // AppKit caches optional methods when the delegate is assigned.
+            let _: () = objc2::msg_send![&*app, setDelegate: delegate];
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C-unwind" fn native_quit_requested(
+        _delegate: &AnyObject,
+        _selector: Sel,
+        _app: &AnyObject,
+    ) -> objc2_app_kit::NSApplicationTerminateReply {
+        use objc2_app_kit::NSApplicationTerminateReply;
+        use objc2_foundation::NSAppleEventManager;
+
+        let reason = NSAppleEventManager::sharedAppleEventManager()
+            .currentAppleEvent()
+            .and_then(|event| {
+                // AEKeyword is u32; the generated binding otherwise requires CoreServices.
+                let reason: Option<objc2::rc::Retained<objc2_foundation::NSAppleEventDescriptor>> = unsafe {
+                    objc2::msg_send![&*event, paramDescriptorForKeyword: u32::from_be_bytes(*b"why?")]
+                };
+                reason
+            })
+            .map(|reason| reason.enumCodeValue());
+        let pending = reason.is_none()
+            && !crate::commands::up::api_v2::pending_work().is_ok_and(|work| work.is_empty());
+        if !super::native_quit_needs_confirmation(pending, reason) {
+            return NSApplicationTerminateReply::TerminateNow;
+        }
+        // The answer may come from the page, which cannot run while AppKit waits on a deferred reply.
+        if send_later(UserEvent::Close) {
+            NSApplicationTerminateReply::TerminateCancel
+        } else {
+            NSApplicationTerminateReply::TerminateNow
+        }
+    }
+
+    /// Quits when nothing is pending; otherwise the user chooses, in the page when `page_ready` says it can ask.
+    fn close_window(
+        external_server: bool,
+        page_ready: bool,
+        quit: &mut Quit,
+        ask: &mut Ask,
+        window: &Window,
+        webview: &WebView,
+        control_flow: &mut ControlFlow,
+    ) {
+        if !matches!(quit, Quit::No) {
+            return;
+        }
+        if external_server {
+            begin_quit(quit, window, webview, control_flow);
+            return;
+        }
+
+        let pending = match crate::commands::up::api_v2::pending_work() {
+            Ok(work) if work.is_empty() => {
+                begin_quit(quit, window, webview, control_flow);
+                return;
+            }
+            Ok(work) => Some(work),
+            Err(error) => {
+                eprintln!("openresearch app: could not check for pending work: {error:#}");
+                None
+            }
+        };
+
+        // Only the page can list the work, so a hidden window comes back to ask once it loads.
+        #[cfg(target_os = "macos")]
+        if super::windowless() && send_later(UserEvent::Focus(None)) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            *ask = Ask::OnLoad(deadline);
+            *control_flow = ControlFlow::WaitUntil(deadline);
+            return;
+        }
+        if !page_ready {
+            *ask = Ask::No;
+            let answer = ask_natively(window, pending.as_ref());
+            answer_close(answer, quit, window, webview, control_flow);
+            return;
+        }
+        let detail =
+            serde_json::json!({ "work": pending, "minimizes": !cfg!(target_os = "macos") });
+        // A quit from the Dock or the menu can find the window minimized or behind, where the page draws nothing.
+        window.set_minimized(false);
+        window.set_focus();
+        let _ = webview.evaluate_script(&format!(
+            "window.dispatchEvent(new CustomEvent('orx:close-request', {{ detail: {detail} }}));"
+        ));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        *ask = Ask::Sent(deadline);
+        *control_flow = ControlFlow::WaitUntil(deadline);
+    }
+
+    fn answer_close(
+        answer: super::CloseAnswer,
+        quit: &mut Quit,
+        window: &Window,
+        webview: &WebView,
+        control_flow: &mut ControlFlow,
+    ) {
+        match answer {
+            super::CloseAnswer::Cancel => {}
+            super::CloseAnswer::Quit => {
+                let Some(proxy) = event_proxy() else {
+                    return begin_quit(quit, window, webview, control_flow);
+                };
+                window.set_visible(false);
+                *quit = Quit::StoppingRuns;
+                tokio::spawn(async move {
+                    crate::commands::up::api_v2::force_stop_runs().await;
+                    let _ = proxy.send_event(UserEvent::RunsStopped);
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            super::CloseAnswer::Background => {
+                let _ = webview;
+                window.set_minimized(true);
+            }
+            #[cfg(target_os = "macos")]
+            super::CloseAnswer::Background => {
+                super::WINDOWLESS.send_replace(true);
+                let _ = webview.load_url("about:blank");
+                // Ordering out a fullscreen window strands its Space; the resize that ends the exit hides it.
+                if in_native_fullscreen(window) {
+                    window.set_fullscreen(None);
+                    return;
+                }
+                window.set_visible(false);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn in_native_fullscreen(window: &Window) -> bool {
+        use objc2_app_kit::{NSWindow, NSWindowStyleMask};
+        use tao::platform::macos::WindowExtMacOS;
+
+        // Tao owns this window for the duration of the main-thread event.
+        let native_window = unsafe { &*window.ns_window().cast::<NSWindow>() };
+        native_window
+            .styleMask()
+            .contains(NSWindowStyleMask::FullScreen)
+    }
+
+    fn ask_natively(
+        window: &Window,
+        pending: Option<&crate::store::PendingWork>,
+    ) -> super::CloseAnswer {
+        let title = "Work is still running";
+        let description = super::close_alert_description(pending);
+        let background = if cfg!(target_os = "macos") {
+            "Run in background"
+        } else {
+            "Minimize instead"
+        };
+        // A hidden window is already running in the background.
+        let background = (!super::windowless()).then_some(background);
+        let quit = if pending.is_some_and(crate::store::PendingWork::blocks_quit) {
+            "Force Quit"
+        } else {
+            "Quit"
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let chosen = {
+            let cancel = "Cancel".to_string();
+            let buttons = match background {
+                Some(background) => {
+                    rfd::MessageButtons::YesNoCancelCustom(background.into(), quit.into(), cancel)
+                }
+                None => rfd::MessageButtons::OkCancelCustom(quit.into(), cancel),
+            };
+            let dialog = rfd::MessageDialog::new()
+                .set_title(title)
+                .set_description(description)
+                .set_buttons(buttons);
+            #[cfg(windows)]
+            let dialog = dialog.set_parent(window);
+            #[cfg(target_os = "macos")]
+            let _ = window;
+            match dialog.show() {
+                rfd::MessageDialogResult::Custom(label) => label,
+                _ => "Cancel".into(),
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let chosen = {
+            use gtk::prelude::*;
+            use tao::platform::unix::WindowExtUnix;
+
+            let dialog = gtk::MessageDialog::builder()
+                .transient_for(window.gtk_window())
+                .modal(true)
+                .text(title)
+                .secondary_text(description)
+                .build();
+            dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+            dialog.add_button(quit, gtk::ResponseType::Accept);
+            if let Some(background) = background {
+                dialog.add_button(background, gtk::ResponseType::Other(0));
+            }
+            dialog.set_default_response(gtk::ResponseType::Cancel);
+            let response = dialog.run();
+            dialog.close();
+            match response {
+                gtk::ResponseType::Accept => quit,
+                gtk::ResponseType::Other(0) => background.unwrap_or("Cancel"),
+                _ => "Cancel",
+            }
+            .to_string()
+        };
+
+        match chosen.as_str() {
+            label if label == quit => super::CloseAnswer::Quit,
+            label if Some(label) == background => super::CloseAnswer::Background,
+            _ => super::CloseAnswer::Cancel,
+        }
     }
 
     fn begin_quit(
@@ -1795,6 +2346,48 @@ mod imp {
         parent.addSubview_positioned_relativeTo(&material, NSWindowOrderingMode::Below, Some(&wk));
     }
 
+    /// Mica behind the whole window, so it shows wherever the page is transparent.
+    /// False before Windows 11 22H2, which has no system backdrop.
+    #[cfg(windows)]
+    fn add_window_material(window: &Window) -> bool {
+        use tao::platform::windows::WindowExtWindows;
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_MAINWINDOW,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+        };
+        use windows_sys::Win32::UI::Controls::MARGINS;
+
+        let hwnd = window.hwnd() as _;
+        let backdrop = DWMSBT_MAINWINDOW;
+        // SAFETY: the window is alive and the attribute points at a value of its size.
+        let set = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE as u32,
+                (&raw const backdrop).cast(),
+                size_of_val(&backdrop) as u32,
+            )
+        };
+        if set < 0 {
+            return false;
+        }
+
+        // DWM draws the backdrop only under the frame, so the frame takes the whole client area.
+        let whole = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        // SAFETY: as above.
+        if unsafe { DwmExtendFrameIntoClientArea(hwnd, &whole) } < 0 {
+            return false;
+        }
+        // Over an extended frame DWM shows the backdrop through black, not the default white.
+        window.set_background_color(Some((0, 0, 0, 0)));
+        true
+    }
+
     /// wry's WKUIDelegate has no confirm panel, and without one WebKit answers
     /// every `window.confirm` with false, so add it to the delegate's class.
     #[cfg(target_os = "macos")]
@@ -1872,6 +2465,76 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn close_alert_names_each_pending_item_under_what_quitting_does_to_it() {
+        use crate::store::{AfterQuit, PendingAgent, PendingRun, PendingWork};
+        let run = |name: &str, backend: &str, after_quit| PendingRun {
+            project_id: "project".into(),
+            project: None,
+            experiment_id: "experiment".into(),
+            run_id: name.into(),
+            session_id: None,
+            name: name.into(),
+            backend: Some(backend.into()),
+            after_quit,
+        };
+        let agent = PendingAgent {
+            project_id: "project".into(),
+            project: Some("Scaling laws".into()),
+            session_id: "chat".into(),
+            side_parent_id: None,
+            harness: "codex".into(),
+            title: Some("Tune the schedule".into()),
+        };
+
+        let remote = super::close_alert_description(Some(&PendingWork {
+            agents: vec![agent],
+            runs: vec![run("lr-sweep", "modal_job", AfterQuit::Continues)],
+        }));
+        assert!(remote.contains("Tune the schedule (Scaling laws)") && remote.contains("lr-sweep"));
+        assert!(!remote.contains("Force Quit") && !remote.contains("Finished"));
+
+        let blocked = super::close_alert_description(Some(&PendingWork {
+            agents: vec![],
+            runs: vec![
+                run("eval", "tinker_job", AfterQuit::NeedsApp),
+                run("probe", "vercel_job", AfterQuit::NeedsApp),
+            ],
+        }));
+        assert!(blocked.starts_with("Force Quit stops"));
+        assert!(
+            blocked.contains("eval: runs on this computer") && blocked.contains("probe: without")
+        );
+        assert!(!blocked.contains("Agents"));
+
+        assert!(super::close_alert_description(None).contains("couldn't check"));
+    }
+
+    #[test]
+    fn native_quit_never_defers_system_termination_or_idle_quit() {
+        for busy in [false, true] {
+            assert_eq!(super::native_quit_needs_confirmation(busy, None), busy);
+            for reason in [*b"quia", *b"shut", *b"rest", *b"rlgo"] {
+                assert!(!super::native_quit_needs_confirmation(
+                    busy,
+                    Some(u32::from_be_bytes(reason))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn new_work_resets_windowless_idle_exit() {
+        let mut idle = crate::commands::up::api_v2::Idle::default();
+        let secs = std::time::Duration::from_secs;
+
+        assert!(!idle.should_exit(secs(0), false));
+        assert!(!idle.should_exit(secs(599), true));
+        assert!(!idle.should_exit(secs(600), false));
+        assert!(!idle.should_exit(secs(1199), false));
+        assert!(idle.should_exit(secs(1200), false));
+    }
+
+    #[test]
     fn the_desktop_entry_launches_the_appimage_wherever_it_is() {
         let entry = desktop_entry(
             r"/home/me/My Apps/Open$Re%1\x.AppImage",
@@ -1883,7 +2546,9 @@ mod tests {
             "\nIcon=/home/me/.local/share/icons/hicolor/256x256/apps/openresearch.png\n"
         ));
         assert!(entry.contains("\nStartupWMClass=OpenResearch\n"));
-        assert!(entry.contains("\nMimeType=x-scheme-handler/openresearch;\n"));
+        assert!(entry.contains(
+            "\nMimeType=x-scheme-handler/openresearch;application/x-openresearch-project;\n"
+        ));
         assert!(!entry.contains("orx app"));
     }
 
@@ -1900,6 +2565,26 @@ mod tests {
         assert_eq!(link_path("openresearch://reproduce/"), None);
         assert_eq!(link_path("openresearch://reproduce"), None);
         assert_eq!(link_path("openresearch://settings/x"), None);
+        let shared = std::env::temp_dir().join("tiny lm.orx");
+        assert_eq!(
+            link_path(url::Url::from_file_path(&shared).unwrap().as_str()),
+            Some(format!(
+                "/open?file={}",
+                urlencoding::encode(&shared.to_string_lossy())
+            ))
+        );
+        let notes = url::Url::from_file_path(std::env::temp_dir().join("notes.txt")).unwrap();
+        assert_eq!(link_path(notes.as_str()), None);
+        assert_eq!(
+            link_path("openresearch://p/a1B2c3D4e5F6").as_deref(),
+            Some("/open?shared=a1B2c3D4e5F6")
+        );
+        assert_eq!(
+            link_path("openresearch://p/a1B2c3D4e5F6/").as_deref(),
+            Some("/open?shared=a1B2c3D4e5F6")
+        );
+        assert_eq!(link_path("openresearch://p/../../etc"), None);
+        assert_eq!(link_path("openresearch://p/short"), None);
         assert_eq!(link_path("https://reproduce/x"), None);
         assert_eq!(link_path("not a link"), None);
         assert_eq!(
@@ -1910,6 +2595,18 @@ mod tests {
 
     fn app_args(args: &[&str]) -> Option<Option<String>> {
         app_launch(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn the_app_takes_a_shared_project_file_as_a_file_url() {
+        let shared = std::env::temp_dir().join("tiny lm.orx");
+        let url = url::Url::from_file_path(&shared).unwrap().to_string();
+        let path = shared.to_str().unwrap();
+        assert_eq!(app_args(&["app", path]), Some(Some(url.clone())));
+        assert_eq!(app_args(&["app", &url]), Some(Some(url)));
+        let notes = std::env::temp_dir().join("notes.txt");
+        assert_eq!(app_args(&["app", notes.to_str().unwrap()]), None);
+        assert_eq!(app_args(&["app", "tiny.orx"]), Some(None));
     }
 
     #[test]

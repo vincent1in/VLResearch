@@ -7,7 +7,7 @@ use crate::store::Store;
 
 /// Lists a project's runs as a table, newest first.
 pub async fn run(args: crate::RunsArgs) -> Result<()> {
-    let store = Store::open()?;
+    let store = Store::open_for_reading()?;
     let plane = resolve_project(store, &args.project_id)?;
     let listing = plane.list_runs().await?;
 
@@ -37,7 +37,7 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
         .map(|r| {
             vec![
                 r.id.clone(),
-                r.status.clone(),
+                r.display_status().into(),
                 listing
                     .titles
                     .get(&r.experiment_id)
@@ -64,6 +64,15 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
         ],
         &rows,
     );
+
+    for run in &filtered {
+        for detail in [run.waiting_detail(), run.contact_detail()]
+            .into_iter()
+            .flatten()
+        {
+            println!("{}  {detail}", run.id);
+        }
+    }
 
     if !failures.is_empty() {
         println!();

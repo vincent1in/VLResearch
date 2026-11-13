@@ -22,7 +22,7 @@ const REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20)
 /// account already had it.
 pub(crate) async fn ensure_default_registered(creds: &Credentials) -> Result<bool> {
     tokio::time::timeout(REGISTER_TIMEOUT, async {
-        let ssh_dir = dirs::home_dir()
+        let ssh_dir = crate::config::home_dir()
             .ok_or_else(|| anyhow!("Couldn't locate your home directory."))?
             .join(".ssh");
         let mut builder = std::fs::DirBuilder::new();
@@ -78,7 +78,7 @@ async fn ensure_default_public_key(ssh_dir: &std::path::Path) -> Result<String> 
     let private = ssh_dir.join("id_ed25519");
     let public = ssh_dir.join("id_ed25519.pub");
     if !public.try_exists()? {
-        let mut command = tokio::process::Command::new("ssh-keygen");
+        let mut command = crate::process::tokio_command("ssh-keygen");
         if private.try_exists()? {
             println!("Restoring the public-key file from the existing private key\u{2026}");
             command.args(["-y", "-P", "", "-f"]).arg(&private);
@@ -125,7 +125,7 @@ async fn ensure_default_public_key(ssh_dir: &std::path::Path) -> Result<String> 
 
 fn expand(path: &str) -> std::path::PathBuf {
     match path.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
+        Some(rest) => crate::config::home_dir()
             .map(|h| h.join(rest))
             .unwrap_or_else(|| path.into()),
         None => path.into(),
@@ -137,7 +137,7 @@ fn expand(path: &str) -> std::path::PathBuf {
 fn device_name(line: &str) -> String {
     key_comment(line)
         .or_else(|| {
-            std::process::Command::new("hostname")
+            crate::process::command("hostname")
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -278,25 +278,7 @@ mod setup_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_key_is_created_and_registered_once() {
-        // `~/.ssh` and the agent are per-process, so the body runs in a child
-        // with an empty home and no agent.
-        if std::env::var("ORX_SSH_KEY_TEST_CHILD").is_err() {
-            let home = std::env::temp_dir().join(format!("orx-ssh-key-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&home).unwrap();
-            let status = tokio::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "commands::ssh_key::setup_tests::default_key_is_created_and_registered_once",
-                    "--nocapture",
-                ])
-                .env("ORX_SSH_KEY_TEST_CHILD", "1")
-                .env("HOME", &home)
-                .env_remove("SSH_AUTH_SOCK")
-                .status()
-                .await
-                .unwrap();
-            let _ = std::fs::remove_dir_all(home);
-            assert!(status.success());
+        if !crate::config::in_test_child(&["SSH_AUTH_SOCK"]) {
             return;
         }
 
@@ -327,7 +309,7 @@ mod setup_tests {
         assert!(ensure_default_registered(&creds).await.unwrap());
         assert!(!ensure_default_registered(&creds).await.unwrap());
 
-        let ssh = dirs::home_dir().unwrap().join(".ssh");
+        let ssh = crate::config::home_dir().unwrap().join(".ssh");
         assert!(ssh.join("id_ed25519").is_file());
         let public = std::fs::read_to_string(ssh.join("id_ed25519.pub")).unwrap();
         let keys = registered.lock().unwrap().clone();
@@ -338,7 +320,7 @@ mod setup_tests {
         );
         assert!(matches!(
             ssh_identity::check(&creds).await,
-            KeyStatus::Matched
+            KeyStatus::Matched { .. }
         ));
         assert_eq!(
             default_key_fingerprint().await,

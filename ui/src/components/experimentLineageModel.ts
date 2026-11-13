@@ -1,15 +1,15 @@
 import {
   backendDetail,
   backendKind,
-  runDisplayStatus,
   type Experiment,
   type Run,
 } from "../api";
+import { runActive, runDisplay } from "../runDisplay";
 import { ltr } from "../i18n";
 import { m } from "../paraglide/messages.js";
 
-/** Outcome of an experiment's latest attempt; "none" when it has never run. */
-export type HistoryStatus = "done" | "failed" | "cancelled" | "lost" | "running" | "none";
+/** Outcome of an experiment's latest attempt; "none" when it has never run, "stale" when it is last-seen or a cancel awaits. */
+export type HistoryStatus = "done" | "failed" | "cancelled" | "lost" | "running" | "stale" | "none";
 
 export interface HistoryNode {
   id: string;
@@ -49,9 +49,9 @@ export type HistoryRow =
 export const NO_TASK = "__no_task";
 
 export function historyStatus(run: Run): HistoryStatus {
-  const status = runDisplayStatus(run);
-  if (status === "done" || status === "failed" || status === "cancelled" || status === "lost") return status;
-  return "running";
+  const { status, stale } = runDisplay(run);
+  if (stale || status === "cancellation_pending") return "stale";
+  return runActive(run.status) ? "running" : run.status;
 }
 
 const CODE_PREFIX = /^([A-Z][0-9]{0,2}[a-z]?)(?:\s*[:–—-]\s*|\s+)(?=\S)/;

@@ -769,9 +769,13 @@ fn selectable_model(model: &Value, connected: &HashSet<&str>) -> bool {
         return false;
     }
     // V2 scopes the catalog to available providers; anonymous Zen must also be explicitly free.
-    model["providerID"] != "opencode"
-        || connected.contains("opencode")
-        || model["cost"].as_array().is_some_and(|tiers| {
+    model["providerID"] != "opencode" || connected.contains("opencode") || free_model(model)
+}
+
+/// One of OpenCode's own models at no cost: what the free-models switch governs.
+fn free_model(model: &Value) -> bool {
+    model["providerID"] == "opencode"
+        && model["cost"].as_array().is_some_and(|tiers| {
             !tiers.is_empty()
                 && tiers.iter().all(|cost| {
                     cost["input"].as_f64() == Some(0.0) && cost["output"].as_f64() == Some(0.0)
@@ -789,11 +793,20 @@ pub(super) async fn detect(
     binary: crate::local::opencode::ResolvedBinary,
     mut info: HarnessInfo,
 ) -> HarnessInfo {
+    info.configured_model = super::snapshot_config().0["model"]
+        .as_str()
+        .map(str::to_owned);
+    let refreshed = crate::local::local_models::refresh_alias_models(&binary).await;
+    let records = crate::local::local_models::providers().unwrap_or_default();
     let catalog = tokio::spawn(async move {
         let db = native_store::prepare_opencode(NativeStore::Isolated)?;
         let _lease = crate::local::opencode::prepare_database(&binary, &db).await?;
-        let mut cmd = tokio::process::Command::new(&binary.path);
-        crate::local::local_models::prepare_env(&mut cmd, None)?;
+        let mut cmd = crate::process::tokio_command(&binary.path);
+        crate::local::local_models::prepare_env(
+            &mut cmd,
+            None,
+            crate::local::opencode::Protocol::V2,
+        )?;
         cmd.env("OPENCODE_DB", _lease.path())
             .env("OPENCODE_CONFIG_PROJECT_DISABLE", "1")
             .current_dir(
@@ -820,11 +833,13 @@ pub(super) async fn detect(
                 })
                 .filter_map(|integration| integration["id"].as_str())
                 .collect();
+            let free = super::free_models_offered();
             info.models = models["data"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter(|model| selectable_model(model, &connected))
+                .filter(|model| free || !free_model(model))
                 .filter_map(|model| {
                     let provider = model["providerID"].as_str()?;
                     let id = model["id"].as_str()?;
@@ -834,15 +849,21 @@ pub(super) async fn detect(
                         .flatten()
                         .filter_map(|v| v["id"].as_str())
                         .collect();
+                    let label = crate::local::local_models::model_label(
+                        provider,
+                        model["name"].as_str().unwrap_or(id),
+                        &records,
+                    );
                     Some(
                         ModelInfo::new(format!("{provider}/{id}"))
-                            .with_label(model["name"].as_str(), None)
+                            .with_label(Some(&label), None)
                             .with_reasoning(&variants)
                             .with_image_input(image_input(model)),
                     )
                 })
                 .collect();
-            info.authenticated = !connected.is_empty();
+            info.authenticated =
+                !connected.is_empty() || crate::local::local_models::configures_remote();
             info.agent_ready = !info.models.is_empty();
             info.auth_state = if info.authenticated || info.agent_ready {
                 HarnessAuthState::Ready
@@ -863,11 +884,19 @@ pub(super) async fn detect(
         Ok(Err(error)) => info.agent_note = Some(error.to_string()),
         Err(error) => info.agent_note = Some(format!("OpenCode discovery failed: {error}")),
     }
+    if let Err(error) = refreshed {
+        info.agent_note = Some(format!("Could not refresh provider models: {error}"));
+    }
     info
 }
 
 async fn discover_models(endpoint: &AgentEndpoint) -> Result<(Value, Value)> {
-    discover_models_with_timeout(endpoint, Duration::from_secs(30)).await
+    discover_models_within(
+        endpoint,
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+    )
+    .await
 }
 
 async fn catalog_get(endpoint: &AgentEndpoint, path: &str) -> Result<Option<Value>> {
@@ -899,9 +928,10 @@ async fn catalog_get(endpoint: &AgentEndpoint, path: &str) -> Result<Option<Valu
     Ok(Some(body))
 }
 
-async fn discover_models_with_timeout(
+async fn discover_models_within(
     endpoint: &AgentEndpoint,
     timeout: Duration,
+    retry: Duration,
 ) -> Result<(Value, Value)> {
     let mut catalog = None;
     let mut plugins_pending = false;
@@ -926,7 +956,7 @@ async fn discover_models_with_timeout(
                 }
             }
             // OpenCode 2.0.4 removed await-activation; cold catalogs can initially be empty.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(retry).await;
         }
     })
     .await;
@@ -960,7 +990,7 @@ pub(super) async fn generate(
     tokio::spawn(async move {
         let db = native_store::prepare_opencode(NativeStore::Isolated)?;
         let lease = crate::local::opencode::prepare_database(&binary, &db).await?;
-        let mut cmd = tokio::process::Command::new(&binary.path);
+        let mut cmd = crate::process::tokio_command(&binary.path);
         crate::local::local_models::prepare_generation_env(
             &mut cmd,
             Some(&model),
@@ -1094,6 +1124,7 @@ mod tests {
                     answers: Vec::new(),
                     note: None,
                     annotations: Vec::new(),
+                    from: None,
                 };
                 reply(&ctx, &endpoint, &prompt, &answer).await.unwrap();
             }
@@ -1149,6 +1180,7 @@ mod tests {
                 answers: Vec::new(),
                 note: Some("Skipped".into()),
                 annotations: Vec::new(),
+                from: None,
             };
             let result = reply(&ctx, &endpoint, &prompt, &answer).await;
             server.abort();
@@ -1170,6 +1202,8 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (endpoint, server)
     }
+
+    const RETRY: Duration = Duration::from_millis(1);
 
     fn plugin_pending() -> Value {
         json!({"_tag":"ServiceUnavailableError", "service":"plugin", "message":"fixture", "extra":true})
@@ -1213,7 +1247,7 @@ mod tests {
                     );
                 }
                 let (endpoint, server) = catalog_server(app, legacy).await;
-                let result = discover_models_with_timeout(&endpoint, Duration::from_secs(2)).await;
+                let result = discover_models_within(&endpoint, Duration::from_secs(2), RETRY).await;
                 server.abort();
                 let (models, integrations) = result.unwrap();
                 assert_eq!(models["data"][0]["id"], "/api/model");
@@ -1267,7 +1301,7 @@ mod tests {
                     }),
                 );
                 let (endpoint, server) = catalog_server(app, false).await;
-                let result = discover_models_with_timeout(&endpoint, Duration::from_secs(1)).await;
+                let result = discover_models_within(&endpoint, Duration::from_secs(1), RETRY).await;
                 server.abort();
                 let error = result.unwrap_err().to_string();
                 assert!(error.contains(diagnostic), "{error}");
@@ -1295,8 +1329,8 @@ mod tests {
             );
             let (endpoint, server) = catalog_server(app, false).await;
             let result = tokio::time::timeout(
-                Duration::from_secs(2),
-                discover_models_with_timeout(&endpoint, Duration::from_secs(1)),
+                Duration::from_secs(1),
+                discover_models_within(&endpoint, Duration::from_millis(100), RETRY),
             )
             .await;
             server.abort();
@@ -1304,7 +1338,7 @@ mod tests {
             if stalled {
                 assert_eq!(error, "OpenCode model discovery timed out");
             } else {
-                assert_eq!(error, "OpenCode plugins did not finish activating within 1 seconds. Re-check OpenCode.");
+                assert!(error.starts_with("OpenCode plugins did not finish activating"));
             }
         }
     }
@@ -1321,13 +1355,20 @@ mod tests {
             let polls = Arc::new(AtomicUsize::new(0));
             let count = polls.clone();
             let seen = polls.clone();
+            let reloaded = Arc::new(tokio::sync::Notify::new());
+            let observed = reloaded.clone();
             let app = Router::new()
                 .route(
                     "/api/model",
                     get(move || {
                         let count = count.clone();
+                        let observed = observed.clone();
                         async move {
-                            Json(if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let poll = count.fetch_add(1, Ordering::SeqCst);
+                            if poll == 2 {
+                                observed.notify_one();
+                            }
+                            Json(if poll == 0 {
                                 json!({"data":[]})
                             } else {
                                 json!({"data":[{"id":"fixture"}]})
@@ -1349,7 +1390,19 @@ mod tests {
                     }),
                 );
             let (endpoint, server) = catalog_server(app, false).await;
-            let result = discover_models_with_timeout(&endpoint, Duration::from_secs(1)).await;
+            let timeout = Duration::from_secs(30);
+            let discover = discover_models_within(&endpoint, timeout, RETRY);
+            tokio::pin!(discover);
+            if plugins_reload {
+                tokio::select! {
+                    _ = reloaded.notified() => {}
+                    result = &mut discover => panic!("discovery ended before its reload: {result:?}"),
+                }
+                tokio::time::pause();
+                tokio::time::advance(timeout).await;
+                tokio::time::resume();
+            }
+            let result = discover.await;
             server.abort();
             let (models, integrations) = result.unwrap();
             let expected = if plugins_reload {

@@ -1224,6 +1224,8 @@ pub(crate) mod tests {
             active_leaf_id: None,
             side_parent_session_id: side_parent.map(str::to_owned),
             side_parent_leaf_id: None,
+            profile_id: None,
+            native_fork_at: None,
             created_at: 1,
             updated_at: 1,
         }

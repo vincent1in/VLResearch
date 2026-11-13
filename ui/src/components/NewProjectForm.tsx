@@ -1,28 +1,15 @@
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { queryClient } from "../queries/client";
-import {
-  githubAccountQuery,
-  githubProjectRepoPreviewQuery,
-  repoAccessQuery,
-  getProjectPathStatusQuery,
-  resolvePaperQuery,
-  searchPapersQuery,
-} from "../queries/projects";
-import { getHarnessesQuery, getProjectDefaultsQuery } from "../queries/settings";
+import { useContext, useEffect, useRef, useState } from "react";
+import { WorkspaceDomContext } from "../WorkspaceDom";
+import { useWorkspace } from "../workspace";
+import { useQuery } from "@tanstack/react-query";
+import { mutCreateProject } from "../queries/projects";
+
 import { m } from "../paraglide/messages.js";
 import { getLocale } from "../paraglide/runtime.js";
 import { ltr } from "../i18n";
-import { useEffect, useRef, useState } from "react";
+
 import { ChevronDown, ChevronRight, CircleAlert, FolderOpen } from "lucide-react";
-import {
-  createProject,
-  pickProjectFolder,
-  type PaperHit,
-  type Project,
-  type ResolvedPaper,
-  type AgentSelection,
-  prewarmStarterPrompts,
-} from "../api";
+import { type PaperHit, type Project, type ResolvedPaper, type AgentSelection } from "../api";
 import { Button, SEGMENTED_CLASS_NAME } from "./ui";
 import { PaperTitle } from "./PaperTitle";
 import { defaultSelection } from "./ModelPicker";
@@ -36,7 +23,7 @@ export function useDebouncedValue(value: string, delay: number) {
   return debounced;
 }
 
-function slugify(text: string, maxLength?: number): string {
+export function slugify(text: string, maxLength?: number): string {
   const slug = text
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -86,11 +73,28 @@ export function NewProjectForm({
   preferredAgent: AgentSelection | null;
   initialPaperId?: string;
 }) {
+  const { id: elementId } = useContext(WorkspaceDomContext);
+
+  const {
+    getHarnessesQuery,
+    getProjectPathStatusQuery,
+    githubAccountQuery,
+    getProjectDefaultsQuery,
+    githubProjectRepoPreviewQuery,
+    repoAccessQuery,
+    searchPapersQuery,
+    resolvePaperQuery,
+  } = useWorkspace().queries;
+  const workspace = useWorkspace();
+  const { pickProjectFolder, prewarmStarterPrompts } = workspace.api;
+  const { queryClient } = workspace;
+
   const { data: harnesses = [] } = useQuery(getHarnessesQuery());
   const starterSelection = preferredAgent ?? defaultSelection(harnesses);
   const starterHarness = starterSelection?.harness;
   const starterModel = starterSelection?.model ?? null;
-  const starterAgent = starterHarness ? { harness: starterHarness, model: starterModel } : undefined;
+  const starterProfile = starterSelection?.profile ?? null;
+  const starterAgent = starterHarness ? { harness: starterHarness, model: starterModel, profile: starterProfile } : undefined;
   const [mode, setMode] = useState<Mode>(initialPaperId ? "paper" : "blank");
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
@@ -165,7 +169,6 @@ export function NewProjectForm({
     const error = paperId ? resolveQuery.error : searchQuery.error;
     if (canSearch && error) setError(error.message);
   }, [canSearch, paperId, resolveQuery.error, searchQuery.error]);
-  const createMutation = useMutation({ mutationFn: createProject });
 
   async function choosePaper(paperId: string) {
     const request = ++seq.current;
@@ -261,7 +264,7 @@ export function NewProjectForm({
       if (githubSyncEnabled && existingGithubRepo) {
         await queryClient.fetchQuery({ ...repoAccessQuery(existingGithubRepo.owner, existingGithubRepo.repo), staleTime: 0 }).catch(() => null);
       }
-      const result = await createMutation.mutateAsync({
+      const result = await mutCreateProject.runAsHeadlessPromise(workspace, {
         name: name.trim(),
         path: projectPath.trim(),
         creationMode: mode,
@@ -274,7 +277,7 @@ export function NewProjectForm({
         ...(mode === "paper" && paper
           ? { paperId: paper.paperId, cloneUrl: paper.repoUrl ?? undefined }
           : {}),
-      });
+      }, {});
       onCreated(result.project, result.githubPublicationError);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -298,11 +301,11 @@ export function NewProjectForm({
         paperId: prewarmPaperId ?? undefined,
         path: prewarmPath ?? undefined,
         locale: getLocale(),
-        starterAgent: starterHarness ? { harness: starterHarness, model: starterModel } : undefined,
+        starterAgent,
       }).catch(() => {});
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [prewarmReady, prewarmName, prewarmPaperId, prewarmPath, starterHarness, starterModel]);
+  }, [prewarmReady, prewarmName, prewarmPaperId, prewarmPath, starterHarness, starterModel, starterProfile]);
 
   const gitMissing = pathStatus?.gitVersion === null;
   const missingLocalFolder =
@@ -492,7 +495,7 @@ export function NewProjectForm({
                   setPathTouched(true);
                   setPath(event.target.value);
                 }}
-                aria-describedby={paperDestinationHasError ? "paper-destination-description" : undefined}
+                aria-describedby={paperDestinationHasError ? elementId("paper-destination-description") : undefined}
                 placeholder="~/OpenResearch/paper-title"
                 spellCheck={false}
               />
@@ -500,7 +503,7 @@ export function NewProjectForm({
                 <span className="sr-only" role="status" aria-live="polite">{m.new_project_form_checking_project_location()}</span>
               )}
               {paperDestinationHasError && (
-                <span id="paper-destination-description" className="folder-picker-hint error !text-accent-red" role="alert">
+                <span id={elementId("paper-destination-description")} className="folder-picker-hint error !text-accent-red" role="alert">
                   {paperDestinationError}
                 </span>
               )}
@@ -548,14 +551,14 @@ export function NewProjectForm({
                   setPath(event.target.value);
                 }}
                 placeholder="~/OpenResearch/my-research"
-                aria-describedby={blankDestinationHasError ? "blank-destination-description" : undefined}
+                aria-describedby={blankDestinationHasError ? elementId("blank-destination-description") : undefined}
                 spellCheck={false}
               />
               {checkingPath && (
                 <span className="sr-only" role="status" aria-live="polite">{m.new_project_form_checking_project_location()}</span>
               )}
               {blankDestinationHasError && (
-                <span id="blank-destination-description" className="folder-picker-hint error !text-accent-red" role="alert">
+                <span id={elementId("blank-destination-description")} className="folder-picker-hint error !text-accent-red" role="alert">
                   {blankDestinationError}
                 </span>
               )}
@@ -603,7 +606,7 @@ export function NewProjectForm({
             type="button"
             className={`inline-flex items-center gap-1 text-sm font-medium${githubSyncEnabled && githubLogin === null ? " text-accent-red" : " text-text"}`}
             aria-expanded={advancedOpen}
-            aria-controls="new-project-advanced-settings"
+            aria-controls={elementId("new-project-advanced-settings")}
             onClick={() => setAdvancedOpen((open) => !open)}
           >
             {githubSyncEnabled
@@ -614,7 +617,7 @@ export function NewProjectForm({
             <ChevronDown className={advancedOpen ? "rotate-180" : ""} size={16} />
           </button>
           {advancedOpen && (
-            <label id="new-project-advanced-settings" className="flex w-full flex-col items-stretch gap-2 font-normal">
+            <label id={elementId("new-project-advanced-settings")} className="flex w-full flex-col items-stretch gap-2 font-normal">
               <span className="flex flex-row items-center gap-2">
                 <input
                   className="m-0"

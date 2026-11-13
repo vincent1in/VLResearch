@@ -19,14 +19,15 @@ test('numbers published canaries independently each UTC day', () => {
   assert.equal(tag('20261027', ['canary-20261027.3--OpenResearch.dmg', 'canary-20261027.2']), 'canary-20261027.4')
 })
 
-test('the published manifest pins each desktop asset to its bytes and commit', () => {
+test('the published manifest pins each desktop asset to its bytes and commit, and leaves the CLIs out', () => {
   const dir = mkdtempSync(join(tmpdir(), 'orx-canary-manifest-'))
   try {
     mkdirSync(join(dir, 'artifacts'))
     const ancestry = join(dir, 'ancestry')
     writeFileSync(ancestry, `${'a'.repeat(40)}\n${'b'.repeat(40)}\n`)
     const files = ['OpenResearch.dmg', 'OpenResearch-Canary-orx.exe', 'OpenResearch-x86_64.AppImage', 'OpenResearch-aarch64.AppImage']
-    for (const file of files) writeFileSync(join(dir, 'artifacts', file), file)
+    const cli = ['OpenResearch-cli-x86_64-unknown-linux-musl.tar.gz', 'OpenResearch-cli-x86_64-unknown-linux-musl.tar.gz.sha256', 'OpenResearch-cli-aarch64-apple-darwin.tar.gz']
+    for (const file of [...files, ...cli]) writeFileSync(join(dir, 'artifacts', `canary-20261027.2--${file}`), file)
     const output = execFileSync(process.execPath, ['scripts/canary-manifest.mjs', join(dir, 'artifacts'), '0.2.21', 'canary-20261027.2', 'a'.repeat(40), ancestry], { encoding: 'utf8' })
     const manifest = JSON.parse(output)
     assert.equal(manifest.tag, 'canary-20261027.2')
@@ -34,16 +35,12 @@ test('the published manifest pins each desktop asset to its bytes and commit', (
     assert.deepEqual(manifest.ancestors, ['a'.repeat(40), 'b'.repeat(40)])
     assert.deepEqual(Object.keys(manifest.assets).sort(), ['linux-aarch64', 'linux-x86_64', 'macos', 'windows'])
     for (const asset of Object.values(manifest.assets)) {
-      assert.equal(asset.sha256, createHash('sha256').update(asset.asset).digest('hex'))
+      assert.equal(asset.sha256, createHash('sha256').update(asset.asset.replace('canary-20261027.2--', '')).digest('hex'))
     }
     mkdirSync(join(dir, 'partial'))
-    writeFileSync(join(dir, 'partial', 'OpenResearch.dmg'), 'mac')
+    writeFileSync(join(dir, 'partial', 'canary-20261027.2--OpenResearch.dmg'), 'mac')
     const partial = execFileSync(process.execPath, ['scripts/canary-manifest.mjs', join(dir, 'partial'), '0.2.21', 'canary-20261027.2', 'a'.repeat(40), ancestry], { encoding: 'utf8' })
     assert.deepEqual(Object.keys(JSON.parse(partial).assets), ['macos'])
-    const sharedName = 'canary-20261027.2--OpenResearch.dmg'
-    writeFileSync(join(dir, 'partial', sharedName), 'shared')
-    const shared = execFileSync(process.execPath, ['scripts/canary-manifest.mjs', join(dir, 'partial'), '0.2.21', 'canary-20261027.2', 'a'.repeat(40), ancestry, 'shared'], { encoding: 'utf8' })
-    assert.deepEqual(JSON.parse(shared).assets.macos, { asset: sharedName, sha256: createHash('sha256').update('shared').digest('hex') })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

@@ -41,7 +41,7 @@ use crate::local::chat::{
 };
 use crate::local::native_store::{self, NativeStore};
 use crate::local::opencode::{ensure_playbook, PLAYBOOK_REL};
-use crate::local::shell_env::{find_in_dir, find_on_path};
+use crate::local::shell_env::installs;
 
 const CURSOR_REINSTALL: &str = "Reinstall it from cursor.com/install";
 const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,20 +75,24 @@ impl Cursor {
             // scan itself costs seconds under load, so the pick the snapshot
             // pass remembered is tried before `cursor_candidates()` runs.
             let mut candidates: Option<Vec<PathBuf>> = None;
-            let shim_pick = super::detect::remembered_bin("cursor")
-                .and_then(|b| bundled_launch(&b).map(|l| (b, l)))
-                .or_else(|| {
-                    let discovered = cursor_candidates();
-                    let pick = super::detect::selected_bin("cursor", discovered.clone())
-                        .and_then(|b| bundled_launch(&b).map(|l| (b, l)))
-                        .or_else(|| {
-                            discovered
-                                .iter()
-                                .find_map(|c| bundled_launch(c).map(|l| (c.clone(), l)))
-                        });
-                    candidates = Some(discovered);
-                    pick
-                });
+            let shim_pick = if super::managed::installed("cursor").is_some() {
+                None
+            } else {
+                super::detect::remembered_bin("cursor")
+                    .and_then(|b| bundled_launch(&b).map(|l| (b, l)))
+                    .or_else(|| {
+                        let discovered = cursor_candidates();
+                        let pick = super::detect::selected_bin("cursor", discovered.clone())
+                            .and_then(|b| bundled_launch(&b).map(|l| (b, l)))
+                            .or_else(|| {
+                                discovered
+                                    .iter()
+                                    .find_map(|c| bundled_launch(c).map(|l| (c.clone(), l)))
+                            });
+                        candidates = Some(discovered);
+                        pick
+                    })
+            };
             let (selected, probes) = match shim_pick {
                 Some((bin, launch)) => {
                     super::detect::remember_selected("cursor", &bin);
@@ -124,14 +128,23 @@ impl Cursor {
         info.agent_ready = info.ready();
         if info.agent_ready {
             if models.is_none() && !snapshot {
-                info.agent_note = Some("Could not load Cursor models. Re-check this harness or update Cursor; the CLI default model is still available.".to_string());
+                info.agent_note = Some(
+                    "Could not load Cursor models. Re-check this agent or update Cursor."
+                        .to_string(),
+                );
             }
-            info = info.with_models(models.unwrap_or_default());
+            let (models, default) = models.unwrap_or_default();
+            info.configured_model =
+                read_json(native_store::cursor_home(NativeStore::Legacy).join("cli-config.json"))
+                    .as_ref()
+                    .and_then(cursor_configured_model)
+                    .or(default);
+            info = info.with_models(models);
         } else if info.install_broken {
             info.agent_note = Some(info.broken_note(CURSOR_REINSTALL));
         } else if info.installed {
             info.agent_note =
-                Some("Sign in with `agent login`, then re-check this harness.".to_string());
+                Some("Sign in with `agent login`, then re-check this agent.".to_string());
         } else {
             info.agent_note = Some(
                 "Install Cursor CLI with `curl https://cursor.com/install -fsS | bash`, then sign in with `agent login`."
@@ -243,28 +256,18 @@ impl Harness for Cursor {
     }
 }
 
-/// `cursor-agent` on PATH, then an `agent` binary that is actually Cursor, then
-/// the platform's installer drop locations, in preference order. `agent` is a
-/// generic name, so a hit is only accepted when the path (or the symlink it
-/// resolves to) names Cursor.
-fn cursor_candidates() -> Vec<PathBuf> {
-    let drop_dirs: Vec<PathBuf> = dirs::home_dir()
-        .map(|home| home.join(".local").join("bin"))
-        .into_iter()
-        .chain(
-            cfg!(windows)
-                .then(dirs::data_local_dir)
-                .flatten()
-                .map(|dir| dir.join("cursor-agent")),
-        )
-        .collect();
-    let mut cursor_agents: Vec<PathBuf> = find_on_path("cursor-agent").into_iter().collect();
-    let mut agents: Vec<PathBuf> = Vec::new();
-    for dir in drop_dirs {
-        cursor_agents.extend(find_in_dir(&dir, "cursor-agent"));
-        agents.extend(find_in_dir(&dir, "agent"));
-    }
-    agents.extend(find_on_path("agent"));
+/// Every `cursor-agent` install, then every `agent` that is actually Cursor, in
+/// preference order. `agent` is a generic name, so a hit is only accepted when
+/// the path (or the symlink it resolves to) names Cursor.
+pub(crate) fn cursor_candidates() -> Vec<PathBuf> {
+    let own = || {
+        cfg!(windows)
+            .then(crate::config::data_local_dir)
+            .flatten()
+            .map(|dir| dir.join("cursor-agent"))
+    };
+    let cursor_agents = installs("cursor-agent", own());
+    let agents = installs("agent", own());
     // `agent` is the installer's alias binary in the same directory — where a
     // `cursor-agent` sibling exists, probing both doubles the sweep.
     let canon = |dir: &Path| crate::paths::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -391,17 +394,17 @@ fn version_dir_key(name: &str) -> Option<(u64, u64)> {
 /// dominant probe cost) and `CURSOR_INVOKED_AS`.
 fn cursor_command(bin: &Path) -> Command {
     if let Some(launch) = bundled_launch(bin) {
-        let mut cmd = Command::new(launch.node);
+        let mut cmd = crate::process::tokio_command(launch.node);
         cmd.arg(launch.index);
         if let Some(name) = bin.file_name() {
             cmd.env("CURSOR_INVOKED_AS", name);
         }
-        if let Some(local) = dirs::data_local_dir() {
+        if let Some(local) = crate::config::data_local_dir() {
             cmd.env("NODE_COMPILE_CACHE", local.join("cursor-compile-cache"));
         }
         return cmd;
     }
-    Command::new(bin)
+    crate::process::tokio_command(bin)
 }
 
 /// The `status` payload's login verdict, in either shape the CLI reports.
@@ -465,7 +468,9 @@ async fn cursor_command_json(bin: &Path, args: &[&str]) -> Option<Value> {
 /// Without one, `status` is the auth oracle and `models` only runs on a
 /// logged-in verdict — racing it would spend a spawn the other harnesses'
 /// probes need the CPU for.
-async fn cursor_spec_probes(bin: PathBuf) -> (Option<Value>, Option<Vec<ModelInfo>>) {
+async fn cursor_spec_probes(
+    bin: PathBuf,
+) -> (Option<Value>, Option<(Vec<ModelInfo>, Option<String>)>) {
     let status_probe = || {
         super::detect::timed_probe(
             "cursor",
@@ -489,7 +494,35 @@ async fn cursor_spec_probes(bin: PathBuf) -> (Option<Value>, Option<Vec<ModelInf
     (status, models)
 }
 
-async fn cursor_model_list(bin: PathBuf) -> Option<Vec<ModelInfo>> {
+fn cursor_configured_model(config: &Value) -> Option<String> {
+    config["model"]["displayModelId"]
+        .as_str()
+        .filter(|model| super::concrete_model(model))
+        .or_else(|| {
+            config["model"]["modelId"]
+                .as_str()
+                .filter(|model| super::concrete_model(model))
+        })
+        .map(str::to_owned)
+}
+
+#[test]
+fn selected_cursor_config_model_preserves_custom_and_auto_ids() {
+    for id in ["auto", "claude-opus-5-5-high", "custom-route"] {
+        assert_eq!(
+            cursor_configured_model(&serde_json::json!({"model":{"modelId":"provider-model","displayModelId":id,"displayName":"Selected"}}))
+                .as_deref(),
+            Some(id)
+        );
+    }
+    assert_eq!(
+        cursor_configured_model(&serde_json::json!({"model":{"modelId":"auto"}})).as_deref(),
+        Some("auto")
+    );
+    assert_eq!(cursor_configured_model(&serde_json::json!({})), None);
+}
+
+async fn cursor_model_list(bin: PathBuf) -> Option<(Vec<ModelInfo>, Option<String>)> {
     let mut cmd = cursor_command(&bin);
     cmd.args(["models"])
         .stdin(Stdio::null())
@@ -506,7 +539,14 @@ async fn cursor_model_list(bin: PathBuf) -> Option<Vec<ModelInfo>> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let parsed = parse_cursor_model_list(&text);
-    (!parsed.is_empty()).then_some(parsed)
+    let default = text.lines().find_map(|line| {
+        let (id, label) = line.trim().split_once(" - ")?;
+        (label.ends_with(" (current, default)")
+            || label.ends_with(" (current)")
+            || label.ends_with(" (default)"))
+        .then(|| id.to_string())
+    });
+    (!parsed.is_empty()).then_some((parsed, default))
 }
 
 // `agent models` lists `id - display name`, followed by a usage tip.
@@ -573,7 +613,7 @@ fn cursor_exit_detail(status: std::process::ExitStatus, log: &Path) -> String {
 
 async fn cursor_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     let message = format!("{}\n\n{}", request.system, request.prompt);
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::process::tokio_command(bin);
     cmd.args([
         "--print",
         "--output-format",
@@ -672,7 +712,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         .filter(|_| native_session.is_some());
     let mut prompt = ctx.text.clone();
     if ctx.native_session_id.is_some() && resume.is_none() {
-        if let Some(recovery) = super::native_recovery_context(ctx, "Cursor") {
+        if let Some(recovery) = super::native_recovery_context(ctx, "Cursor")? {
             prompt = format!("{recovery}\n\n{prompt}");
         }
     }
@@ -680,7 +720,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         prompt = first_turn_prompt(&prompt);
     }
 
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::process::tokio_command(&bin);
     cmd.args([
         "--print",
         "--output-format",
@@ -723,7 +763,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         cmd.env("CURSOR_DATA_DIR", &cursor_home);
     }
     cmd.env("NO_COLOR", "1");
-    set_chat_session_env(&mut cmd, &ctx.session_id, "cursor", ctx.host.up_port());
+    set_chat_session_env(&mut cmd, &ctx.session_id, "cursor", ctx.host.up_port())?;
 
     ctx.persist_delivery(DeliveryState::Unknown)?;
     let mut child = match cmd.spawn() {
@@ -739,7 +779,14 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let mut state = TurnState::default();
 
     loop {
-        match tokio::time::timeout(TURN_WATCHDOG, lines.next_line()).await {
+        let next = tokio::select! {
+            next = tokio::time::timeout(TURN_WATCHDOG, lines.next_line()) => next,
+            _ = ctx.flush_due() => {
+                let _ = ctx.flush();
+                continue;
+            }
+        };
+        match next {
             Ok(Ok(Some(line))) => {
                 let Ok(event) = serde_json::from_str::<Value>(&line) else {
                     continue;
@@ -1005,6 +1052,7 @@ fn apply_tool_call(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
                 prompt: None,
                 phase: None,
                 children: Vec::new(),
+                orx: None,
             });
         }
         "completed" => {
@@ -1037,6 +1085,7 @@ fn apply_tool_call(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) {
                     prompt: None,
                     phase: None,
                     children: Vec::new(),
+                    orx: None,
                 });
             }
         }
@@ -1198,9 +1247,9 @@ mod tests {
                 ),
             )
             .unwrap();
-            Command::new(launcher)
+            crate::process::tokio_command(launcher)
         } else {
-            Command::new("cat")
+            crate::process::tokio_command("cat")
         };
         let prompt = "First line\nSecond line: \"quoted\" & 100% é\n";
         let mut child = command
@@ -1222,11 +1271,11 @@ mod tests {
     #[tokio::test]
     async fn early_exit_keeps_the_child_status_instead_of_a_broken_pipe_error() {
         let mut command = if cfg!(windows) {
-            let mut command = Command::new("cmd.exe");
+            let mut command = crate::process::tokio_command("cmd.exe");
             command.args(["/C", "exit 23"]);
             command
         } else {
-            let mut command = Command::new("sh");
+            let mut command = crate::process::tokio_command("sh");
             command.args(["-c", "exit 23"]);
             command
         };
@@ -1560,6 +1609,7 @@ ActionRequiredError: Named models unavailable Free plans can only use Auto. Swit
                     note: None,
                     resume_mode: None,
                     annotations: Vec::new(),
+                    from: None,
                 },
             )
             .await
@@ -1588,6 +1638,7 @@ ActionRequiredError: Named models unavailable Free plans can only use Auto. Swit
                     note: None,
                     resume_mode: None,
                     annotations: Vec::new(),
+                    from: None,
                 },
             )
             .await

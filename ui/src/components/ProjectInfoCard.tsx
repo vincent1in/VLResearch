@@ -1,16 +1,23 @@
-import { showCustomDialog, type DialogContentProps } from "../dialog";
+import { useContext, useId, useRef, useState, type RefObject } from "react";
+import { WorkspaceDomContext } from "../WorkspaceDom";
+import { useQuery } from "@tanstack/react-query";
+import { useWorkspace } from "../workspace";
+import { mutDeleteProject, mutUpdateProject } from "../queries/projects";
+import { type DialogContentProps } from "../dialog";
 import { useFileManagerLabel } from "./useFileManagerLabel";
-import { useId, useRef, useState, type RefObject } from "react";
+
 import { Menu } from "@base-ui/react/menu";
 import { DirectionProvider } from "@base-ui/react/direction-provider";
-import { Folder, FolderOpen, MessageCircle, MoreHorizontal, Pin, Plus, Settings, Trash2, X } from "lucide-react";
-import { deleteProject, revealFileInManager, updateProject, type Project } from "../api";
+import { Folder, FolderOpen, MessageCircle, MoreHorizontal, Pin, Plus, Settings, Share2, Trash2, X } from "lucide-react";
+import { type Project } from "../api";
+import { downloadFile } from "../download";
 import { m } from "../paraglide/messages.js";
+import { ShareProjectDialog, showShareExclusions } from "./ShareProjectDialog";
 import { Button, DialogContent, DialogTitle, Spinner, IconButton, Input, MenuItem, Tooltip, showAlert } from "./ui";
 
 function deleteExplanation(project: Project) {
   const synced = project.githubEnabled && (project.githubUrl || (project.githubOwner && project.githubRepo));
-  return `${m.projects_delete_from_app({ name: project.name })}\n\n${synced ? m.projects_home_local_and_github_kept() : m.projects_home_local_folder_kept()}`;
+  return `${m.projects_delete_from_app({ name: project.name })}\n\n${m.delete_pending_stop_warning()}\n\n${synced ? m.projects_home_local_and_github_kept() : m.projects_home_local_folder_kept()}`;
 }
 
 export function ProjectInfoCard({ project, chatCount, collapsed, busy, onToggleCollapsed, onRemoved, onNewChat, pinned, onPin }: {
@@ -24,7 +31,15 @@ export function ProjectInfoCard({ project, chatCount, collapsed, busy, onToggleC
   pinned: boolean;
   onPin: () => void;
 }) {
+  const { portalContainer } = useContext(WorkspaceDomContext);
+
+  const { showCustomDialog } = useWorkspace().dialogs;
+
+  const workspace = useWorkspace();
+  const { api: { revealFileInManager, shareProject }, queries: { getRuntimeQuery } } = workspace;
+
   const revealLabel = useFileManagerLabel();
+  const remote = useQuery(getRuntimeQuery()).data?.kind === "ssh";
   const [menuOpen, setMenuOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -35,7 +50,7 @@ export function ProjectInfoCard({ project, chatCount, collapsed, busy, onToggleC
       props: { project, returnFocus: triggerRef },
       onCancel: "close",
       onConfirm: async (deleteArtifacts) => {
-        const artifactsError = await deleteProject(project.id, deleteArtifacts);
+        const artifactsError = await mutDeleteProject.runAsHeadlessPromise(workspace, project.id, deleteArtifacts, {});
         onRemoved();
         if (artifactsError) showAlert(artifactsError, "error");
       },
@@ -52,7 +67,7 @@ export function ProjectInfoCard({ project, chatCount, collapsed, busy, onToggleC
       <Menu.Root open={menuOpen} onOpenChange={setMenuOpen} modal={false}>
         <Menu.Trigger ref={triggerRef} render={<IconButton size="small" className={`text-text group-hover:opacity-100 group-focus-within:opacity-100 ${menuOpen ? "bg-surface opacity-100" : "opacity-0"}`} />}
           aria-label={m.sidebar_project_details({ name: project.name })}><MoreHorizontal size={16} /></Menu.Trigger>
-        <Menu.Portal>
+        <Menu.Portal container={portalContainer}>
           <Menu.Positioner sticky positionMethod="fixed" side="inline-end" align="start" sideOffset={12} collisionPadding={8} className="z-100">
             <Menu.Popup aria-label={project.name}
               className="outline-none w-72 max-w-[calc(100vw-1rem)] max-h-(--available-height) overflow-y-auto rounded-xl border border-border bg-background p-2 text-text shadow-modal">
@@ -68,9 +83,22 @@ export function ProjectInfoCard({ project, chatCount, collapsed, busy, onToggleC
                   component: EditProjectDialog,
                   props: { project, onDelete: remove, returnFocus: triggerRef },
                   onCancel: "close",
-                  onConfirm: async (name) => { await updateProject(project.id, { name }); },
+                  onConfirm: async (name) => { await mutUpdateProject.runAsHeadlessPromise(workspace, project.id, { name }, {}); },
                 });
               }}><span className="flex items-center gap-2"><Settings size={16} />{m.activity_edit()}</span></Menu.Item>
+              <Menu.Item nativeButton render={<MenuItem className="data-highlighted:bg-surface" />} onClick={() => {
+                setMenuOpen(false);
+                showCustomDialog({
+                  component: ShareProjectDialog,
+                  props: { project, remote, returnFocus: triggerRef },
+                  onCancel: "close",
+                  onConfirm: async (choice) => {
+                    const { file, fileName, skipped } = await shareProject(project.id, choice);
+                    downloadFile(fileName, file);
+                    showShareExclusions(skipped.length);
+                  },
+                });
+              }}><span className="flex items-center gap-2"><Share2 size={16} />{m.share_project()}</span></Menu.Item>
               <Menu.Item nativeButton render={<MenuItem className="data-highlighted:bg-surface" />} onClick={() => {
                 void revealFileInManager(project.id, ".").catch((err: unknown) => showAlert(err instanceof Error ? err.message : String(err), "error"));
               }}><span className="flex items-center gap-2"><FolderOpen size={16} />{revealLabel}</span></Menu.Item>

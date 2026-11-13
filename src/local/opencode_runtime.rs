@@ -82,11 +82,32 @@ impl ProbeEnvironment {
     }
 }
 
+/// The user's opencode, unless orx's own copy is newer.
+pub(crate) async fn resolve_binary() -> Result<ResolvedBinary> {
+    let user = user_binary().await;
+    let major = user.as_ref().ok().map(|binary| binary.protocol.major());
+    let Some((path, version)) =
+        crate::local::harness::managed::installed_for_major("opencode", major)
+    else {
+        return user;
+    };
+    let current = user.as_ref().is_ok_and(|binary| {
+        crate::local::harness::managed::parse(&binary.version).is_some_and(|own| own >= version)
+    });
+    if current {
+        return user;
+    }
+    match resolve_binary_at(path).await {
+        Ok(binary) => Ok(binary),
+        Err(error) => user.or(Err(error)),
+    }
+}
+
 /// First opencode that resolves, in discovery order — picking the highest
 /// version instead would move a pinned 1.x install onto the 2.x protocol.
 /// The `--version` probes run in parallel (a cold node start can take
 /// seconds); only the pick stays discovery-ordered.
-pub(crate) async fn resolve_binary() -> Result<ResolvedBinary> {
+pub(crate) async fn user_binary() -> Result<ResolvedBinary> {
     let candidates = super::opencode_candidates();
     let results = futures::future::join_all(candidates.into_iter().map(resolve_binary_at)).await;
     let mut first_error = None;
@@ -112,7 +133,7 @@ pub(crate) async fn resolve_binary_at(path: PathBuf) -> Result<ResolvedBinary> {
     }
     let metadata = std::fs::metadata(&path)?;
     let probe = ProbeEnvironment::new()?;
-    let mut cmd = Command::new(&path);
+    let mut cmd = crate::process::tokio_command(&path);
     crate::local::chat::prepare_env(&mut cmd);
     probe.configure(&mut cmd);
     cmd.arg("--version");
@@ -428,8 +449,8 @@ async fn prepare_database_waiting(
             backup.display()
         ));
     }
-    let mut cmd = Command::new(&binary.path);
-    crate::local::local_models::prepare_env(&mut cmd, None)?;
+    let mut cmd = crate::process::tokio_command(&binary.path);
+    crate::local::local_models::prepare_env(&mut cmd, None, binary.protocol)?;
     cmd.current_dir(
         lease
             .path()
@@ -662,7 +683,7 @@ mod tests {
         assert!(protocol_for_version("0.0.0-next-unknown").is_err());
         assert!(protocol_for_version("3.0.0").is_err());
         let probe = ProbeEnvironment::new().unwrap();
-        let mut cmd = Command::new("opencode");
+        let mut cmd = crate::process::tokio_command(std::env::temp_dir().join("opencode"));
         cmd.env("OPENCODE_DB", "/do-not-open/user.db");
         probe.configure(&mut cmd);
         let env: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();

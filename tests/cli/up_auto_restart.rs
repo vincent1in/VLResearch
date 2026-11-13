@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -8,6 +7,7 @@ use std::time::{Duration, Instant};
 struct Sandbox(PathBuf);
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        orx_test_support::stop_server(&self.0.join("data"));
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -39,14 +39,13 @@ fn idle_orx_up_relaunches_into_an_installed_update() {
         .unwrap()
         .port();
 
-    let mut up = Command::new(&orx)
+    let mut up = crate::home::isolate_home(&mut Command::new(&orx), &root)
         .args(["--no-telemetry", "up", "--no-browser", "--port"])
         .arg(port.to_string())
-        .env("HOME", &root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("share"))
         .env("ORX_DATA_DIR", root.join("data"))
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", orx_test_support::agentless_path(&root))
         .env("GITHUB_TOKEN", "")
         // Keep the startup release check off the network.
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
@@ -66,15 +65,15 @@ fn idle_orx_up_relaunches_into_an_installed_update() {
     // What the installer does: rename a newer orx over the running one, then record it.
     let marker = root.join("relaunched");
     let next = bin.join("orx.next");
-    std::fs::write(
+    orx_test_support::write_executable(
         &next,
         format!(
             "#!/bin/sh\n[ \"$1\" = --version ] && echo 'orx 99.0.0' && exit 0\necho \"$@\" > '{}'\n",
             marker.display()
         ),
+        0o755,
     )
     .unwrap();
-    std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::rename(&next, &orx).unwrap();
     let config = root.join("config/openresearch");
     std::fs::create_dir_all(&config).unwrap();
@@ -89,7 +88,9 @@ fn idle_orx_up_relaunches_into_an_installed_update() {
     }
     std::fs::write(config.join("update-check-unknown.json"), cache.to_string()).unwrap();
 
-    let relaunched = wait_for(Duration::from_secs(45), || marker.exists());
+    // Startup, the 10 s update sample, shutdown and the relaunched process's first instructions
+    // all wait for CPU, which a loaded machine rations.
+    let relaunched = wait_for(Duration::from_secs(120), || marker.exists());
     let _ = up.kill();
     let _ = up.wait();
     assert!(serving, "orx up never started serving");

@@ -1,23 +1,29 @@
+import { useWorkspace } from "../workspace";
 import { EscapeScope } from "./EscapeScope";
-import { type ChatSession, type Experiment, type Run, runDisplayStatus, fmtNumber, timeAgo } from "../api";
+import { type ChatSession, type Experiment, type Run, fmtNumber, timeAgo } from "../api";
+import { runDisplay } from "../runDisplay";
 import { activeWorkspaceRuns } from "../workspaceRuns";
 import { statusLabel } from "./StatusBadge";
-import { getComputeSettingsQuery } from "../queries/settings";
+
 import { TARGET_LABELS } from "../computeTargets";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { FlaskConical, FolderOpen, Package, GitBranch, Cpu, MessagesSquare, Plus, Terminal, ChevronDown } from "lucide-react";
+import { ChevronDown, ChevronRight, FlaskConical, HelpCircle, FolderOpen, Package, GitBranch, Cpu, MessagesSquare, Plus, Search, Terminal } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { getSessionWorktreeQuery } from "../queries/files";
+
 import { countChanges, parseDiffFiles } from "./GitDiff";
 import { m } from "../paraglide/messages.js";
 import { BackendLogo } from "./BackendLogos";
+import { HarnessLogo } from "./HarnessLogo";
+import { delegateStatusLabel } from "./DelegateCard";
+import { delegateLineage, delegateModelLabel, delegateStatus } from "../delegates";
+import { useModelName } from "./pickerAgents";
 import { IconButton, MenuItem, StatusIndicator, Spinner, Tooltip } from "./ui";
 import { usePopover } from "./ModelPicker";
 import { formatForDisplay } from "@tanstack/react-hotkeys";
 import { appHotkeys } from "../hotkeys";
 import { navigateKeyboardList, navigateKeyboardRow } from "../keyboardNavigation";
 
-export function WorkspaceTools({ expanded, experiments, runs, onOpenExperiment, rightOffset, activeView, projectId, onCompute, sessionId, busy, onChanges, onFiles, onTerminal, onArtifacts, onExperiments, onSideChat, sessions, onSelectSideChat }: {
+export function WorkspaceTools({ expanded, experiments, runs, onOpenExperiment, rightOffset, activeView, projectId, onCompute, sessionId, busy, onChanges, onFiles, onTerminal, findOpen, onFind, onArtifacts, onExperiments, onSideChat, sessions, onSelectSideChat, onOpenDelegate }: {
   expanded: boolean;
   experiments: Experiment[];
   runs: Run[];
@@ -31,31 +37,38 @@ export function WorkspaceTools({ expanded, experiments, runs, onOpenExperiment, 
   onChanges: () => void;
   onFiles: () => void;
   onTerminal: () => void;
+  findOpen: boolean;
+  onFind: () => void;
   onArtifacts: () => void;
   onExperiments: () => void;
   /** Absent until there is a chat to branch from. */
   onSideChat?: () => void;
   sessions: ChatSession[];
   onSelectSideChat: (sessionId: string) => void;
+  onOpenDelegate: (sessionId: string) => void;
 }) {
+  const { getComputeSettingsQuery } = useWorkspace().queries;
+
   const experimentRows = activeWorkspaceRuns(experiments, runs, sessionId);
   const compute = useQuery({ ...getComputeSettingsQuery(projectId), enabled: expanded });
   const defaultBackend = compute.data?.configuredDefaultBackend ?? compute.data?.defaultBackend;
   const computeLabel = defaultBackend ? TARGET_LABELS[defaultBackend]() : compute.isPending ? "…" : compute.isError ? m.model_picker_unavailable() : m.settings_not_set();
   const items = [
+    { id: "search", label: m.chat_search_title(), Icon: Search, onClick: onFind, shortcut: appHotkeys["chat.find"].hotkey },
     { id: "files", label: m.app_files(), Icon: FolderOpen, onClick: onFiles, shortcut: appHotkeys["files.open"].hotkey },
     { id: "artifacts", label: m.app_artifacts(), Icon: Package, onClick: onArtifacts, shortcut: appHotkeys["artifacts.open"].hotkey },
     { id: "experiments", label: m.app_experiments(), Icon: FlaskConical, onClick: onExperiments, shortcut: appHotkeys["experiments.open"].hotkey },
     { id: "terminal", label: m.workspace_terminal(), Icon: Terminal, onClick: onTerminal, shortcut: appHotkeys["terminal.open"].hotkey },
   ].map((item) => ({
     ...item,
+    pressed: item.id === "search" ? findOpen : activeView === item.id,
     ariaShortcut: typeof item.shortcut === "string" ? `${item.shortcut.replace("Mod+", "Meta+")} ${item.shortcut.replace("Mod+", "Control+")}` : undefined,
   }));
   return (
     <>
     <nav aria-label={m.workspace_tools_heading()} className="workspace-mobile-nav hidden">
-      {items.map(({ id, label, Icon, onClick }) => (
-        <button key={id} type="button" aria-pressed={activeView === id} onClick={onClick}>
+      {items.map(({ id, label, Icon, onClick, pressed }) => (
+        <button key={id} type="button" aria-pressed={pressed} onClick={onClick}>
           <Icon size={20} aria-hidden="true" />
           <span>{label}</span>
         </button>
@@ -65,8 +78,8 @@ export function WorkspaceTools({ expanded, experiments, runs, onOpenExperiment, 
     <div className="workspace-tools absolute end-3.5 top-2 mac-titlebar:top-1.5 z-30" style={{ insetInlineEnd: rightOffset }}>
       {!expanded ? (
         <nav aria-label={m.workspace_tools_heading()} onKeyDown={navigateKeyboardRow} className="flex items-center justify-end gap-1">
-          {items.map(({ id, label, Icon, onClick, shortcut, ariaShortcut }) => (
-            <IconButton key={id} data-keyboard-horizontal-item active={activeView === id} className="text-text" data-tip={shortcut ? `${label} (${formatForDisplay(shortcut)})` : label} data-tip-align={id === "terminal" ? "end" : undefined} aria-label={label} aria-keyshortcuts={ariaShortcut} aria-pressed={activeView === id} onClick={onClick}>
+          {items.map(({ id, label, Icon, onClick, shortcut, ariaShortcut, pressed }) => (
+            <IconButton key={id} data-keyboard-horizontal-item active={pressed} className="text-text" data-tip={shortcut ? `${label} (${formatForDisplay(shortcut)})` : label} data-tip-align={id === "terminal" ? "end" : undefined} aria-label={label} aria-keyshortcuts={ariaShortcut} aria-pressed={pressed} onClick={onClick}>
               <Icon size={16} />
             </IconButton>
           ))}
@@ -105,17 +118,21 @@ export function WorkspaceTools({ expanded, experiments, runs, onOpenExperiment, 
               <SideChatPicker parentId={sessionId} sessions={sessions} onSelect={onSelectSideChat} onCreate={onSideChat} expanded />
             )}
             {sessionId && <ChatBranch key={sessionId} sessionId={sessionId} busy={busy} onChanges={onChanges} />}
+            {sessionId && <SubagentLineage sessions={sessions} sessionId={sessionId} onOpen={onOpenDelegate} />}
             {experimentRows.length > 0 && (
               <div>
                 <h2 className="m-0 flex items-center gap-4 px-2 py-1 text-sm font-normal text-text">
                   <span className="flex w-[15px] shrink-0 justify-center"><StatusIndicator tone="success" live /></span>
                   <span>{m.workspace_active_experiments()}</span>
                 </h2>
-                {experimentRows.map((row) => (
-                  <MenuItem key={row.run.id} data-keyboard-item className="min-h-7 py-1" onClick={() => onOpenExperiment(row.experiment.id, row.run.id)}>
-                    <span className="min-w-0 truncate ps-8 text-menu text-subtext" title={`${row.experiment.title || row.experiment.slug} · ${statusLabel(runDisplayStatus(row.run))}`}>{row.experiment.title || row.experiment.slug}</span>
-                  </MenuItem>
-                ))}
+                {experimentRows.map((row) => {
+                  const display = runDisplay(row.run);
+                  return (
+                    <MenuItem key={row.run.id} data-keyboard-item className="min-h-7 py-1" onClick={() => onOpenExperiment(row.experiment.id, row.run.id)}>
+                      <span className="min-w-0 truncate ps-8 text-menu text-subtext" title={`${row.experiment.title || row.experiment.slug} · ${statusLabel(display.status, display.stopping)}`}>{row.experiment.title || row.experiment.slug}</span>
+                    </MenuItem>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -134,7 +151,7 @@ function SideChatPicker({ parentId, sessions, onSelect, onCreate, expanded = fal
   onSelect: (sessionId: string) => void;
   onCreate: () => void;
 }) {
-  const children = sessions.filter((session) => session.sideParentSessionId === parentId)
+  const children = sessions.filter((session) => session.sideParentSessionId === parentId && !session.delegate)
     .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -261,7 +278,7 @@ function SideChatPicker({ parentId, sessions, onSelect, onCreate, expanded = fal
                 {visible.map((session) => {
                   const title = session.title?.trim() || m.side_chat_untitled();
                   return (
-                    <Tooltip key={session.id} interactive content={title} className="w-full cursor-default">
+                    <Tooltip key={session.id} interactive content={title} side={expanded ? "start" : "top"} className="w-full cursor-default">
                       <MenuItem type="button" data-side-chat-result onClick={() => { closePicker(); onSelect(session.id); }}>
                         <span className="flex min-w-0 items-center gap-2">
                           {session.busy ? <Spinner /> : <MessagesSquare size={14} className="shrink-0" />}
@@ -286,7 +303,53 @@ function SideChatPicker({ parentId, sessions, onSelect, onCreate, expanded = fal
   );
 }
 
+/** The chats this one delegated to: running ones listed, finished ones folded behind a count. */
+function SubagentLineage({ sessions, sessionId, onOpen }: { sessions: ChatSession[]; sessionId: string; onOpen: (sessionId: string) => void }) {
+  const [showFinished, setShowFinished] = useState(false);
+  const modelName = useModelName();
+  const lineage = delegateLineage(sessions, sessionId);
+  if (lineage.length === 0) return null;
+  const ended = (session: ChatSession) => ["finished", "failed", "stopped"].includes(delegateStatus(session, sessions));
+  const running = lineage.filter(({ session }) => !ended(session));
+  const finished = lineage.filter(({ session }) => ended(session));
+  const failed = finished.filter(({ session }) => delegateStatus(session, sessions) === "failed").length;
+  const row = ({ session, level }: { session: ChatSession; level: number }) => {
+    const title = session.title?.trim() || delegateModelLabel(session, modelName);
+    const status = delegateStatus(session, sessions);
+    return (
+      <MenuItem key={session.id} data-keyboard-item className="min-h-7 py-1" onClick={() => onOpen(session.id)}>
+        <span className="flex min-w-0 items-center gap-2" style={{ paddingInlineStart: `${0.75 * level + 1.25}rem` }}>
+          <HarnessLogo harness={session.harness} size={12} />
+          <span className="min-w-0 truncate text-menu text-subtext" title={`${title} · ${delegateStatusLabel(status)}`}>{title}</span>
+          {(status === "asking" || status === "approval") && <HelpCircle size={12} className="shrink-0 text-accent-amber" aria-label={delegateStatusLabel(status)} />}
+        </span>
+      </MenuItem>
+    );
+  };
+  return (
+    <div>
+      <h2 className="m-0 flex items-center gap-4 px-2 py-1 text-sm font-normal text-text">
+        <span className="flex w-[15px] shrink-0 justify-center"><StatusIndicator tone={running.length ? "success" : "neutral"} live={running.length > 0} /></span>
+        <span>{m.subagents_heading()}</span>
+      </h2>
+      {running.map(row)}
+      {finished.length > 0 && (
+        <MenuItem data-keyboard-item className="min-h-7 py-1" aria-expanded={showFinished} onClick={() => setShowFinished((value) => !value)}>
+          <span className="flex min-w-0 items-center gap-1.5 ps-8 text-menu text-subtext">
+            <ChevronRight size={12} className={`shrink-0 transition-transform duration-200 ease-standard motion-reduce:transition-none ${showFinished ? "rotate-90" : ""}`} />
+            <span>{m.subagents_finished({ count: fmtNumber(finished.length) })}</span>
+            {failed > 0 && <span className="text-accent-red">· {m.subagents_failed({ count: fmtNumber(failed) })}</span>}
+          </span>
+        </MenuItem>
+      )}
+      {showFinished && finished.map(row)}
+    </div>
+  );
+}
+
 function ChatBranch({ sessionId, busy, onChanges }: { sessionId: string; busy: boolean; onChanges: () => void }) {
+  const { getSessionWorktreeQuery } = useWorkspace().queries;
+
   const worktree = useQuery({ ...getSessionWorktreeQuery(sessionId), refetchInterval: busy ? 5_000 : false });
   const wasBusy = useRef(busy);
   const { refetch } = worktree;

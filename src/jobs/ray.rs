@@ -26,6 +26,9 @@ pub struct RaySettings {
     /// `resolve_address`.
     #[serde(default)]
     pub address: Option<String>,
+    /// Fields from a newer orx, kept across this version's saves.
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -92,7 +95,7 @@ pub fn resolve_address_with_source() -> (String, AddressSource) {
 
 // --- flavor → resources -----------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RayResources {
     pub cpus: f64,
     pub gpus: f64,
@@ -215,6 +218,11 @@ async fn check(res: reqwest::Response, what: &str) -> Result<reqwest::Response> 
     if status.is_success() {
         return Ok(res);
     }
+    if matches!(status.as_u16(), 401 | 403) {
+        res.error_for_status_ref().map_err(|error| {
+            anyhow!(error).context(format!("Ray Jobs {what} rejected access (HTTP {status})"))
+        })?;
+    }
     let body = res.text().await.unwrap_or_default();
     Err(anyhow!(
         "Ray Jobs {} failed ({}): {}",
@@ -240,10 +248,12 @@ pub async fn preflight(address: &str) -> Result<Option<String>> {
         .map(|s| s.to_string()))
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct JobSubmission {
     pub entrypoint: String,
     pub submission_id: String,
     pub resources: RayResources,
+    #[serde(default)]
     pub env: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub working_dir: Option<String>,
@@ -254,14 +264,20 @@ pub struct JobInfo {
     /// Shared stage vocabulary (`SCHEDULING` / `RUNNING` / `COMPLETED` / …).
     pub stage: String,
     pub message: Option<String>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawJobStatus {
     #[serde(default)]
+    start_time: Option<i64>,
+    #[serde(default)]
+    end_time: Option<i64>,
+    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    driver_exit_code: Option<i32>,
 }
 
 fn map_ray_status(raw: &str) -> String {
@@ -300,8 +316,24 @@ pub async fn run_job(address: &str, spec: &JobSubmission) -> Result<()> {
         .send()
         .await
         .map_err(|e| anyhow!("Could not reach Ray Jobs at {address}: {e}"))?;
-    check(res, "job submit").await?;
-    Ok(())
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = res.text().await.unwrap_or_default();
+    // Ray answers a reused submission ID with an error, though that job runs.
+    let known = inspect_job(address, &spec.submission_id).await?;
+    if known.stage != "GONE" {
+        return Ok(());
+    }
+    Err(super::Refused {
+        status: Some(status.as_u16()),
+        message: format!(
+            "Ray Jobs at {address} refused the job (HTTP {}): {body}",
+            status.as_u16()
+        ),
+    }
+    .into())
 }
 
 /// Upload a Ray `working_dir` package through the Jobs server. Ray's own SDK
@@ -337,6 +369,13 @@ pub async fn stage_working_dir(
 }
 
 pub async fn inspect_job(address: &str, submission_id: &str) -> Result<JobInfo> {
+    Ok(inspect_job_with_times(address, submission_id).await?.0)
+}
+
+pub(crate) async fn inspect_job_with_times(
+    address: &str,
+    submission_id: &str,
+) -> Result<(JobInfo, Option<i64>, Option<i64>)> {
     let res = http()
         .get(format!("{address}/api/jobs/{submission_id}"))
         .send()
@@ -346,17 +385,27 @@ pub async fn inspect_job(address: &str, submission_id: &str) -> Result<JobInfo> 
     // restarted) — a distinct GONE stage for the supervisor to debounce, not
     // a transport error to retry forever.
     if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(JobInfo {
-            stage: "GONE".to_string(),
-            message: None,
-        });
+        return Ok((
+            JobInfo {
+                stage: "GONE".to_string(),
+                message: None,
+                exit_code: None,
+            },
+            None,
+            None,
+        ));
     }
     let raw: RawJobStatus = check(res, "job inspect").await?.json().await?;
     let status = raw.status.unwrap_or_else(|| "PENDING".into());
-    Ok(JobInfo {
-        stage: map_ray_status(&status),
-        message: raw.message,
-    })
+    Ok((
+        JobInfo {
+            stage: map_ray_status(&status),
+            message: raw.message,
+            exit_code: raw.driver_exit_code,
+        },
+        raw.start_time,
+        raw.end_time,
+    ))
 }
 
 pub async fn stop_job(address: &str, submission_id: &str) -> Result<()> {
@@ -365,7 +414,10 @@ pub async fn stop_job(address: &str, submission_id: &str) -> Result<()> {
         .send()
         .await
         .map_err(|e| anyhow!("Could not reach Ray Jobs at {address}: {e}"))?;
-    check(res, "job stop").await?;
+    // A job Ray no longer has needs no stop; its next inspect proves it gone.
+    if res.status() != reqwest::StatusCode::NOT_FOUND {
+        check(res, "job stop").await?;
+    }
     Ok(())
 }
 
@@ -393,10 +445,6 @@ pub async fn fetch_logs(address: &str, submission_id: &str) -> Result<String> {
     } else {
         Ok(res.text().await.unwrap_or_default())
     }
-}
-
-pub fn job_url(address: &str, submission_id: &str) -> String {
-    format!("{address}/#/jobs/{submission_id}")
 }
 
 #[cfg(test)]

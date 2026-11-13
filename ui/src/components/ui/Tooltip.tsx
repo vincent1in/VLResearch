@@ -7,12 +7,15 @@ export function Tooltip({
   className,
   interactive = false,
   disabled = false,
+  side = "top",
 }: {
   content: string;
   children: ReactNode;
   className?: string;
   interactive?: boolean;
   disabled?: boolean;
+  /** `start` opens beside the trigger, toward the reading start, so rows in a list stay visible. */
+  side?: "top" | "start";
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tooltipRef = useRef<HTMLSpanElement>(null);
@@ -25,6 +28,16 @@ export function Tooltip({
     if (!tooltip.matches(":popover-open")) tooltip.showPopover();
     const anchor = trigger.getBoundingClientRect();
     const bounds = tooltip.getBoundingClientRect();
+    if (side === "start") {
+      const rtl = getComputedStyle(trigger).direction === "rtl";
+      const beside = rtl ? anchor.right + 6 : anchor.left - bounds.width - 6;
+      if (beside >= 8 && beside + bounds.width <= window.innerWidth - 8) {
+        const middle = anchor.top + anchor.height / 2 - bounds.height / 2;
+        tooltip.style.left = `${beside}px`;
+        tooltip.style.top = `${Math.max(8, Math.min(middle, window.innerHeight - bounds.height - 8))}px`;
+        return;
+      }
+    }
     const left = Math.max(8, Math.min(anchor.left + anchor.width / 2 - bounds.width / 2, window.innerWidth - bounds.width - 8));
     const above = anchor.top - bounds.height - 6;
     const top = above >= 8 ? above : anchor.bottom + 6;
@@ -46,6 +59,7 @@ export function Tooltip({
     window.addEventListener("scroll", dismiss, true);
     window.addEventListener("resize", dismiss);
     return () => {
+      dismiss();
       window.removeEventListener("scroll", dismiss, true);
       window.removeEventListener("resize", dismiss);
     };
@@ -82,7 +96,7 @@ export function Tooltip({
         ref={tooltipRef}
         popover="manual"
         role="tooltip"
-        className="pointer-events-none fixed inset-auto m-0 w-max max-w-64 whitespace-normal rounded-sm border-0 bg-text px-2 py-1.5 font-sans text-sm font-normal leading-snug text-background shadow-control-subtle"
+        className="pointer-events-none fixed inset-auto m-0 w-max max-w-64 whitespace-pre-line rounded-sm border-0 bg-text px-2 py-1.5 font-sans text-sm font-normal leading-snug text-background shadow-control-subtle"
       >
         {content}
       </span>

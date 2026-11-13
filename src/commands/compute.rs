@@ -250,6 +250,9 @@ pub struct ConfigureArgs {
     partition: Option<String>,
     #[arg(long)]
     account: Option<String>,
+    /// Default `#SBATCH --qos` for Slurm runs.
+    #[arg(long)]
+    qos: Option<String>,
     #[arg(long)]
     time_limit: Option<String>,
     /// Default `#SBATCH --cpus-per-task` for Slurm runs.
@@ -258,6 +261,14 @@ pub struct ConfigureArgs {
     /// Default `#SBATCH --mem` for Slurm runs (64G, 4000M, or megabytes).
     #[arg(long)]
     mem: Option<String>,
+    /// An extra `#SBATCH` option for every Slurm run, such as --sbatch-arg='--rsc p=1:g=1';
+    /// repeat for several. Replaces the saved list.
+    #[arg(long = "sbatch-arg", value_name = "ARG", allow_hyphen_values = true)]
+    sbatch_args: Vec<String>,
+    /// true (the default) writes `#SBATCH --ntasks=1` into every Slurm job; false leaves it out,
+    /// for clusters that refuse it.
+    #[arg(long)]
+    request_one_task: Option<bool>,
     #[arg(long)]
     context: Option<String>,
     #[arg(long)]
@@ -275,9 +286,6 @@ pub struct ConfigureArgs {
 pub struct ConnectArgs {
     #[command(flatten)]
     check: CheckArgs,
-    /// Idle lifetime for a new SSH master, in seconds (default: 86400; 0 means indefinite).
-    #[arg(long)]
-    persist: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -341,11 +349,14 @@ impl ConfigureArgs {
                 "host",
                 "partition",
                 "account",
+                "qos",
                 "timeLimit",
                 "cpusPerTask",
                 "mem",
                 "remoteRoot",
                 "keepRemoteRuns",
+                "sbatchArgs",
+                "requestOneTask",
             ],
             "k8s" => &["context", "namespace"],
             "ray" => &["address"],
@@ -362,6 +373,7 @@ impl ConfigureArgs {
             ("defaultHost", self.default_host),
             ("partition", self.partition),
             ("account", self.account),
+            ("qos", self.qos),
             ("timeLimit", self.time_limit),
             ("mem", self.mem),
             ("context", self.context),
@@ -375,8 +387,14 @@ impl ConfigureArgs {
         if let Some(keep) = self.keep_remote_runs {
             body.insert("keepRemoteRuns".into(), json!(keep));
         }
+        if let Some(one_task) = self.request_one_task {
+            body.insert("requestOneTask".into(), json!(one_task));
+        }
         if let Some(cpus) = self.cpus_per_task {
             body.insert("cpusPerTask".into(), json!(cpus));
+        }
+        if !self.sbatch_args.is_empty() {
+            body.insert("sbatchArgs".into(), json!(self.sbatch_args));
         }
         if let Some(path) = self.credentials_file {
             let credentials: Map<String, Value> = serde_json::from_str(&read_input(&path)?)
@@ -412,6 +430,8 @@ impl ConfigureArgs {
                 "default-host" => "defaultHost",
                 "remote-root" => "remoteRoot",
                 "keep-remote-runs" => "keepRemoteRuns",
+                "sbatch-arg" => "sbatchArgs",
+                "request-one-task" => "requestOneTask",
                 other => other,
             };
             if !allowed.contains(&key)
@@ -431,6 +451,10 @@ impl ConfigureArgs {
                     json!(0)
                 } else if key == "keepRemoteRuns" {
                     json!(false)
+                } else if key == "requestOneTask" {
+                    json!(true)
+                } else if key == "sbatchArgs" {
+                    json!([])
                 } else {
                     json!("")
                 },
@@ -467,23 +491,22 @@ async fn run_command(command: ComputeCommand, json_output: bool) -> Result<()> {
     }
     if let ComputeCommand::Connect(ref args) = command {
         validate_check(&args.check)?;
-        if args.persist.is_some()
-            && (!cfg!(unix) || !matches!(args.check.backend, Backend::Ssh | Backend::Slurm))
-        {
-            return Err(anyhow!("--persist requires SSH or Slurm on Unix."));
-        }
         if json_output {
             return Err(anyhow!(
                 "connect is interactive; use test --json for machine-readable checks."
             ));
         }
-        connect(&args.check, args.persist).await?;
+        if !matches!(args.check.backend, Backend::Ssh | Backend::Slurm) {
+            connect(&args.check).await?;
+        }
     }
     let is_check = matches!(
         command,
         ComputeCommand::Test(_) | ComputeCommand::Connect(_)
     );
     let value = match command {
+        ComputeCommand::Test(args) => check(&args, "test").await?,
+        ComputeCommand::Connect(ConnectArgs { check: args }) => check(&args, "connect").await?,
         ComputeCommand::Catalog(a) => return catalog(a, json_output).await,
         ComputeCommand::Status => settings::status().await?,
         ComputeCommand::Show { backend } => settings::show(backend.name()).await?,
@@ -496,16 +519,6 @@ async fn run_command(command: ComputeCommand, json_output: bool) -> Result<()> {
         ComputeCommand::Configure(args) => {
             let backend = args.backend.name();
             settings::configure(backend, (*args).body()?).await?
-        }
-        ComputeCommand::Test(args) | ComputeCommand::Connect(ConnectArgs { check: args, .. }) => {
-            settings::check(
-                args.backend.name(),
-                args.host,
-                args.container,
-                args.no_container,
-                args.address,
-            )
-            .await?
         }
         ComputeCommand::SshConfig { command } => match command {
             SshConfigCommand::Show => settings::read_ssh_config().await?,
@@ -551,6 +564,29 @@ async fn run_command(command: ComputeCommand, json_output: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Checks run in the server, which owns SSH connections and relays their login prompts.
+async fn check(args: &CheckArgs, action: &str) -> Result<Value> {
+    let body = json!({"backend":args.backend.name(), "host":args.host, "container":args.container, "noContainer":args.no_container, "address":args.address, "callerPythonOverrides":crate::jobs::caller_python_overrides()});
+    let client = crate::plane::local_plane::ApiClient::discover().await?;
+    if action == "connect" && matches!(args.backend, Backend::Ssh | Backend::Slurm) {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!("connect requires a terminal for login/MFA. Use configure with --credentials-file - for unattended credential setup."));
+        }
+        let prompt: crate::engine::transport::Prompt = std::sync::Arc::new(|question| {
+            Box::pin(async move { Ok(Some(secret_prompt(&question).await?)) })
+        });
+        return client.connect(body, prompt).await;
+    }
+    client
+        .json(
+            reqwest::Method::POST,
+            &format!("compute/{action}"),
+            Some(&body),
+        )
+        .await
 }
 
 fn validate_check(args: &CheckArgs) -> Result<()> {
@@ -619,74 +655,12 @@ fn instructions_write(path: &std::path::Path, content: &str, expected: &str) -> 
     instructions_read(path)
 }
 
-async fn connect(args: &CheckArgs, persist: Option<u64>) -> Result<()> {
+async fn connect(args: &CheckArgs) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(anyhow!("connect requires a terminal for login/MFA. Use configure with --credentials-file - for unattended credential setup."));
     }
     match args.backend {
-        Backend::Ssh | Backend::Slurm => {
-            let host = match &args.host {
-                Some(host) => Some(host.clone()),
-                None => match args.backend {
-                    Backend::Ssh => crate::config::ssh_settings()?.default_host,
-                    _ => {
-                        crate::jobs::slurm::load_settings()?
-                            .unwrap_or_default()
-                            .host
-                    }
-                },
-            }
-            .ok_or_else(|| anyhow!("Pass --host or configure a default host."))?;
-            let target = crate::jobs::ssh::SshTarget::alias(&host);
-            #[cfg(unix)]
-            if !crate::jobs::ssh::service::healthy(&target).await {
-                let connection = crate::jobs::ssh::interactive_args(&target, persist, None).await?;
-                interactive_command("ssh", &connection.args).await?;
-                if let Some(warning) = crate::jobs::ssh::setup_connection_sharing(&target).await {
-                    eprintln!("orx: warning: {warning}");
-                }
-            }
-            #[cfg(windows)]
-            {
-                let _ = persist;
-                use crate::jobs::ssh::service;
-                let start = service::request(&target, json!({"op":"connect_start"})).await?;
-                let attempt = start["attempt"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("Missing SSH login attempt"))?;
-                let result = async {
-                    loop {
-                        let status = service::request(
-                            &target,
-                            json!({"op":"connect_status", "attempt":attempt}),
-                        )
-                        .await?;
-                        if status["done"] == true {
-                            if let Some(error) = status["error"].as_str() {
-                                return Err(anyhow!(error.to_owned()));
-                            }
-                            return Ok(());
-                        }
-                        if let Some(prompt) = status["prompt"].as_str() {
-                            let answer = secret_prompt(prompt).await?;
-                            service::request(
-                                &target,
-                                json!({"op":"connect_answer", "attempt":attempt, "answer":answer}),
-                            )
-                            .await?;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                    }
-                }
-                .await;
-                let _ =
-                    service::request(&target, json!({"op":"connect_cancel", "attempt":attempt}))
-                        .await;
-                result?;
-            }
-            crate::jobs::ssh::service::attach(&target).await?;
-        }
         Backend::Hf => {
             interactive_command("hf", &["auth".into(), "login".into()]).await?;
             use crate::jobs::huggingface::{resolve_token_with_source, TokenSource};
@@ -711,6 +685,7 @@ async fn connect(args: &CheckArgs, persist: Option<u64>) -> Result<()> {
                 alphaxiv: false,
                 api_url: None,
                 non_interactive: false,
+                device: false,
             })
             .await?;
             super::ssh_key::add(None).await?;
@@ -722,16 +697,16 @@ async fn connect(args: &CheckArgs, persist: Option<u64>) -> Result<()> {
                  Environment. Check them with `orx compute test vercel`."
             );
         }
-        Backend::Local | Backend::Ray | Backend::K8s => {}
+        Backend::Local | Backend::Ray | Backend::K8s | Backend::Ssh | Backend::Slurm => {}
     }
     Ok(())
 }
 
 async fn interactive_command(program: &str, args: &[String]) -> Result<()> {
-    let path = crate::local::shell_env::find_on_path(program).ok_or_else(|| {
+    let path = crate::local::shell_env::find(program).ok_or_else(|| {
         anyhow!("{program} is not installed. Install it, then retry compute connect.")
     })?;
-    let mut command = tokio::process::Command::new(path);
+    let mut command = crate::process::tokio_command(path);
     command.args(args);
     if program == "ssh" {
         command.env("ORX_SSH_PROBE", "1");
@@ -752,18 +727,18 @@ fn credential_line(value: &str) -> &str {
 
 #[cfg(unix)]
 async fn secret_prompt(label: &str) -> Result<String> {
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     struct RestoreEcho(String);
     impl Drop for RestoreEcho {
         fn drop(&mut self) {
-            let _ = Command::new("stty")
+            let _ = crate::process::command("stty")
                 .arg(&self.0)
                 .stdin(Stdio::inherit())
                 .status();
             eprintln!();
         }
     }
-    let original = Command::new("stty")
+    let original = crate::process::command("stty")
         .arg("-g")
         .stdin(Stdio::inherit())
         .output()?;
@@ -774,7 +749,7 @@ async fn secret_prompt(label: &str) -> Result<String> {
     }
     let original = String::from_utf8(original.stdout)?.trim().to_owned();
     eprint!("{label}: ");
-    if !Command::new("stty")
+    if !crate::process::command("stty")
         .arg("-echo")
         .stdin(Stdio::inherit())
         .status()?
@@ -797,7 +772,7 @@ async fn secret_prompt(label: &str) -> Result<String> {
 #[cfg(windows)]
 async fn secret_prompt(label: &str) -> Result<String> {
     eprintln!("{label}");
-    let output = std::process::Command::new("powershell.exe").args(["-NoProfile", "-Command", "$s = Read-Host 'Credential' -AsSecureString; [System.Net.NetworkCredential]::new('', $s).Password"]).stdin(std::process::Stdio::inherit()).output()?;
+    let output = crate::process::command("powershell.exe").args(["-NoProfile", "-Command", "$s = Read-Host 'Credential' -AsSecureString; [System.Net.NetworkCredential]::new('', $s).Password"]).stdin(std::process::Stdio::inherit()).output()?;
     if !output.status.success() {
         return Err(anyhow!(
             "Credential prompt failed; use --credentials-file instead."
@@ -882,6 +857,34 @@ mod tests {
             json!({"host":"lab", "keepRemoteRuns":true})
         );
         assert!(body(&["ssh", "--remote-root", "/scratch/me/orx"]).is_err());
+        assert_eq!(
+            body(&[
+                "slurm",
+                "--qos",
+                "acc_ehpc",
+                "--sbatch-arg",
+                "--rsc p=1:g=1",
+                "--sbatch-arg=-G 1",
+                "--request-one-task",
+                "false",
+            ])
+            .unwrap(),
+            json!({"qos":"acc_ehpc", "sbatchArgs":["--rsc p=1:g=1", "-G 1"], "requestOneTask":false})
+        );
+        assert_eq!(
+            body(&[
+                "slurm",
+                "--clear",
+                "qos",
+                "--clear",
+                "sbatch-arg",
+                "--clear",
+                "request-one-task"
+            ])
+            .unwrap(),
+            json!({"qos":"", "sbatchArgs":[], "requestOneTask":true})
+        );
+        assert!(body(&["ssh", "--host", "lab", "--qos", "normal"]).is_err());
         assert!(crate::Cli::try_parse_from(["orx", "compute", "status", "--json"]).is_ok());
     }
 }
