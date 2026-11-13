@@ -40,12 +40,12 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/updates.rs`, `src/commands/update.rs`, `src/commands/version.rs` | No release-feed checks, update warnings or installs from alphaXiv |
 | `src/commands/up/harness_setup.rs` | No agent installs or updates unless `VLR_ALLOW_INSTALLERS` |
 | `src/local/chat/mod.rs` | `prepare_env` adds the agents' no-telemetry and checklist settings; `emit` feeds the activity clock; `keep_turn_leases` runs the stall check; a finished turn calls the autocompactor; declares the `vlresearch` child module |
-| `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server |
+| `src/commands/up.rs` | Merges `src/flavor/api.rs`'s routes into the dashboard server; the daily agent updates run only with `VLR_ALLOW_INSTALLERS` |
 | `ui/src/components/ChatPanel.tsx` | The progress strip above the composer; the agent's checklist tool reads as progress |
 | `ui/src/App.tsx` | The Experiments tab's Research toggle, beside Table and Tree; the open chat and a way to bring a chat to the front, for the Research view; its side chats, which bring the loop's chat to the front and open upstream's side chat off it; its Settings button, which opens the Research settings |
 | `ui/src/components/SettingsPage.tsx` | The Research section in the settings stack, after Harnesses, and `research` among the sections the Settings entry covers |
 | `ui/src/workspaceState.ts`, `src/workspace_state.rs` | `research` is a settings section a dashboard address can name |
-| `src/compute.rs` | `submit` (the run engine) and `submit_supervised` check the scoping gate (given the launching chat, to find the run's optimization) before any compute is spent, and the locked paths and scope against the commit they staged; then record the run's optimization and probe runs |
+| `src/compute.rs` | `submit` (the run engine) checks the scoping gate (given the launching chat, to find the run's optimization) before any compute is spent, and the locked paths and scope against the commit it staged; then records the run's optimization and probe runs |
 | `src/plane/local_plane.rs` | `launch` passes a probe request on to the gate, which runs in the `orx up` process for launches from chat |
 | `src/commands/exp.rs` | `orx exp wait` timeout under Claude Code; a timed-out wait in a chat tells the agent to end its turn |
 | `src/invocation.rs` | The line printed after a launch mentions the automatic wake-up |

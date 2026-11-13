@@ -5628,6 +5628,10 @@ async fn begin_restart(state: &AppState, own_requests: usize, stop_agents: bool)
 /// Once a day, keep each agent orx can install current: through the user's own
 /// updater, else with orx's copy (`harness_setup::keep_current`).
 fn spawn_agent_updates(state: AppState) {
+    // VLResearch: agents update only with VLR_ALLOW_INSTALLERS, as installs do.
+    if !crate::flavor::egress::installers_allowed() {
+        return;
+    }
     tokio::spawn(async move {
         // Startup detection's probes go first.
         tokio::time::sleep(Duration::from_secs(60)).await;
