@@ -27,7 +27,8 @@ awk '
     if (name != "") { print "::error title=" property(name) "::" (detail == "" ? "failed" : detail); shown++ }
     name = ""; detail = ""; lines = 0
   }
-  { sub(/\r$/, "") }
+  # Colours and the indentation nextest gives captured output would hide every pattern below.
+  { sub(/\r$/, ""); gsub(/\033\[[0-9;]*m/, ""); sub(/^[ \t]+/, "") }
   # libtest prints each failure as "---- <name> stdout ----" then its output.
   /^---- .* stdout ----$/ { flush(); name = $2; next }
   /^failures:$/ || /^test result:/ { flush(); next }
