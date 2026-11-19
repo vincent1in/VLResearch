@@ -1,93 +1,10 @@
-import { showConfirmDialog, showCustomDialog } from "../dialog";
-import { Dialog } from "@base-ui/react/dialog";
-import { EscapeScope } from "./EscapeScope";
-import { commandRegion } from "../keyboardRegion";
-import { ComposerProjectPicker } from "./ComposerProjectPicker";
-import { LibraryPicker } from "./LibraryPicker";
-import { ProjectInfoCard } from "./ProjectInfoCard";
-import { SessionHoverCard } from "./SessionHoverCard";
-import { taskLocation } from "../workspaceState";
-import { fitSidebarRows, sidebarRowHeight, type SidebarRow } from "../sidebarLayout";
-import { useVirtualizer, defaultRangeExtractor, measureElement as measureVirtualElement, type Range as VirtualRange } from "@tanstack/react-virtual";
-import { markLiveUpdate } from "../queries/live";
-import { removeSession as removeCachedSession } from "../queries/invalidation";
-import { nativeOptions, sessionAcpHarness } from "../acp";
-import { resolveHarnessDefaultModel } from "../modelSelection";
-import { setChatConfiguration } from "../api";
-import { RemoteConnectionStrip, useRemoteConnection } from "../RemoteRuntime";
+import { useMachines } from "../machineSelection";
+import { downloadFile } from "../download";
+import { flushSync } from "react-dom";
 import {
-  isCurrentScope,
-  setScopedQueryData,
-  deletedSessionIds,
-  queryClient,
-  subscribeWorkspace,
-  workspaceKey,
-} from "../queries/client";
-import { LOCAL_ERROR_PART_ID, LOCAL_PREFIX, SHELL_TOOL } from "../queries/chatState";
-import { CancelledError, useInfiniteQuery, useMutation, useQueries, useQuery } from "@tanstack/react-query";
-import { useNavigate } from "@tanstack/react-router";
-import { useChatState } from "../queries/chatStore";
-
-import {
-  getHarnessesQuery,
-  getHarnessSetupCommandsQuery,
-  getSkillsQuery,
-  useAlphaXivFolders,
-} from "../queries/settings";
-import { listChatActiveRunsQuery, listChatSessionsQuery, getChatMessagesQuery, listNativeChatsQuery, readSidebarChatPage } from "../queries/chat";
-import { getProjectStarterPromptsQuery, listProjectsQuery, listProjectActivityQuery, resolvePaperQuery } from "../queries/projects";
-import { getCodeTreeQuery } from "../queries/files";
-import {
-  fileMentionContext,
-  insertFileMention,
-  matchFileMentions,
-  mentionCandidates,
-  type FileMentionMatch,
-} from "../fileMentions";
-import { m } from "../paraglide/messages.js";
-import { formatForDisplay, matchesKeyboardEvent, useAppHotkeys, useHotkey } from "@tanstack/react-hotkeys";
-import { appHotkeys } from "../hotkeys";
-import { copyToClipboard } from "../clipboard";
-import { autoDir, ltr } from "../i18n";
-import { navigateKeyboardList } from "../keyboardNavigation";
-import { useLocale } from "../locale";
-import {
-  ArrowDown,
-  ArrowUpRight,
-  Blocks,
-  BookOpen,
-  Check,
-  ChevronLeft,
-  ChevronRight,
-  CircleX,
-  Clock,
-  CornerDownLeft,
-  Copy,
-  FileText,
-  FlaskConical,
-  FolderPlus,
-  Globe,
-  Gauge,
-  HelpCircle,
-  Goal,
-  Lightbulb,
-  MessageSquareQuote,
-  MessagesSquare,
-  MoreHorizontal,
-  Paperclip,
-  Pencil,
-  Plus,
-  Search,
-  SlidersHorizontal,
-  SquareTerminal,
-  ToggleRight,
-  TriangleAlert,
-  Trash2,
-  Users,
-  WifiOff,
-  X,
-} from "lucide-react";
-import {
+  Fragment,
+  createContext,
+  useContext,
   memo,
   useCallback,
   useEffect,
@@ -96,56 +13,165 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
+  type Dispatch,
   type MouseEvent as ReactMouseEvent,
+  type SetStateAction,
 } from "react";
-import { BrandMark } from "./Wordmark";
+import { WorkspaceDomContext } from "../WorkspaceDom";
+import { useWorkspace } from "../workspace";
+
+import { Dialog } from "@base-ui/react/dialog";
+import { Menu } from "@base-ui/react/menu";
+import { DirectionProvider } from "@base-ui/react/direction-provider";
+import { EscapeScope } from "./EscapeScope";
+import { commandRegion, subscribeCommandRegion } from "../keyboardRegion";
+import { ChatSearch } from "./ChatSearch";
+import { chatSearchRanges } from "../chatSearch";
+import { ComposerProjectPicker } from "./ComposerProjectPicker";
+import { LibraryPicker } from "./LibraryPicker";
+import { ProjectInfoCard } from "./ProjectInfoCard";
+import { NoProjectGroupHeader, PendingProjectMove, ProjectProposalCard, projectLabel, projectProposal, useCreateProject, type ProjectProposal } from "./NoProject";
+import { mutCreateScratchProject } from "../queries/projects";
+import { ProjectIconTile } from "./ProjectIcon";
+import { SessionHoverCard } from "./SessionHoverCard";
+import { AgentMessageCard } from "./AgentMessageCard";
+import { DelegateCard } from "./DelegateCard";
+import { EnvRequestCard } from "./EnvRequestCard";
+import { delegateStatus, delegatesOf, type DelegateStatus } from "../delegates";
+import { taskLocation } from "../workspaceState";
+import { DONE_PREVIEW_HEIGHT, fitSidebarRows, sidebarGroup, sidebarRowHeight, type SidebarRow } from "../sidebarLayout";
+import { useVirtualizer, defaultRangeExtractor, elementScroll, measureElement as measureVirtualElement, type Range as VirtualRange } from "@tanstack/react-virtual";
+import { markLiveUpdate } from "../queries/live";
 import {
-  type SidebarChatCursor,
-  cancelQueuedMessage,
-  chatAttachmentUrl,
-  createChatSession,
-  openSideChat,
-  getChatSession,
-  deleteChatSession,
+  mutCancelQueuedMessage,
+  mutCompactChatSession,
+  mutCreateChatSession,
+  mutDeleteChatSession,
+  mutForkChatTurn,
+  mutImportNativeChat,
+  mutInterruptChat,
+  mutOpenSideChat,
+  mutPatchChatSession,
+  mutRecoverChatTurn,
+  mutRespondChat,
+  mutRetryQueuedMessage,
+  mutRunShellCommand,
+  mutSelectChatBranch,
+  mutSetChatConfiguration,
+} from "../queries/chat";
+import { useMutate } from "@clo/react-mutation";
+
+import { nativeOptions, sessionAcpHarness } from "../acp";
+import { deriveComposerSelection, harnessDisplayName, harnessKey, selectionHarness, withAutoReviewer } from "../modelSelection";
+import { useAgentSignIn } from "./HarnessSetupDialog";
+
+import { RemoteConnectionStrip, useRemoteConnection } from "../RemoteRuntime";
+
+import { LOCAL_ERROR_PART_ID, LOCAL_PREFIX, SHELL_TOOL, optimisticUserMessage } from "../queries/chatState";
+import { CancelledError, useInfiniteQuery, useQueries, useQuery } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
+
+import {
+  fileMentionContext,
+  insertFileMention,
+  insertMentionToken,
+  matchFileMentions,
+  mentionCandidates,
+  paperToken,
+} from "../fileMentions";
+import { m } from "../paraglide/messages.js";
+import { formatForDisplay, matchesKeyboardEvent, useHotkey } from "@tanstack/react-hotkeys";
+import { appHotkeys } from "../hotkeys";
+import { copyToClipboard } from "../clipboard";
+import { readClipboardImage } from "../clipboardImage";
+import { autoDir, fmtBytes, ltr } from "../i18n";
+import { useLocale } from "../locale";
+import {
+  ArrowDown,
+  ArrowRightLeft,
+  ArrowUpRight,
+  Bell,
+  BookMarked,
+  BookOpen,
+  ChartSpline,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  CircleX,
+  Clock,
+  CornerDownLeft,
+  Copy,
+  Link,
+  FileCode,
+  FileText,
+  FlaskConical,
+  FolderPlus,
+  SquarePen,
+  CircleCheck,
+  Globe,
+  Gauge,
+  Hourglass,
+  Undo2,
+  HelpCircle,
+  Goal,
+  LibraryBig,
+  Lightbulb,
+  LogIn,
+  MessageSquareQuote,
+  MessagesSquare,
+  MoreHorizontal,
+  NotebookText,
+  Paperclip,
+  Pencil,
+  Plus,
+  ScrollText,
+  Search,
+  SlidersHorizontal,
+  SquareTerminal,
+  TriangleAlert,
+  Trash2,
+  Users,
+  WifiOff,
+  X,
+} from "lucide-react";
+
+import { BrandMark } from "./Wordmark";
+import { HarnessLogo, ModelMark } from "./HarnessLogo";
+import { chatStatus, chatStatusWorking, type ChatStatus } from "../chatStatus";
+import {
+  type ChatSessionPatch,
   DEMO_FIGURE_SESSION_ID,
   DEMO_LITERATURE_SESSION_ID,
-  captureUiEvent,
   DEMO_EXPERIMENT_LABELS,
   DEMO_PROJECT_ID,
   DEMO_RUN_EXPERIMENT_PROMPT,
   DEMO_SEEDED_LEAF_IDS,
-  forkChatTurn,
   fmtNumber,
   harnessModelLabel,
-  interruptChat,
   reasoningFor,
-  recoverChatTurn,
   reconcileReasoning,
   reconcileServiceTier,
-  renameChatSession,
-  retryQueuedMessage,
-  respondChat,
-  selectChatBranch,
-  compactChatSession,
-  runShellCommand,
   fmtDuration,
-  sendChatMessage,
-  getChatSubmission,
+  timeAgo,
   RejectedResponseError,
-  setChatSessionArchived,
-  setChatSessionAutonomy,
-  setChatSessionPermissionMode,
-  importNativeChat,
-  setChatSessionGoal,
-  setChatSessionPlanMode,
+  modelLabel,
   type FirstActionSurface,
   type ChatImageAttachment,
+  type ArtifactEntry,
   type ChatMessage,
   type AlphaXivFolder,
   type ChatPart,
+  type ChatToolState,
+  type FailureCause,
+  type OrxSource,
   type Autonomy,
   type ChatSession,
+  type ChatActiveRun,
+  type CitedMessage,
+  type ChatSearchHit,
   type Harness,
+  type HarnessId,
   type Project,
   type PromptAnswer,
   type RuntimeInfo,
@@ -177,7 +203,7 @@ import {
   transcriptFileName,
   transcriptMarkdown,
 } from "../chatRendering";
-import { onChatEvent } from "../events";
+
 import {
   queuedRetryLabel,
   recoveryAction as parseRecoveryAction,
@@ -185,10 +211,12 @@ import {
   retryStatusLabel,
 } from "../chatRecovery";
 import {
-  composerSeed,
+  attachmentToken,
+  citedAttachments,
   composerStashContent,
-  forgetComposerSeed,
+  mergeFailedComposer,
   EMPTY_COMPOSER_STASH,
+  nextAttachmentId,
   type ComposerAnnotation,
   type ComposerAttachment,
   type ComposerStash,
@@ -201,21 +229,29 @@ import {
   shellWords,
   shellWrapperBody,
   unwrapShellBody,
+  loopPaperIds,
 } from "../orxCommand";
 import { LitSourceLogo, parseOrxLit, paperUrl } from "./LitSourceLogo";
+import { FileScopeContext } from "./FileReference";
+import { FigureReveal, PaperShelf, pluralMessage, ReportCard, RunCard, SourceStrip, type ShelfPaper } from "./ResearchCards";
+import { discoveredPapers, linkedPapers, paperKey, type CitedPaper, type PaperMeta } from "../researchActivity";
 import { LitSourcesList } from "./LitSourcesPicker";
 import { ChatImageScope, Md } from "./Md";
+import { ChatLinksContext, type ChatLinks } from "./ChatLinks";
+import { CITED_ID, messageRef } from "../agentMessages";
 import { PlanStrip } from "./PlanStrip";
-import { ExperimentRunBanner } from "./ExperimentRunBanner";
+import { useComposerFocus } from "./useComposerFocus";
+import { BackgroundTaskBanner, ExperimentRunBanner } from "./ExperimentRunBanner";
+import { SettingsHeader, harnessSetupPath, type SettingsTab } from "./SettingsPage";
 import { checklistLabel } from "../flavor/checklist"; // VLResearch
 import { ProgressStrip } from "../flavor/ProgressStrip"; // VLResearch
-import { SETTINGS_NAV, harnessSetupPath, type SettingsTab } from "./SettingsPage";
 import { SkillMenu } from "./SkillMenu";
-import { FileMentionMenu } from "./FileMentionMenu";
-import { ComposerSkillChips, MessageWithChips, skillMarginSpaces } from "./SkillChips";
-import { WorkspaceConnection } from "./WorkspaceConnection";
+import { MentionMenu, type MentionMatch } from "./MentionMenu";
+import { useDebouncedValue } from "./NewProjectForm";
+import { MessageWithChips } from "./SkillChips";
+import { ComposerEditor, type ChipSource, type ComposerEditorHandle } from "./ComposerEditor";
+import { StatusStrip } from "./StatusStrip";
 import { SidebarToggle } from "./Header";
-import { AccountChip } from "./AccountChip";
 import {
   defaultSelection,
   harnessLabel,
@@ -223,7 +259,8 @@ import {
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
-import { ContextMeter } from "./ContextMeter";
+import { useModelName } from "./pickerAgents";
+import { UsageMenu } from "./UsageMenu";
 import { renderNote } from "./agentNote";
 import {
   canonicalSkillName,
@@ -255,7 +292,8 @@ import {
   shouldRecoverLegacyMath,
   tableMarkdown,
 } from "./annotationMarkdown";
-import { Button, IconButton, LoadingRow, MenuItem, showAlert, Spinner, Textarea, Tooltip } from "./ui";
+import { Button, IconButton, LoadingRow, MENU_LABEL, MENU_SEPARATOR, MenuItem, showAlert, Spinner, Tooltip } from "./ui";
+import { QuestionDock, useQuestions } from "./QuestionDock";
 import { PaperTitle } from "./PaperTitle";
 
 const TOOL_LINE_CLASS_NAME = "tool-line flex-1 min-w-0 line-clamp-2 break-words text-base leading-6";
@@ -803,12 +841,95 @@ const PLAN_RESOLVED_CLASS_NAME = [
   "[&_summary_.plan-chevron]:ease-standard [&[open]_summary_.plan-chevron]:rotate-90",
 ].join(" ");
 
+const USER_MESSAGE_BUBBLE_CLASS_NAME = "bg-panel rounded-2xl py-2.5 px-4 text-base leading-normal whitespace-pre-wrap wrap-anywhere";
+
+/** Rises a send from the composer, re-measured every frame because the pin and late row measurements keep moving it. */
+function riseIntoPlace(
+  threadRef: React.RefObject<HTMLElement | null>,
+  innerRef: React.RefObject<HTMLElement | null>,
+  arrived: (started: boolean) => { rising: HTMLElement[]; fading?: Element | null } | null,
+  waitMs: number,
+) {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+  const userScroll = ["wheel", "touchmove", "pointerdown", "keydown"] as const;
+  const giveUpAt = performance.now() + waitMs;
+  const raised = new Map<HTMLElement, number>();
+  let tail: { rising: HTMLElement[] } | null = null;
+  let from = innerRef.current?.getBoundingClientRect().top;
+  let listening: HTMLElement | null = null;
+  let start: number | null = null;
+  let pushed = 0;
+  let frame = 0;
+
+  const stop = () => {
+    cancelAnimationFrame(frame);
+    innerRef.current?.style.removeProperty("transform");
+    for (const element of raised.keys()) element.style.removeProperty("transform");
+    for (const type of userScroll) listening?.removeEventListener(type, stop);
+  };
+  const step = (now: number) => {
+    const thread = threadRef.current;
+    const inner = innerRef.current;
+    if (thread && listening !== thread) {
+      for (const type of userScroll) listening?.removeEventListener(type, stop);
+      for (const type of userScroll) thread.addEventListener(type, stop, { passive: true });
+      listening = thread;
+    }
+
+    const settled = inner ? inner.getBoundingClientRect().top - pushed : undefined;
+    const found = thread && inner ? arrived(start !== null) : null;
+    if (start === null) {
+      if (!found) {
+        // The frame the message lands in has not painted yet, so the last painted spot is where content glides from.
+        from = settled;
+        if (now < giveUpAt) frame = requestAnimationFrame(step);
+        else stop();
+        return;
+      }
+      start = now;
+      found.fading?.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 250, delay: 350, easing: "ease", fill: "backwards" });
+    }
+    // A fast reply can drop the status line mid-rise, and the server's copy replaces the sent row; both keep rising.
+    if (found) tail = found;
+    const [lead, ...others] = tail?.rising ?? [];
+    if (!thread || !inner || !lead?.isConnected || settled === undefined) return stop();
+    const rising = [lead, ...others.filter((element) => element.isConnected)];
+
+    const progress = Math.min(1, (now - start) / 600);
+    const remaining = 2 ** (-10 * progress);
+    const leadSettled = lead.getBoundingClientRect().top - pushed - (raised.get(lead) ?? 0);
+    const glide = Math.min(300, Math.max(0, (from ?? settled) - settled));
+    const rise = Math.min(300, Math.max(glide, thread.getBoundingClientRect().bottom - leadSettled));
+
+    pushed = glide * remaining;
+    inner.style.transform = `translateY(${pushed}px)`;
+    for (const element of raised.keys()) {
+      if (!rising.includes(element)) element.style.removeProperty("transform");
+    }
+    raised.clear();
+    const lift = (rise - glide) * remaining;
+    for (const element of rising) {
+      raised.set(element, lift);
+      element.style.transform = `translateY(${lift}px)`;
+    }
+
+    if (progress < 1) frame = requestAnimationFrame(step);
+    else stop();
+  };
+
+  frame = requestAnimationFrame(step);
+}
+
 const PROMPT_ACTIONS_CLASS_NAME = "prompt-actions flex flex-wrap gap-2";
 
 // --- chat state --------------------------------------------------------------
 
 const NO_MESSAGES: ChatMessage[] = [];
 const EMPTY_SESSIONS: ChatSession[] = [];
+const EMPTY_RUNS: ChatActiveRun[] = [];
+type DelegateRow = { session: ChatSession; status: DelegateStatus };
+const EMPTY_DELEGATES: DelegateRow[] = [];
 const EMPTY_RECOVERY_OVERRIDES = {};
 
 // --- rendering ---------------------------------------------------------------
@@ -832,7 +953,35 @@ function nativeOrxSkillPath(tool: string, skillName: string): string | null {
   return null;
 }
 
-type ToolActivityKind = "skill" | "read" | "search" | "edit" | "web" | "agent" | "project" | "command";
+/** What loading each of orx's research guides prepares the agent to do. */
+const GUIDE_LABELS: Record<string, [done: () => string, progress: () => string]> = {
+  "orx-agent-delegation": [m.activity_guide_delegation, m.activity_guide_delegation_progress],
+  "orx-compute": [m.activity_guide_compute, m.activity_guide_compute_progress],
+  "orx-create": [m.activity_guide_create, m.activity_guide_create_progress],
+  "orx-customize": [m.activity_guide_customize, m.activity_guide_customize_progress],
+  "orx-experiment-tree": [m.activity_guide_experiment_tree, m.activity_guide_experiment_tree_progress],
+  "orx-feedback": [m.activity_guide_feedback, m.activity_guide_feedback_progress],
+  "orx-figures": [m.activity_guide_figures, m.activity_guide_figures_progress],
+  "orx-git": [m.activity_guide_git, m.activity_guide_git_progress],
+  "orx-instances": [m.activity_guide_instances, m.activity_guide_instances_progress],
+  "orx-lit-review": [m.activity_guide_lit_review, m.activity_guide_lit_review_progress],
+  "orx-logs": [m.activity_guide_logs, m.activity_guide_logs_progress],
+  "orx-paper": [m.activity_guide_paper, m.activity_guide_paper_progress],
+  "orx-reports": [m.activity_guide_reports, m.activity_guide_reports_progress],
+  "orx-results": [m.activity_guide_results, m.activity_guide_results_progress],
+};
+
+/** orx's own skills are the research guides it gives every agent, each named
+ * for what it prepares the agent to do. */
+function guideFields(skillName: string | null): Partial<Pick<ToolActivity, "guide" | "label" | "progressLabel">> {
+  if (!skillName?.startsWith("orx-")) return {};
+  const labels = GUIDE_LABELS[skillName];
+  return labels
+    ? { guide: true, label: labels[0](), progressLabel: labels[1]() }
+    : { guide: true, progressLabel: m.activity_loading_research_guide() };
+}
+
+type ToolActivityKind = "skill" | "read" | "search" | "edit" | "web" | "agent" | "project" | "run" | "log" | "command";
 
 interface ToolActivity {
   kind: ToolActivityKind;
@@ -845,11 +994,22 @@ interface ToolActivity {
   fileRef?: string;
   labelTarget?: string;
   litCall?: NonNullable<ReturnType<typeof parseOrxLit>>;
+  /** Every paper an `orx paper` call reads, when it reads more than one or reads them in a loop. */
+  paperIds?: string[];
   queries?: string[];
   runIds?: string[];
   experimentIds?: string[];
   /** Chat sessions `orx agent spawn` created in this tool call. */
   spawnedSessionIds?: string[];
+  /** The label naming the experiment of the call's one run, in place of `label` and `progressLabel`. */
+  runLabel?: (experiment: string) => string;
+  runProgressLabel?: (experiment: string) => string;
+  /** A row about the chat itself, such as a compaction, which stays out of the research summary. */
+  aside?: boolean;
+  /** Reads one of orx's research guides. */
+  guide?: boolean;
+  /** The project an `orx project create` call proposed, once the command accepted it. */
+  projectProposal?: ProjectProposal;
 }
 
 type OpenTranscriptFile = (
@@ -1308,6 +1468,7 @@ function idsFromToolOutput(output: string | undefined, resource: "runs" | "exper
       new RegExp(`/runs/(${UUID_PATTERN})`, "gi"),
       new RegExp(`\\brun(?:_|\\s+)id:\\s*(${UUID_PATTERN})`, "gi"),
       new RegExp(`^\\s*RUN\\s+(${UUID_PATTERN})\\b`, "gim"),
+      new RegExp(`\\bRun\\s+(${UUID_PATTERN})\\b`, "g"),
       new RegExp(`={3,}\\s*(${UUID_PATTERN})\\s*={3,}`, "gi"),
     ]
     : [
@@ -1535,7 +1696,17 @@ function computeToolActivity(part: ChatPart): ToolActivity {
   switch (normalizedTool) {
     case "shell":
     case "bash": {
-      if (!rawCommand && !commandArgv?.length) return { kind: "command", label: m.chat_panel_ran_a_command() };
+      const proposed = (proposal: ProjectProposal): ToolActivity => ({
+        kind: "project",
+        label: m.activity_proposed_project({ name: autoDir(proposal.name) }),
+        projectProposal: part.state?.status === "completed" ? proposal : undefined,
+      });
+      if (!rawCommand && !commandArgv?.length) {
+        // ACP agents may name the command only in the call's title.
+        const titled = shellCommandSegments(meaningfulCommand(part.state?.title ?? ""))
+          .map((segment) => projectProposal(orxArgv(segment.raw))).find(Boolean);
+        return titled ? proposed(titled) : { kind: "command", label: m.chat_panel_ran_a_command() };
+      }
       const command = meaningfulCommand(rawCommand ?? commandArgv?.join(" ") ?? "");
       const shellSegments = shellCommandSegments(command);
       let literatureInputs: Array<string | readonly string[]> = shellSegments.map((segment) => segment.raw);
@@ -1545,20 +1716,23 @@ function computeToolActivity(part: ChatPart): ToolActivity {
           ? [commandArgv]
           : shellCommandSegments(normalizeShellBody(wrapperBody)).map((segment) => segment.raw);
       }
-      let litCall: ReturnType<typeof parseOrxLit> = null;
-      for (const input of literatureInputs) {
-        litCall = parseOrxLit(input);
-        if (litCall) break;
-      }
+      const proposal = literatureInputs.map((input) => projectProposal(orxArgv(input))).find(Boolean);
+      if (proposal) return proposed(proposal);
+      const litCalls = literatureInputs.flatMap((input) => parseOrxLit(input) ?? []);
+      const litCall = litCalls[0] ?? null;
       const hasNonLiteratureOrx = literatureInputs.some((input) => {
         const argv = orxArgv(input);
         return argv !== null && argv[0] !== "discover" && argv[0] !== "paper";
       });
       if (litCall && !hasNonLiteratureOrx) {
-        const queries = litCall.kind === "discover" && !litCall.query
-          ? recordedDiscoveryQueries(commandArgv ? shellWrapperBody(commandArgv) ?? command : command, toolOutput ?? "", litCall.strategy)
-          : [];
-        const discoveryLabel = litCall.kind === "discover"
+        const chainedSearches = litCalls.filter((call) => call.kind === "discover");
+        const queries = chainedSearches.length > 1
+          ? chainedSearches.flatMap((call) => call.query ? [call.query] : [])
+          : litCall.kind === "discover" && !litCall.query
+            ? recordedDiscoveryQueries(commandArgv ? shellWrapperBody(commandArgv) ?? command : command, toolOutput ?? "", litCall.strategy)
+            : [];
+        const oneStrategy = new Set(chainedSearches.map((call) => call.strategy)).size <= 1;
+        const discoveryLabel = litCall.kind === "discover" && oneStrategy
           ? {
             keyword: m.activity_searched_alphaxiv_full_text(),
             embedding: m.activity_searched_alphaxiv_semantically(),
@@ -1567,16 +1741,26 @@ function computeToolActivity(part: ChatPart): ToolActivity {
             pubmed: m.activity_searched_pubmed(),
           }[litCall.strategy]
           : null;
-        const label = litCall.kind === "discover"
-          ? litCall.query
-            ? m.activity_for_query({ activity: discoveryLabel ?? m.activity_searched_literature(), query: litCall.query })
-            : queries.length === 1
-              ? m.activity_for_query({ activity: discoveryLabel ?? m.activity_searched_literature(), query: queries[0] })
-              : queries.length > 1
-                ? m.activity_for_queries({ activity: discoveryLabel ?? m.activity_searched_literature(), count: fmtNumber(queries.length) })
-                : discoveryLabel ?? m.activity_searched_literature()
-          : litCall.id ? m.activity_read_target({ target: ltr(litCall.id) }) : m.activity_read_paper();
-        return { kind: litCall.kind === "paper" ? "read" : "search", label, litCall, queries };
+        const literatureCommand = commandArgv ? shellWrapperBody(commandArgv) ?? command : command;
+        const paperIds = [...new Set([
+          ...litCalls.flatMap((call) => call.kind === "paper" && call.id ? [call.id] : []),
+          ...loopPaperIds(literatureCommand),
+        ])];
+        const searched = discoveryLabel ?? m.activity_searched_literature();
+        const query = litCall.kind === "discover" ? litCall.query ?? (queries.length === 1 ? queries[0] : null) : null;
+        const label = litCall.kind === "paper"
+          ? paperIds.length > 1
+            ? m.activity_read_papers({ count: fmtNumber(paperIds.length) })
+            : paperIds[0] ? m.activity_read_target({ target: ltr(paperIds[0]) }) : m.activity_read_paper()
+          : queries.length > 1
+            ? m.activity_for_queries({ activity: searched, count: fmtNumber(queries.length) })
+            : query ? m.activity_for_query({ activity: searched, query }) : searched;
+        const progressLabel = litCall.kind === "paper"
+          ? m.activity_reading_paper()
+          : litCall.query
+            ? m.activity_searching_literature_for({ query: litCall.query })
+            : m.activity_searching_literature();
+        return { kind: litCall.kind === "paper" ? "read" : "search", label, progressLabel, litCall, queries, paperIds: litCall.kind === "paper" ? paperIds : undefined };
       }
 
       if (commandInvokesOrx(command, "agent\\s+spawn")) {
@@ -1603,16 +1787,44 @@ function computeToolActivity(part: ChatPart): ToolActivity {
       if (commandInvokesOrx(command, "logs")) {
         const runIds = commandRunIds(command, toolOutput, resourceRunIds, legacyTargetIds);
         const label = runIds.length === 1 ? m.activity_reviewed_run_log() : m.activity_reviewed_run_logs();
-        return { kind: "project", label, runIds, litCall: litCall ?? undefined };
+        return {
+          kind: "log",
+          label,
+          progressLabel: m.activity_reading_run_log(),
+          runIds,
+          runLabel: (experiment) => m.activity_read_log_of({ experiment }),
+          runProgressLabel: (experiment) => m.activity_reading_log_of({ experiment }),
+          litCall: litCall ?? undefined,
+        };
       }
       if (commandInvokesOrx(command, "exp\\s+run")) {
-        return { kind: "project", label: m.chat_panel_started_an_experiment_run(), litCall: litCall ?? undefined };
+        return {
+          kind: "run",
+          label: m.chat_panel_started_an_experiment_run(),
+          progressLabel: m.activity_launching_experiment(),
+          runIds: idsFromToolOutput(toolOutput, "runs"),
+          runLabel: (experiment) => m.activity_launched_experiment({ experiment }),
+          litCall: litCall ?? undefined,
+        };
       }
       if (commandInvokesOrx(command, "exp\\s+wait")) {
-        return { kind: "project", label: m.chat_panel_waited_for_an_experiment_run(), litCall: litCall ?? undefined };
+        return {
+          kind: "run",
+          label: m.chat_panel_waited_for_an_experiment_run(),
+          progressLabel: m.activity_waiting_on_run(),
+          runIds: idsFromToolOutput(toolOutput, "runs"),
+          runLabel: (experiment) => m.activity_waited_on_experiment({ experiment }),
+          litCall: litCall ?? undefined,
+        };
       }
       if (commandInvokesOrx(command, "exp\\s+cancel")) {
-        return { kind: "project", label: m.chat_panel_cancelled_an_experiment_run(), litCall: litCall ?? undefined };
+        return {
+          kind: "run",
+          label: m.chat_panel_requested_an_experiment_stop(),
+          runIds: idsFromToolOutput(toolOutput, "runs"),
+          runLabel: (experiment) => m.activity_stopped_experiment({ experiment }),
+          litCall: litCall ?? undefined,
+        };
       }
       const readsProject = commandInvokesOrx(command, "project\\s+view");
       if (readsProject && readsExperimentStatus && readsExperimentNotes) {
@@ -1666,6 +1878,9 @@ function computeToolActivity(part: ChatPart): ToolActivity {
           litCall: litCall ?? undefined,
         };
       }
+      if (commandInvokesOrx(command, "create-experiment")) {
+        return { kind: "project", label: m.activity_created_an_experiment(), progressLabel: m.activity_creating_an_experiment(), litCall: litCall ?? undefined };
+      }
       if (commandInvokesOrx(command, "runs?")) {
         return { kind: "project", label: m.chat_panel_listed_project_runs(), litCall: litCall ?? undefined };
       }
@@ -1684,6 +1899,7 @@ function computeToolActivity(part: ChatPart): ToolActivity {
         return {
           kind: skillName ? "skill" : "read",
           label: skillName ? m.activity_read_skill({ name: ltr(skillName) }) : m.activity_read_target({ target: ltr(baseName(gitShowTarget.path)) }),
+          ...guideFields(skillName),
           filePath: gitShowTarget.path,
           fileRef: gitShowTarget.ref,
           labelTarget: skillName ? `${skillName} skill` : baseName(gitShowTarget.path),
@@ -1708,6 +1924,7 @@ function computeToolActivity(part: ChatPart): ToolActivity {
         return {
           kind: skillName ? "skill" : "read",
           label: skillName ? m.activity_read_skill({ name: ltr(skillName) }) : m.activity_read_target({ target: ltr(baseName(readTarget)) }),
+          ...guideFields(skillName),
           filePath: readPath,
           labelTarget: skillName ? `${skillName} skill` : baseName(readTarget),
         };
@@ -1761,6 +1978,7 @@ function computeToolActivity(part: ChatPart): ToolActivity {
       return {
         kind: "skill",
         label: skillName ? m.activity_loaded_skill({ name: ltr(skillName) }) : m.activity_loaded_a_skill(),
+        ...guideFields(skillName),
         filePath: filePath ?? undefined,
         labelTarget: filePath && skillName ? `${skillName} skill` : undefined,
       };
@@ -1772,6 +1990,7 @@ function computeToolActivity(part: ChatPart): ToolActivity {
         return {
           kind: "skill",
           label: m.activity_read_skill({ name: ltr(skillName) }),
+          ...guideFields(skillName),
           filePath: filePath ?? undefined,
           labelTarget: `${skillName} skill`,
         };
@@ -1831,7 +2050,7 @@ function computeToolActivity(part: ChatPart): ToolActivity {
     case "error":
       return { kind: "command", label: m.chat_panel_tool_failed() };
     case "importedchat":
-      return { kind: "project", label: m.activity_imported_chat() };
+      return { kind: "project", label: m.activity_imported_chat(), aside: true };
     case "todowrite": // VLResearch: the agent's checklist reads as progress.
       return { kind: "project", label: checklistLabel(normalizedInput) };
     case "contextcompaction":
@@ -1844,6 +2063,7 @@ function computeToolActivity(part: ChatPart): ToolActivity {
             ? m.activity_compacting_context()
             : m.activity_compacted_context(),
         progressLabel: m.activity_compacting_context(),
+        aside: true,
       };
     default: {
       const detail = description ?? filePath ?? rawCommand ?? part.state?.title ?? "";
@@ -1865,6 +2085,12 @@ function alphaxivActivity(tool: string, input: Record<string, unknown>): ToolAct
     approvalLabel,
     // Paper arguments may be full titles, which have no page to link.
     litCall: { kind: "paper", source: "alphaxiv", id: paper && !/\s/.test(paper) ? paper : undefined },
+    // Saving a paper or reading notes on it does not read it.
+    paperIds: [],
+  });
+  const read = (label: string, paper: string | null): ToolActivity => ({
+    ...row("read", label, paper ?? undefined),
+    paperIds: paper && !/\s/.test(paper) ? [paper] : [],
   });
   const readPaper = (paper: string | null) =>
     paper ? m.activity_read_target({ target: ltr(paper) }) : m.activity_read_paper();
@@ -1906,11 +2132,11 @@ function alphaxivActivity(tool: string, input: Record<string, unknown>): ToolAct
       const label = queries.length > 1
         ? m.activity_for_queries({ activity: readPaper(paper), count: fmtNumber(queries.length) })
         : forQuery(readPaper(paper), queries[0] ?? null);
-      return row("read", label, paper ?? undefined);
+      return read(label, paper);
     }
     case "get_paper_content": {
       const paper = inputString(input, "url");
-      return row("read", readPaper(paper), paper ?? undefined);
+      return read(readPaper(paper), paper);
     }
     case "read_files_from_github_repository": {
       const repository = inputString(input, "githubUrl")
@@ -1923,7 +2149,10 @@ function alphaxivActivity(tool: string, input: Record<string, unknown>): ToolAct
     case "discover_papers": {
       const keywords = exactInputStringArray(input, "keywords") ?? [];
       const query = inputString(input, "question") ?? (keywords.join(", ") || null);
-      return row("search", forQuery(m.activity_searched_alphaxiv(), query));
+      return {
+        ...row("search", forQuery(m.activity_searched_alphaxiv(), query)),
+        progressLabel: query ? m.activity_searching_literature_for({ query }) : m.activity_searching_literature(),
+      };
     }
     case "find_researchers":
       return row("search", forQuery(m.activity_alphaxiv_searched_researchers(), inputString(input, "topic", "query")));
@@ -1990,6 +2219,8 @@ function alphaxivApprovalLabel(
 
 /** The body of an alphaXiv write's approval card: what it writes, with each paper linked by title. */
 function AlphaXivApproval({ tool, input }: { tool: string; input: Record<string, unknown> }) {
+  const { useAlphaXivFolders } = useMachines().owner.queries;
+  const { resolvePaperQuery } = useWorkspace().queries;
   const folders = useAlphaXivFolders().data;
   const papers = tool === "save_papers_to_folder" ? exactInputStringArray(input, "paper_ids_or_urls") ?? [] : [];
   const resolved = useQueries({ queries: papers.map((paper) => resolvePaperQuery(paper)) });
@@ -2068,11 +2299,19 @@ function ToolActivityIcon({ activity, className = "" }: { activity: ToolActivity
   } else {
     switch (activity.kind) {
       case "skill":
-        icon = <Blocks {...props} />;
+        icon = <BookMarked {...props} />;
         break;
       case "read":
+        icon = /\.(?:md|markdown|txt|rst|tex|csv|tsv|log)$/i.test(activity.filePath ?? "")
+          ? <FileText {...props} />
+          : <FileCode {...props} />;
+        break;
       case "project":
-        icon = <BookOpen {...props} />;
+      case "run":
+        icon = <FlaskConical {...props} />;
+        break;
+      case "log":
+        icon = <ScrollText {...props} />;
         break;
       case "search":
         icon = <Search {...props} />;
@@ -2250,6 +2489,21 @@ function ToolActivityLabel({
       </>
     );
   }
+  const onlyRunId = activity.runIds?.length === 1 ? activity.runIds[0] : null;
+  const onlyRunName = onlyRunId && runExperimentName?.(onlyRunId);
+  if (activity.runLabel && onlyRunId && onlyRunName) {
+    const label = activity.runLabel(autoDir(onlyRunName));
+    return onOpenRun ? (
+      <button
+        type="button"
+        className="tool-target text-start"
+        title={m.a11y_open_logs_for_run({ run: ltr(onlyRunId) })}
+        {...tabOpenGestureHandlers<HTMLButtonElement>((intent) => onOpenRun(onlyRunId, intent), { stopPropagation: true })}
+      >
+        {label}
+      </button>
+    ) : label;
+  }
   if (activity.runIds?.length) {
     const runIds = runExperimentName
       ? activity.runIds.filter((runId) => Boolean(runExperimentName(runId)))
@@ -2338,12 +2592,14 @@ function activityInProgress(activity: ToolActivity): ToolActivity {
     read: m.activity_reading(),
     search: m.activity_searching(),
     edit: m.activity_editing(),
-    project: m.activity_reviewing(),
+    project: m.activity_checking_experiments(),
+    run: m.activity_running(),
+    log: m.activity_reading_run_log(),
     web: m.activity_browsing(),
     agent: m.activity_delegating(),
     command: m.activity_running(),
   }[activity.kind];
-  return { ...activity, label };
+  return { ...activity, label, runLabel: activity.runProgressLabel };
 }
 
 function permissionActivityLabel(tool: string | undefined, input: Record<string, unknown> | undefined): string {
@@ -2360,6 +2616,8 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     search: m.activity_search(),
     edit: m.activity_edit(),
     project: m.activity_review(),
+    run: m.activity_run(),
+    log: m.activity_read(),
     web: m.activity_browse(),
     agent: m.activity_delegate(),
     command: m.activity_run(),
@@ -2434,7 +2692,7 @@ function useDelayedToolShimmer(active: boolean): boolean {
 }
 
 function groupIconActivity(activities: ToolActivity[]): ToolActivity {
-  const priority: ToolActivityKind[] = ["skill", "read", "search", "edit", "project", "web", "command", "agent"];
+  const priority: ToolActivityKind[] = ["skill", "read", "search", "edit", "project", "run", "log", "web", "command", "agent"];
   for (const kind of priority) {
     const activity = activities.find((candidate) => candidate.kind === kind);
     if (activity) return activity;
@@ -2480,11 +2738,40 @@ function squashToolParts(parts: ChatPart[]): SquashedToolPart[] {
   return squashed;
 }
 
+type FailureInput = NonNullable<ChatToolState["input"]>;
+
+/** How a chat answers a failed turn: the agent or account it ran on, and what fixes a cause here, if anything does. */
+export interface FailureActions {
+  agent: (input: FailureInput) => Harness | undefined;
+  fix: (cause: FailureCause, input: FailureInput) => (() => void) | undefined;
+}
+
+const FAILURE_LABEL: Record<FailureCause, (agent?: string) => string> = {
+  sign_in: (agent) => agent ? m.chat_failure_signed_out({ name: autoDir(agent) }) : m.onboarding_not_signed_in(),
+  usage_limit: () => m.chat_session_limit_reached(),
+  credits: () => m.chat_failure_credits(),
+  model_unavailable: () => m.chat_model_unavailable(),
+  context_full: () => m.chat_failure_context_full(),
+  overloaded: () => m.chat_failure_overloaded(),
+  network: () => m.chat_panel_temporary_api_error(),
+};
+
+const FIX_LABEL: Partial<Record<FailureCause, () => string>> = {
+  sign_in: () => m.harness_setup_login(),
+  model_unavailable: () => m.model_picker_choose_model(),
+  context_full: () => m.usage_compact(),
+};
+
+function isSignInFailure(part: ChatPart) {
+  return part.state?.input?.cause === "sign_in";
+}
+
 function TurnStatusRow({
   part,
   busy,
   recovering,
   onRecover,
+  failure,
   usageLimited = false,
   temporaryApiError = false,
 }: {
@@ -2494,6 +2781,7 @@ function TurnStatusRow({
   busy: boolean;
   recovering: boolean;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
+  failure?: FailureActions;
 }) {
   const input = part.state?.input;
   const nextRetryAt = input?.nextRetryAt ?? null;
@@ -2520,34 +2808,61 @@ function TurnStatusRow({
   }
   const action = parseRecoveryAction(input?.recoveryAction);
   const turnId = input?.turnId;
-  const label = isModelAccessLimitPart(part)
-    ? m.chat_model_unavailable()
-    : usageLimited ? m.chat_session_limit_reached()
-    : temporaryApiError ? m.chat_panel_temporary_api_error() : m.chat_turn_incomplete();
-  const Icon = temporaryApiError ? WifiOff : usageLimited ? Gauge : TriangleAlert;
-  const errorMessage = cleanToolError(part.state?.error || m.chat_turn_incomplete());
+  const reportedCause = input?.cause;
+  const cause = isSignInFailure(part) ? "sign_in"
+    : reportedCause && Object.hasOwn(FAILURE_LABEL, reportedCause) ? reportedCause
+    : isModelAccessLimitPart(part) ? "model_unavailable" : usageLimited ? "usage_limit" : temporaryApiError ? "network" : undefined;
+  const agent = input && failure?.agent(input);
+  const label = cause ? FAILURE_LABEL[cause](agent && (agent.profile?.name ?? harnessDisplayName(agent))) : m.chat_turn_incomplete();
+  const Icon = cause === "network" ? WifiOff : cause === "overloaded" ? Hourglass : cause === "sign_in" ? LogIn : cause === "usage_limit" ? Gauge : TriangleAlert;
+  const quiet = cause === "network" || cause === "overloaded";
+  const errorMessage = cleanToolError(part.state?.error || "");
+  const fixLabel = cause && FIX_LABEL[cause];
+  const fix = fixLabel && input && failure?.fix(cause, input);
+  // While the agent is signed out, only signing in, here or in the composer, sends the turn again.
+  const waitsForSignIn = cause === "sign_in" && agent?.authState === "needsLogin";
+  const recover = onRecover && turnId && (action === "retry" || action === "continue") && cause !== "usage_limit" && !waitsForSignIn
+    ? action
+    : undefined;
   return (
-    <details className="turn-usage-limit group/limit mt-4 text-base text-subtext">
-      <summary className="flex w-fit max-w-full items-center gap-2 cursor-pointer list-none rounded-sm focus-visible:outline-2 focus-visible:outline-focus [&::-webkit-details-marker]:hidden">
-        <Icon size={18} className={temporaryApiError ? "shrink-0 text-subtext" : "shrink-0 text-accent-red"} aria-hidden="true" />
-        <span>{label}</span>
-        <ChevronRight size={16} className="shrink-0 text-text transition-transform duration-120 ease-standard group-open/limit:rotate-90 motion-reduce:transition-none" aria-hidden="true" />
-      </summary>
-      <pre className="mt-2 rounded-md bg-surface p-2 text-sm font-mono whitespace-pre-wrap wrap-anywhere">
-        {errorMessage}
-      </pre>
-      {!usageLimited && onRecover && turnId && (action === "retry" || action === "continue") && (
-        <Button
-          type="button"
-          size="small"
-          className="mt-2"
-          disabled={busy || recovering}
-          onClick={() => onRecover(turnId, action)}
-        >
-          {recovering ? m.chat_starting() : action === "retry" ? m.app_retry() : m.chat_continue()}
-        </Button>
+    <div className="turn-failure mt-4 text-base text-subtext">
+      <div className="flex items-center justify-between gap-3">
+        <p className="m-0 flex items-center gap-2">
+          <Icon size={18} className={quiet ? "shrink-0 text-subtext" : "shrink-0 text-accent-red"} aria-hidden="true" />
+          <span>{label}</span>
+        </p>
+        {cause === "sign_in" && fix && (
+          <Button type="button" size="small" variant="primary" className="shrink-0" disabled={busy || recovering} onClick={fix} aria-haspopup="dialog">
+            {m.harness_setup_login()}
+          </Button>
+        )}
+      </div>
+      {((fix && cause !== "sign_in") || recover) && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {fix && fixLabel && cause !== "sign_in" && (
+            <Button type="button" size="small" variant="primary" disabled={busy || recovering} onClick={fix}>
+              {fixLabel()}
+            </Button>
+          )}
+          {recover && turnId && (
+            <Button type="button" size="small" disabled={busy || recovering} onClick={() => onRecover?.(turnId, recover)}>
+              {recovering ? m.chat_starting() : recover === "retry" ? m.app_retry() : m.chat_continue()}
+            </Button>
+          )}
+        </div>
       )}
-    </details>
+      {errorMessage && errorMessage !== label && (
+        <Disclosure id={`${part.id}:${turnId ?? ""}`} className="group/limit mt-2">
+          <summary className="flex w-fit max-w-full items-center gap-1.5 cursor-pointer list-none rounded-sm text-sm focus-visible:outline-2 focus-visible:outline-focus [&::-webkit-details-marker]:hidden">
+            <ChevronRight size={14} className="shrink-0 text-text transition-transform duration-120 ease-standard group-open/limit:rotate-90 motion-reduce:transition-none" aria-hidden="true" />
+            <span>{m.onboarding_error_details()}</span>
+          </summary>
+          <pre className="mt-2 rounded-md bg-surface p-2 text-sm font-mono whitespace-pre-wrap wrap-anywhere">
+            {errorMessage}
+          </pre>
+        </Disclosure>
+      )}
+    </div>
   );
 }
 
@@ -2555,8 +2870,12 @@ function TurnStatusRow({
  * raw command/output, because that detail is useful for diagnosis. */
 function ToolRow({
   part,
+  expansionState,
+  revealNonce,
+  revealPartId,
   activity,
   repeatCount = 1,
+  quiet = false,
   onOpenFile,
   onOpenRun,
   onOpenSpawnedSession,
@@ -2565,8 +2884,13 @@ function ToolRow({
   experimentName,
 }: {
   part: ChatPart;
+  expansionState?: Map<string, boolean>;
+  revealNonce?: number;
+  revealPartId?: string;
   activity: ToolActivity;
   repeatCount?: number;
+  /** Supporting work, such as reading code, drawn a step dimmer than research. */
+  quiet?: boolean;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: OpenTranscriptTarget;
   onOpenSpawnedSession?: (sessionId: string) => void;
@@ -2574,12 +2898,20 @@ function ToolRow({
   onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
 }) {
+  const { id: elementId } = useContext(WorkspaceDomContext);
+
   const state = part.state;
   const failed = state?.status === "error";
   const errorMessage = cleanToolError(state?.error || state?.output || "");
   const hasDetail = failed && Boolean(errorMessage);
-  const [detailOpen, setDetailOpen] = useState(false);
-  const detailId = `tool-error-${part.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  const key = `error:${part.id}`;
+  const [detailOpen, setDetailOpen] = useState(() => expansionState?.get(key) ?? false);
+  useLayoutEffect(() => {
+    if (revealNonce === undefined || !hasDetail || part.id !== revealPartId) return;
+    expansionState?.set(key, true);
+    setDetailOpen(true);
+  }, [revealNonce, revealPartId, hasDetail, expansionState, key, part.id]);
+  const detailId = elementId(`tool-error-${part.id.replace(/[^A-Za-z0-9_-]/g, "-")}`);
   if (part.id === LOCAL_ERROR_PART_ID) {
     return (
       <div className="local-error mt-4 flex items-start gap-2 text-base text-subtext">
@@ -2601,7 +2933,7 @@ function ToolRow({
       ) : (
         <ToolActivityIcon activity={activity} className="text-muted" />
       )}
-      <span className={`${TOOL_LINE_CLASS_NAME} ${failed ? "text-accent-red" : "text-subtext"}`}>
+      <span className={`${TOOL_LINE_CLASS_NAME} ${failed ? "text-accent-red" : quiet ? "text-muted" : "text-subtext"}`}>
         <ToolActivityLabel
           activity={activity}
           onOpenFile={onOpenFile}
@@ -2621,11 +2953,11 @@ function ToolRow({
   );
 
   if (!hasDetail) {
-    return <div className="tool-row flex items-start gap-2 min-w-0 py-1 px-1">{line}</div>;
+    return <div data-part-id={part.id} className="tool-row flex items-start gap-2 min-w-0 py-1 px-1">{line}</div>;
   }
 
   return (
-    <div className="tool-row tool-row-error flex flex-col min-w-0">
+    <div data-part-id={part.id} className="tool-row tool-row-error flex flex-col min-w-0">
       <div className="flex items-start gap-2 w-fit max-w-full py-1 px-1 min-w-0 rounded-sm">
         {line}
         <button
@@ -2634,7 +2966,7 @@ function ToolRow({
           aria-expanded={detailOpen}
           aria-controls={detailId}
           aria-label={detailOpen ? m.a11y_hide_error_details({ activity: activity.label }) : m.a11y_show_error_details({ activity: activity.label })}
-          onClick={() => setDetailOpen((current) => !current)}
+          onClick={() => { expansionState?.set(key, !detailOpen); setDetailOpen(!detailOpen); }}
         >
           <ChevronRight size={16} className={`text-accent-red transition-transform duration-120 ease-standard ${detailOpen ? "rotate-90" : ""}`} />
         </button>
@@ -2655,8 +2987,12 @@ function ToolRow({
 function ToolGroup({
   parts,
   expansionState,
+  revealNonce,
+  revealPartId,
   pendingTail,
   streaming = false,
+  summary,
+  quiet = false,
   onOpenSubagent,
   onOpenFile,
   onOpenRun,
@@ -2667,8 +3003,13 @@ function ToolGroup({
 }: {
   parts: ChatPart[];
   expansionState?: Map<string, boolean>;
+  revealNonce?: number;
+  revealPartId?: string;
   pendingTail?: boolean;
   streaming?: boolean;
+  /** What the closed group says it did; "Used tools" when absent. */
+  summary?: string;
+  quiet?: boolean;
   onOpenSubagent?: OpenSubagent;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: OpenTranscriptTarget;
@@ -2677,11 +3018,19 @@ function ToolGroup({
   onOpenExperiment?: OpenTranscriptTarget;
   experimentName?: (experimentId: string) => string;
 }) {
-  const [open, setOpen] = useState(() => expansionState?.get(parts[0].id) ?? false);
+  const key = `tool:${parts[0].id}`;
+  const [open, setOpen] = useState(() => expansionState?.get(key) ?? false);
   const [hasOpened, setHasOpened] = useState(open);
+  const holdsRevealedPart = revealPartId !== undefined && findPartById(parts, revealPartId) !== null;
+  useLayoutEffect(() => {
+    if (revealNonce === undefined || !holdsRevealedPart) return;
+    expansionState?.set(key, true);
+    setOpen(true);
+    setHasOpened(true);
+  }, [revealNonce, holdsRevealedPart, expansionState, key]);
   const toggle = () => {
     setHasOpened(true);
-    expansionState?.set(parts[0].id, !open);
+    expansionState?.set(key, !open);
     setOpen(!open);
   };
   const displayParts = squashToolParts(parts);
@@ -2704,7 +3053,7 @@ function ToolGroup({
   const iconActivity = pendingActivity ?? groupIconActivity(activities);
   const summaryLabel = pendingActivity
     ? pendingActivity.label
-    : m.chat_panel_used_tools();
+    : summary ?? m.chat_panel_used_tools();
   if (parts.length === 1) {
     if (isSubagentPart(parts[0])) {
       return (
@@ -2745,6 +3094,7 @@ function ToolGroup({
         <ToolRow
           part={parts[0]}
           activity={displayParts[0].activity}
+          quiet={quiet}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
           onOpenSpawnedSession={onOpenSpawnedSession}
@@ -2758,7 +3108,7 @@ function ToolGroup({
 
   return (
     <div className="tool-group my-3.5 mx-0">
-      <div className="tool-group-summary flex items-start gap-2 w-fit max-w-full py-1 px-1 text-base leading-6 text-subtext text-start">
+      <div className={`tool-group-summary flex items-start gap-2 w-fit max-w-full py-1 px-1 text-base leading-6 text-start ${quiet && !pendingActivity ? "text-muted" : "text-subtext"}`}>
         <ToolActivityIcon activity={iconActivity} className={shimmering ? "tool-running-shimmer-icon" : "text-muted"} />
         {pendingActivity ? (
           <span
@@ -2813,8 +3163,12 @@ function ToolGroup({
               <ToolRow
                 key={part.id}
                 part={part}
+                expansionState={expansionState}
+                revealNonce={revealNonce}
+                revealPartId={revealPartId}
                 repeatCount={count}
                 activity={activity}
+                quiet={quiet}
                 onOpenFile={onOpenFile}
                 onOpenRun={onOpenRun}
                 onOpenSpawnedSession={onOpenSpawnedSession}
@@ -2830,9 +3184,230 @@ function ToolGroup({
   );
 }
 
-/** Interactive card for a plan / permission / question prompt. Approving (or
- * answering) resumes the session. Once resolved, cards mirror Claude Code:
- * a permission leaves no trace, a plan collapses to an expandable
+type ToolFacet = "literature" | "runs" | "experiments" | "guides" | "reports" | "code" | "other";
+
+function toolFacet(part: ChatPart, activity: ToolActivity): ToolFacet {
+  if (isSubagentPart(part) || activity.aside) return "other";
+  if (activity.litCall) return "literature";
+  switch (activity.kind) {
+    case "run":
+    case "log":
+      return "runs";
+    case "project":
+      return "experiments";
+    case "skill":
+      return "guides";
+    case "edit":
+      return reportPath(activity) ? "reports" : "code";
+    case "read":
+    case "search":
+    case "command":
+      return "code";
+    default:
+      return "other";
+  }
+}
+
+/** A Markdown file the agent wrote to the artifacts directory. */
+function reportPath(activity: ToolActivity): string | null {
+  const path = activity.kind === "edit" ? activity.filePath : undefined;
+  return path && /(?:^|[\\/])artifacts[\\/].+\.md$/i.test(path) ? path : null;
+}
+
+/** The papers a call finished reading, which the shelf shows in place of its row. */
+function shelvedPapers(part: ChatPart, activity: ToolActivity): ShelfPaper[] {
+  const lit = activity.litCall;
+  if (lit?.kind !== "paper" || part.state?.status !== "completed") return [];
+  const ids = activity.paperIds ?? (lit.id ? [lit.id] : []);
+  return ids.map((id) => ({
+    source: ids.length === 1 ? lit.source : parseOrxLit(["orx", "paper", id])?.source ?? lit.source,
+    id,
+    output: ids.length === 1 ? part.state?.output : undefined,
+  }));
+}
+
+function literatureSearches(activity: ToolActivity): number {
+  return activity.litCall && activity.kind === "search" ? Math.max(1, activity.queries?.length ?? 0) : 0;
+}
+
+/** The runs a call names that this workspace knows. */
+function knownRunIds(activity: ToolActivity, runExperimentName?: (runId: string) => string): string[] {
+  if (activity.kind !== "run" && activity.kind !== "log") return [];
+  return (activity.runIds ?? []).filter((runId) => !runExperimentName || Boolean(runExperimentName(runId)));
+}
+
+/** One line for a stretch of code work: the file it touched, else how much it did. */
+function codeSummary(activities: ToolActivity[]): string {
+  const files = new Map<string, { read: boolean; edited: boolean }>();
+  let commands = 0;
+  for (const activity of activities) {
+    if ((activity.kind === "read" || activity.kind === "edit") && activity.labelTarget) {
+      const file = files.get(activity.labelTarget) ?? { read: false, edited: false };
+      if (activity.kind === "read") file.read = true;
+      else file.edited = true;
+      files.set(activity.labelTarget, file);
+    } else {
+      commands++;
+    }
+  }
+
+  if (files.size === 1) {
+    const [[name, { read, edited }]] = [...files];
+    const target = ltr(name);
+    if (commands > 0) {
+      const [one, other] = edited
+        ? [m.activity_worked_on_and_ran_one, m.activity_worked_on_and_ran_other]
+        : [m.activity_read_and_ran_one, m.activity_read_and_ran_other];
+      return pluralMessage(commands, one, other)({ target, count: fmtNumber(commands) });
+    }
+    if (read && edited) return m.activity_read_and_edited({ target });
+    return edited ? m.activity_edited_target({ target }) : m.activity_read_target({ target });
+  }
+  if (files.size === 0) return pluralMessage(commands, m.activity_ran_commands_one, m.activity_ran_commands_other)({ count: fmtNumber(commands) });
+  return m.activity_worked_on_files({ count: fmtNumber(files.size) });
+}
+
+function reportTitle(parts: ChatPart[], path: string): { title: string; lines: number | null } {
+  for (const part of [...parts].reverse()) {
+    const input = part.state?.input ?? {};
+    const content = typeof input.content === "string" ? input.content : null;
+    if (!content || toolActivity(part).filePath !== path) continue;
+    const heading = /^#\s+(.+)$/m.exec(content)?.[1]?.trim();
+    return { title: heading || baseName(path), lines: content.replace(/\n$/, "").split("\n").length };
+  }
+  return { title: baseName(path), lines: null };
+}
+
+type ToolGroupProps = React.ComponentProps<typeof ToolGroup>;
+
+/** A run of tool calls sorted by what the research did: papers read, runs
+ * launched, reports written, then the code and other work that supported it.
+ * The calls still pending sort last, where the current step shows. */
+function ResearchToolRun({ parts, pendingTail, discovered, ...props }: ToolGroupProps & {
+  /** Papers `orx discover` found earlier in the message, for naming the papers read. */
+  discovered: () => Map<string, PaperMeta>;
+}) {
+  const pendingId = pendingTail ? parts.at(-1)?.id : undefined;
+  const facets = new Map<ToolFacet, ChatPart[]>();
+  for (const part of parts) {
+    const facet = toolFacet(part, toolActivity(part));
+    facets.set(facet, [...(facets.get(facet) ?? []), part]);
+  }
+  const ordered = [...facets].sort(([, a], [, b]) =>
+    Number(a.some((part) => part.id === pendingId)) - Number(b.some((part) => part.id === pendingId)));
+  const group = (groupParts: ChatPart[], extra: Partial<ToolGroupProps> = {}) => (
+    <ToolGroup
+      key={`tg-${groupParts[0].id}`}
+      {...props}
+      {...extra}
+      parts={groupParts}
+      pendingTail={groupParts.some((part) => part.id === pendingId)}
+    />
+  );
+
+  return ordered.map(([facet, facetParts]) => {
+    const activities = facetParts.map(toolActivity);
+    switch (facet) {
+      case "literature": {
+        const shelf = new Map<string, ShelfPaper>();
+        const rows: ChatPart[] = [];
+        for (const part of facetParts) {
+          const papers = shelvedPapers(part, toolActivity(part));
+          for (const paper of papers) {
+            const key = `${paper.source}:${paper.id}`;
+            const shelved = shelf.get(key) ?? { ...paper, partIds: [] };
+            shelved.partIds?.push(part.id);
+            shelf.set(key, shelved);
+          }
+          if (papers.length === 0) rows.push(part);
+        }
+        const searches = rows.reduce((total, part) => total + literatureSearches(toolActivity(part)), 0);
+        const summary = searches > 0
+          ? pluralMessage(searches, m.activity_surveyed_literature_one, m.activity_surveyed_literature_other)({ count: fmtNumber(searches) })
+          : m.activity_checked_literature();
+        return (
+          <Fragment key={`literature-${facetParts[0].id}`}>
+            {rows.length > 0 && group(rows, { summary })}
+            {shelf.size > 0 && <PaperShelf papers={[...shelf.values()]} discovered={discovered()} />}
+          </Fragment>
+        );
+      }
+      case "runs": {
+        const cards = new Map<string, ChatPart[]>();
+        const rows: ChatPart[] = [];
+        for (const part of facetParts) {
+          const runIds = part.state?.status === "error" ? [] : knownRunIds(toolActivity(part), props.runExperimentName);
+          for (const runId of runIds) cards.set(runId, [...(cards.get(runId) ?? []), part]);
+          if (runIds.length === 0) rows.push(part);
+        }
+        return (
+          <Fragment key={`runs-${facetParts[0].id}`}>
+            {rows.length > 0 && group(rows, {
+              quiet: true,
+              summary: rows.every((part) => toolActivity(part).kind === "log") ? m.activity_reviewed_run_logs() : m.activity_checked_experiments(),
+            })}
+            {[...cards].map(([runId, runParts]) => {
+              const part = runParts.at(-1)!;
+              const pending = part.id === pendingId && part.state?.status === "running";
+              const activity = pending ? activityInProgress(toolActivity(part)) : toolActivity(part);
+              const name = props.runExperimentName?.(runId) || m.tree_experiment();
+              return (
+                <RunCard
+                  key={runId}
+                  runId={runId}
+                  label={activity.runLabel?.(autoDir(name)) ?? activity.label}
+                  pending={pending}
+                  partIds={runParts.map((runPart) => runPart.id)}
+                  onOpenRun={props.onOpenRun}
+                />
+              );
+            })}
+          </Fragment>
+        );
+      }
+      case "experiments":
+        return group(facetParts, { quiet: true, summary: m.activity_checked_experiments() });
+      case "guides": {
+        const count = fmtNumber(facetParts.length);
+        const summary = activities.every((activity) => activity.guide)
+          ? pluralMessage(facetParts.length, m.activity_loaded_research_guides_one, m.activity_loaded_research_guides_other)({ count })
+          : pluralMessage(facetParts.length, m.activity_loaded_skills_one, m.activity_loaded_skills_other)({ count });
+        return group(facetParts, { quiet: true, summary });
+      }
+      case "reports": {
+        const reports = new Set<string>();
+        const rows: ChatPart[] = [];
+        for (const part of facetParts) {
+          const path = reportPath(toolActivity(part));
+          if (path && part.state?.status === "completed") reports.add(path);
+          else rows.push(part);
+        }
+        return (
+          <Fragment key={`reports-${facetParts[0].id}`}>
+            {rows.length > 0 && group(rows)}
+            {[...reports].map((path) => (
+              <ReportCard
+                key={path}
+                path={path}
+                {...reportTitle(facetParts, path)}
+                partIds={facetParts.filter((part) => toolActivity(part).filePath === path).map((part) => part.id)}
+                onOpen={props.onOpenFile && ((target, intent) => props.onOpenFile?.(target, undefined, undefined, undefined, intent))}
+              />
+            ))}
+          </Fragment>
+        );
+      }
+      case "code":
+        return group(facetParts, { quiet: true, summary: codeSummary(activities) });
+      case "other":
+        return group(facetParts);
+    }
+  });
+}
+
+/** Interactive card for a plan / permission prompt, and the record of an
+ * answered question. Approving resumes the session. Once resolved, cards
+ * mirror Claude Code: a permission leaves no trace, a plan collapses to an expandable
  * "Proposed plan" row, a question collapses to a compact record of the
  * chosen answer — all inline at the card's chronological position. */
 function PromptCard({
@@ -2850,9 +3425,8 @@ function PromptCard({
   onOpenFile?: OpenTranscriptFile;
   onOpenPlan?: (plan: string, promptId: string, intent: TabOpenIntent) => void;
 }) {
+  const { id: elementId } = useContext(WorkspaceDomContext);
   const p = part.prompt;
-  const [picked, setPicked] = useState<string[]>([]);
-  const [answerText, setAnswerText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   if (!p) return null;
   // Read-only host (no onRespond): actions disabled or hidden, card visible.
@@ -2862,14 +3436,13 @@ function PromptCard({
     if (!onRespond || submitting) return;
     setSubmitting(true);
     try {
-      if (await onRespond({ promptId: part.id, ...answer })) {
-        setAnswerText("");
-        setPicked([]);
-      }
+      await onRespond({ promptId: part.id, ...answer });
     } finally {
       setSubmitting(false);
     }
   };
+
+  if (p.kind === "env") return <EnvRequestCard part={part} done={done} respond={respond} />;
 
   // Resolved rendering, keyed off `resolved` alone (`done` also covers
   // read-only hosts, where an *unresolved* card must stay visible).
@@ -2885,7 +3458,7 @@ function PromptCard({
             : { label: m.chat_panel_plan_resolved(), icon: FileText, iconClass: "text-muted" };
       const OutcomeIcon = outcome.icon;
       return (
-        <details className={PLAN_RESOLVED_CLASS_NAME}>
+        <Disclosure id={part.id} className={PLAN_RESOLVED_CLASS_NAME}>
           <summary>
             <span className="plan-resolved-label text-base font-normal wrap-anywhere">
               {p.synthesized ? m.chat_plan() : m.chat_proposed_plan()}
@@ -2898,19 +3471,19 @@ function PromptCard({
             <Md text={p.plan ?? ""} onOpenFile={onOpenFile} />
             {p.note && <div className="prompt-collapsed-note mt-1.5 italic">{p.note}</div>}
           </div>
-        </details>
+        </Disclosure>
       );
     }
     const chosen = [(p.answers ?? []).join(", "), p.note].filter(Boolean).join("\n\n");
     if (p.approved === false && !chosen) {
       return (
-        <details className="group/question py-1 text-base text-subtext">
+        <Disclosure id={part.id} className="group/question py-1 text-base text-subtext">
           <summary className="flex w-fit max-w-full items-center gap-2 cursor-pointer list-none rounded-sm focus-visible:outline-2 focus-visible:outline-focus [&::-webkit-details-marker]:hidden">
             <span>{m.chat_question()} — {m.chat_question_skipped()}</span>
             <ChevronRight size={16} className="shrink-0 text-text transition-transform duration-120 ease-standard group-open/question:rotate-90 motion-reduce:transition-none" aria-hidden="true" />
           </summary>
           <div className="mt-1 leading-normal text-subtext whitespace-pre-line wrap-anywhere">{questionText}</div>
-        </details>
+        </Disclosure>
       );
     }
     const annotations: ComposerAnnotation[] = (p.annotations ?? []).map((annotation, index) => ({
@@ -2921,12 +3494,14 @@ function PromptCard({
     return (
       <div className="flex flex-col gap-3 py-1">
         {questionText && <div className="text-base text-text leading-normal whitespace-pre-line wrap-anywhere">{questionText}</div>}
-        {!answerInTranscript && (
+        {!answerInTranscript && (p.answeredBy ? (
+          <AgentMessageCard part={{ id: part.id, type: "text", text: chosen, orx: { kind: "message", from: p.answeredBy } }} onOpenFile={onOpenFile} />
+        ) : (
           <div className="ms-auto max-w-[88%] rounded-2xl bg-panel px-4 py-3 text-base text-text whitespace-pre-wrap wrap-anywhere">
             {questionText && <div className="mb-1 truncate text-subtext">{questionText}</div>}
             {chosen}
           </div>
-        )}
+        ))}
         {annotations.length > 0 && <AnnotationsPopover annotations={annotations} variant="sent" />}
       </div>
     );
@@ -2987,7 +3562,7 @@ function PromptCard({
       (typeof p.toolInput?.reason === "string" && p.toolInput.reason) || "";
     const description = inputString(toolInput, "description") || "";
     const explanation = p.header || reason || description || (summary ? "" : permissionActivityLabel(p.tool, toolInput));
-    const headingId = `permission-heading-${part.id}`;
+    const headingId = elementId(`permission-heading-${part.id}`);
     const alphaxivTool = p.tool?.match(ALPHAXIV_TOOL)?.[1]?.toLowerCase();
     const alphaxivWrite = alphaxivTool === "save_papers_to_folder" || alphaxivTool === "create_folder" ? alphaxivTool : null;
     return (
@@ -3046,77 +3621,8 @@ function PromptCard({
     );
   }
 
-  const toggle = (label: string) => {
-    setAnswerText("");
-    setPicked((cur) => p.multiSelect
-      ? cur.includes(label) ? cur.filter((item) => item !== label) : [...cur, label]
-      : [label]);
-  };
-  const submit = () => {
-    if (!done && (answerText.trim() || picked.length > 0)) {
-      void respond({ answers: picked, note: answerText.trim() || undefined });
-    }
-  };
-  const skip = () => void respond({ approve: false });
-  return (
-    <div className="prompt-card question flex flex-col gap-2 rounded-lg border border-border bg-surface p-3" role="group" aria-labelledby={`question-${part.id}`}>
-      <div className="flex items-center gap-2 text-subtext">
-        <HelpCircle size={18} aria-hidden="true" />
-        <span className="flex-1 text-sm">{p.header || m.chat_question()}</span>
-        {onRespond && <IconButton aria-label={m.chat_question_skip()} disabled={done} onClick={skip}><X size={16} /></IconButton>}
-      </div>
-      <div id={`question-${part.id}`} className="text-base font-medium leading-snug text-text whitespace-pre-line wrap-anywhere">{p.question?.replace(/\n\s*\n/g, "\n")}</div>
-      {(p.options?.length ?? 0) > 0 && (
-        <div className="prompt-options flex flex-col">
-          {p.options?.map((option, index) => {
-            const selected = picked.includes(option.label);
-            return (
-              <button
-                type="button"
-                key={option.label}
-                aria-pressed={selected}
-                className={`prompt-option flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-start text-text cursor-pointer transition-colors duration-120 ease-standard enabled:hover:bg-highlight focus-visible:bg-highlight focus-visible:outline-2 focus-visible:outline-focus disabled:cursor-default ${selected ? "bg-panel" : ""}`}
-                disabled={done}
-                onClick={() => toggle(option.label)}
-              >
-                <span className={`flex size-6 shrink-0 items-center justify-center rounded-md border text-sm ${selected ? "border-text bg-surface text-text" : "border-border bg-background text-subtext"}`}>{selected ? <Check size={14} /> : index + 1}</span>
-                <span className="min-w-0 text-base">
-                  <span>{option.label}</span>
-                  {option.description && <span className="ms-2 text-sm text-subtext">{option.description}</span>}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-      {onRespond && (
-        <form className="flex flex-wrap items-end gap-2" onSubmit={(event) => { event.preventDefault(); submit(); }}>
-          <div className="flex min-w-0 basis-48 grow items-start gap-2">
-            <Pencil size={18} className="mt-2 shrink-0 text-subtext" aria-hidden="true" />
-            <Textarea
-              variant="inline"
-              aria-label={m.chat_question_your_answer()}
-              placeholder={m.chat_question_custom_response()}
-              value={answerText}
-              onChange={(event) => { setAnswerText(event.target.value); setPicked([]); }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
-                  event.preventDefault();
-                  submit();
-                }
-              }}
-              disabled={done}
-              rows={1}
-            />
-          </div>
-          <div className="ms-auto flex items-center gap-2">
-            <Button type="button" disabled={done} onClick={skip}>{m.chat_question_skip()}</Button>
-            <Button type="submit" variant="primary" disabled={done || (!answerText.trim() && picked.length === 0)}>{m.chat_panel_send()}</Button>
-          </div>
-        </form>
-      )}
-    </div>
-  );
+  // An open question is answered from the composer (`QuestionDock`).
+  return null;
 }
 
 /** Whether a message renders anything once resolved-permission cards vanish —
@@ -3137,7 +3643,7 @@ function messageHasVisibleContent(m: ChatMessage, activePermissionId?: string | 
  * memo stops those from touching the rows at all. */
 /** Resolve an `image` (attachment) part into what the transcript renders: a
  * source URL, whether it's a PDF (file chip vs inline image), and a name. */
-function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: string } {
+function attachmentPartView(p: ChatPart, chatAttachmentUrl: (name: string) => string): { src: string; isPdf: boolean; name: string } {
   const raw = p.text ?? "";
   const src = raw.startsWith("data:") ? raw : chatAttachmentUrl(raw);
   // Server file names embed the original after a `__` marker; optimistic parts
@@ -3153,16 +3659,20 @@ function attachmentPartView(p: ChatPart): { src: string; isPdf: boolean; name: s
   return { src, isPdf, name };
 }
 
-function downloadMarkdown(fileName: string, markdown: string) {
-  const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = fileName;
-  // Safari ignores a detached anchor and cancels a download whose blob is revoked too early.
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+/** Where a chat moved to another agent, its model named as the picker names it. */
+function SwitchNotice({ part }: { part: ChatPart }) {
+  const modelName = useModelName();
+  const input = part.state?.input ?? {};
+  const harness = inputString(input, "harness") ?? "";
+  const name = inputString(input, "name") ?? harness;
+  const model = inputString(input, "model");
+  const label = model && (modelName({ harness: harness as HarnessId, profile: inputString(input, "profile"), model }) ?? modelLabel(model));
+  return (
+    <div role="status" data-provider-switch className="flex items-center gap-2 py-2 text-sm text-subtext">
+      <ArrowRightLeft size={16} className="shrink-0" aria-hidden="true" />
+      <span className="min-w-0 wrap-anywhere">{label ? m.chat_switched_agent({ agent: name, model: label }) : m.chat_switched_agent_only({ agent: name })}</span>
+    </div>
+  );
 }
 
 /** The pager stays visible once a prompt has more than one version — hiding it
@@ -3178,6 +3688,7 @@ function ForkControls({
   pagerDisabled,
   onEdit,
   editDisabled,
+  citeRef,
 }: {
   text: string;
   createdAt: number;
@@ -3189,6 +3700,8 @@ function ForkControls({
   pagerDisabled: boolean;
   onEdit: () => void;
   editDisabled: boolean;
+  /** The ref Copy link puts on the clipboard, once the message is saved. */
+  citeRef?: string;
 }) {
   const many = count > 1;
   const sentAt = new Date(createdAt);
@@ -3231,6 +3744,13 @@ function ForkControls({
         <IconButton size="small" aria-label={m.md_copy()} disabled={!text} onClick={copy}>
           <Copy size={14} />
         </IconButton>
+        {citeRef && (
+          <Tooltip interactive content={m.chat_copy_message_link()}>
+            <IconButton size="small" aria-label={m.chat_copy_message_link()} onClick={() => void copyToClipboard(citeRef)}>
+              <Link size={14} />
+            </IconButton>
+          </Tooltip>
+        )}
       </div>
       <Tooltip interactive content={m.chat_panel_edit_and_re_send()}>
         <IconButton size="small"
@@ -3263,6 +3783,7 @@ export const Message = memo(function Message({
   busy = false,
   recoveringTurnId,
   onRecover,
+  failure,
   skills,
   predictTextTail = false,
   forkCount,
@@ -3273,6 +3794,9 @@ export const Message = memo(function Message({
   branchDisabled,
   onFork,
   onSelectFork,
+  expansionState,
+  revealNonce,
+  revealPartId,
 }: {
   message: ChatMessage;
   responseMessages?: ChatMessage[];
@@ -3293,6 +3817,7 @@ export const Message = memo(function Message({
   busy?: boolean;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
+  failure?: FailureActions;
   /** Known slash-skills, for rendering a `/name` token as a command chip. */
   skills?: SkillInfo[];
   predictTextTail?: boolean;
@@ -3307,14 +3832,37 @@ export const Message = memo(function Message({
   branchDisabled: boolean;
   onFork: (messageId: string, text: string) => void;
   onSelectFork: (leafId: string) => void;
+  expansionState?: Map<string, boolean>;
+  revealNonce?: number;
+  /** Only the tool group and error detail holding this part open on reveal. */
+  revealPartId?: string;
 }) {
+  const { chatAttachmentUrl } = useWorkspace().api;
   useLocale();
   // Editing re-asks as a new fork rather than rewriting history, so the original
   // stays reachable through the pager.
   const [editDraft, setEditDraft] = useState<string | null>(null);
   const shell = shellExchangePart(message);
   if (shell) return <ShellExchangeCard part={shell} />;
+  const providerSwitch = message.parts.find((part) => part.tool === "provider_switch");
+  if (providerSwitch) return <SwitchNotice part={providerSwitch} />;
   if (message.role === "user") {
+    const sent = message.parts.filter((part): part is ChatPart & { orx: OrxSource } => Boolean(part.orx));
+    if (sent.length > 0) {
+      return (
+        <div className="msg-agent-group flex flex-col items-start gap-2">
+          {sent.map((part) => (
+            <AgentMessageCard
+              key={part.id}
+              part={part}
+              runExperimentName={runExperimentName}
+              onOpenFile={onOpenFile}
+              onOpenRun={onOpenRun}
+            />
+          ))}
+        </div>
+      );
+    }
     const text = replies?.textById.get(message.id) ?? message.parts
       .filter((p) => p.type === "text")
       .map((p) => p.text ?? "")
@@ -3325,7 +3873,7 @@ export const Message = memo(function Message({
     // Optimistic parts carry a data URL; server parts carry a file name.
     const attachments = message.parts
       .filter((p) => p.type === "image" && p.text)
-      .map(attachmentPartView);
+      .map((part) => attachmentPartView(part, chatAttachmentUrl));
     const images = attachments.filter((a) => !a.isPdf);
     const files = attachments.filter((a) => a.isPdf);
     const annotations: ComposerAnnotation[] = message.parts
@@ -3391,7 +3939,7 @@ export const Message = memo(function Message({
         {annotations.length > 0 && (
           <AnnotationsPopover annotations={annotations} variant="sent" />
         )}
-        <div dir="auto" className="msg-user max-w-full bg-panel rounded-2xl py-2.5 px-4 text-base whitespace-pre-wrap wrap-anywhere [&_.skill-chip]:align-baseline">
+        <div dir="auto" className={`msg-user max-w-full ${USER_MESSAGE_BUBBLE_CLASS_NAME} [&_.skill-chip]:align-baseline [&_.context-pill]:border-border [&_.context-pill]:bg-highlight [&_.context-pill:hover]:bg-border`}>
           {replies?.questionById.has(message.id) && <div className="mb-1 truncate text-subtext">{replies.questionById.get(message.id)}</div>}
           <MessageWithChips text={text} isCommand={isCommand} />
           {images.length > 0 && (
@@ -3414,7 +3962,10 @@ export const Message = memo(function Message({
             </div>
           )}
         </div>
-        {forkCount !== undefined && (
+        {forkCount === undefined ? message.id.startsWith(LOCAL_PREFIX) && (
+          // Holds the controls' row so the server's copy of a just-sent message moves nothing below it.
+          <div aria-hidden="true" className="h-7" />
+        ) : (
           <ForkControls
             text={text}
             createdAt={message.createdAt}
@@ -3426,6 +3977,7 @@ export const Message = memo(function Message({
             pagerDisabled={branchDisabled}
             onEdit={() => setEditDraft(text)}
             editDisabled={forkDisabled}
+            citeRef={messageRef(message.id)}
           />
         )}
       </div>
@@ -3438,10 +3990,14 @@ export const Message = memo(function Message({
   const response = splitResponseParts(turns, predictTextTail, replies);
   const predictingAnswer = predictTextTail && response.answerMessageId === message.id;
   const copyText = predictingAnswer && !message.completedAt ? "" : responseText({ ...message, parts: response.answer });
+  const answerRef = messageRef(response.answerMessageId ?? message.id);
   return (
     <div className="msg-assistant group/turn text-base leading-relaxed text-text min-w-0">
       {turns.length > 0 && <AssistantTurn messages={turns} response={response} options={{
         replies,
+        expansionState,
+        revealNonce,
+        revealPartId,
         activePermissionId,
         pendingTailToolId,
         onOpenFile,
@@ -3464,6 +4020,7 @@ export const Message = memo(function Message({
           busy={busy}
           recovering={recoveringTurnId === turnStatus.state?.input?.turnId}
           onRecover={onRecover}
+          failure={failure}
         />
       ))}
       {localErrors.map((turn) => (
@@ -3482,11 +4039,106 @@ export const Message = memo(function Message({
               <Copy size={14} />
             </IconButton>
           </Tooltip>
+          {answerRef && (
+            <Tooltip interactive content={m.chat_copy_message_link()}>
+              <IconButton
+                size="small"
+                aria-label={m.chat_copy_message_link()}
+                onClick={() => void copyToClipboard(answerRef)}
+              >
+                <Link size={14} />
+              </IconButton>
+            </Tooltip>
+          )}
         </div>
       )}
     </div>
   );
 });
+
+interface ReceiptItem {
+  icon: React.ReactNode;
+  label: string;
+}
+
+/** What a finished turn produced, for its fold line: papers it read (or the
+ * searches, when it read none), runs, reports and figures. */
+function turnReceipt(parts: ChatPart[], figures: number, runExperimentName?: (runId: string) => string): ReceiptItem[] {
+  const papers = new Map<string, ShelfPaper>();
+  const runs = new Set<string>();
+  const reports = new Set<string>();
+  let searches = 0;
+  let searchSource: ShelfPaper["source"] | null = null;
+  for (const part of parts) {
+    if (part.type !== "tool") continue;
+    const activity = toolActivity(part);
+    for (const paper of shelvedPapers(part, activity)) papers.set(`${paper.source}:${paper.id}`, paper);
+    searches += literatureSearches(activity);
+    if (literatureSearches(activity) > 0) searchSource ??= activity.litCall?.source ?? null;
+    if (part.state?.status !== "error") for (const runId of knownRunIds(activity, runExperimentName)) runs.add(runId);
+    const report = reportPath(activity);
+    if (report && part.state?.status === "completed") reports.add(report);
+  }
+
+  const icon = (Icon: typeof FlaskConical) => <Icon size={16} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-muted" />;
+  const logo = (source: ShelfPaper["source"]) => <LitSourceLogo source={source} size={16} decorative />;
+  const count = (value: number, one: (params: { count: string }) => string, other: (params: { count: string }) => string) =>
+    pluralMessage(value, one, other)({ count: fmtNumber(value) });
+  const items: ReceiptItem[] = [];
+  const firstPaper = papers.values().next().value;
+  if (firstPaper) items.push({ icon: logo(firstPaper.source), label: count(papers.size, m.chat_receipt_papers_one, m.chat_receipt_papers_other) });
+  else if (searches > 0 && searchSource) items.push({ icon: logo(searchSource), label: count(searches, m.chat_receipt_searches_one, m.chat_receipt_searches_other) });
+  if (runs.size > 0) items.push({ icon: icon(FlaskConical), label: count(runs.size, m.chat_receipt_runs_one, m.chat_receipt_runs_other) });
+  if (reports.size > 0) items.push({ icon: icon(NotebookText), label: count(reports.size, m.chat_receipt_reports_one, m.chat_receipt_reports_other) });
+  if (figures > 0) items.push({ icon: icon(ChartSpline), label: count(figures, m.chat_receipt_figures_one, m.chat_receipt_figures_other) });
+  return items;
+}
+
+/** The papers an answer links, each marked with whether the turn fetched it. */
+function answerSources(answer: ChatPart[], turnParts: ChatPart[]): CitedPaper[] {
+  const read = new Map<string, ShelfPaper>();
+  for (const part of turnParts) {
+    if (part.type !== "tool") continue;
+    for (const paper of shelvedPapers(part, toolActivity(part))) read.set(paperKey(paper.source, paper.id), paper);
+  }
+  const text = answer.flatMap((part) => part.type === "text" && part.text ? [part.text] : []).join("\n");
+  return linkedPapers(text).map((paper) => {
+    const fetched = read.get(paperKey(paper.source, paper.id));
+    return { ...paper, read: Boolean(fetched), output: fetched?.output };
+  });
+}
+
+const TURN_FIGURE_PATH = /\bartifacts\/[^\s"'`)<>]+\.(?:svg|png|jpe?g|gif|webp)\b/i;
+
+/** Images in the artifacts directory a finished turn wrote and named: written
+ * while it ran, and mentioned in its calls or its answer. */
+function useTurnFigures(messages: ChatMessage[], finished: boolean): string[] {
+  const projectId = useContext(FileScopeContext)?.projectId ?? "";
+  const text = useMemo(() => finished
+    ? messages.flatMap((message) => message.parts).map((part) => [
+      part.text,
+      part.state?.output,
+      JSON.stringify(part.state?.input ?? ""),
+    ].join("\n")).join("\n")
+    : "", [messages, finished]);
+  const mentioned = TURN_FIGURE_PATH.test(text);
+  const { getArtifactsQuery } = useWorkspace().queries;
+  const artifacts = useQuery({ ...getArtifactsQuery(projectId), enabled: Boolean(projectId) && mentioned }).data;
+  return useMemo(() => {
+    if (!artifacts || !mentioned) return [];
+    const start = messages[0].createdAt - 1_000;
+    const end = (messages.at(-1)?.completedAt ?? Date.now()) + 5_000;
+    const files: string[] = [];
+    const visit = (entries: ArtifactEntry[]) => {
+      for (const entry of entries) {
+        if (entry.children) visit(entry.children);
+        if (!entry.isDir && entry.presentation === "image" && entry.modifiedAt >= start && entry.modifiedAt <= end && text.includes(entry.path)) files.push(entry.path);
+      }
+    };
+    visit(artifacts.entries);
+    return files;
+  }, [artifacts, mentioned, messages, text]);
+}
 
 function AssistantTurn({ messages, response, options }: {
   messages: ChatMessage[];
@@ -3497,8 +4149,20 @@ function AssistantTurn({ messages, response, options }: {
   const { work, answer, answerMessageId } = response;
   const message = messages[messages.length - 1];
   const answerOptions = { ...options, predictTextTail: streaming && answerMessageId === message.id };
-  const [expanded, setExpanded] = useState(false);
+  const key = messages[0].id;
+  const [expanded, setExpanded] = useState(() => options.expansionState?.get(key) ?? false);
+  const [hasOpened, setHasOpened] = useState(expanded);
+  useLayoutEffect(() => {
+    if (options.revealNonce === undefined) return;
+    options.expansionState?.set(key, true);
+    setHasOpened(true);
+    setExpanded(true);
+  }, [options.revealNonce, options.expansionState, key]);
   const [, tick] = useState(0);
+  const finished = !streaming || message.completedAt != null;
+  const figures = useTurnFigures(messages, finished && work.length > 0);
+  const { artifactUrl } = useWorkspace().api;
+  const projectId = useContext(FileScopeContext)?.projectId;
   useEffect(() => {
     if (!streaming || message.completedAt != null || work.length === 0) return;
     const timer = window.setInterval(() => tick((value) => value + 1), 1000);
@@ -3512,6 +4176,10 @@ function AssistantTurn({ messages, response, options }: {
   const duration = elapsed === null ? null : elapsed < 60_000 || elapsed >= 3_600_000
     ? fmtDuration(elapsed)
     : m.chat_work_duration({ minutes: fmtNumber(Math.floor(elapsed / 60_000)), seconds: fmtNumber(Math.floor(elapsed / 1000) % 60) });
+  const turnParts = [...work.flatMap((turn) => turn.parts), ...answer];
+  const receipt = turnReceipt(work.flatMap((turn) => turn.parts), figures.length, options.runExperimentName);
+  const sources = finished ? answerSources(answer, turnParts) : [];
+  const openFigure = (path: string, intent: TabOpenIntent) => options.onOpenFile?.(`artifacts/${path}`, undefined, undefined, undefined, intent);
   return (
     <>
       <div className="turn-work mb-4">
@@ -3520,22 +4188,50 @@ function AssistantTurn({ messages, response, options }: {
           className="flex w-full items-center gap-1.5 border-b border-border/50 pb-2 text-start text-base text-subtext cursor-pointer hover:text-text focus-visible:outline-2 focus-visible:outline-focus"
           aria-expanded={expanded}
           data-work-toggle
-          onClick={() => setExpanded((value) => !value)}
+          onClick={() => { setHasOpened(true); options.expansionState?.set(key, !expanded); setExpanded(!expanded); }}
         >
-          <span>{duration === null ? m.chat_work_details() : m.chat_worked_for({ duration })}</span>
+          {receipt.length > 0 ? (
+            <span className="min-w-0">
+              {[...receipt, ...(duration === null ? [] : [{ icon: null, label: duration }])].map((item, index) => (
+                <Fragment key={item.label}>
+                  {index > 0 && <span className="text-muted"> · </span>}
+                  <span className="inline-flex items-center gap-1.5 align-top">{item.icon}{item.label}</span>
+                </Fragment>
+              ))}
+            </span>
+          ) : (
+            <span>{duration === null ? m.chat_work_details() : m.chat_worked_for({ duration })}</span>
+          )}
           <ChevronRight size={16} className={`shrink-0 text-muted transition-transform duration-200 ease-standard motion-reduce:transition-none ${expanded ? "rotate-90" : ""}`} />
         </button>
         <div className={`tool-group-disclosure ${expanded ? "open" : ""}`} aria-hidden={!expanded} inert={!expanded}>
           <div className="tool-group-disclosure-inner">
             <div className="turn-work-content flex flex-col gap-4 pt-4">
-              {work.map((turn) => (
+              {hasOpened && work.map((turn) => (
                 <div key={turn.id}>{renderParts(turn.parts, { ...options, predictTextTail: false, pendingTailToolId: turn.id === message.id ? options.pendingTailToolId : null })}</div>
               ))}
+              {hasOpened && projectId && figures.length > 0 && (
+                <FigureReveal
+                  figures={figures}
+                  src={(path) => artifactUrl(projectId, path)}
+                  onOpen={options.onOpenFile && openFigure}
+                  expansionState={options.expansionState}
+                  expansionKey={`figures:${key}`}
+                />
+              )}
             </div>
           </div>
         </div>
       </div>
-      <div className="turn-answer">{renderParts(answer, answerOptions)}</div>
+      <div className="turn-answer">
+        {renderParts(answer, answerOptions)}
+        {sources.length > 0 && (
+          <SourceStrip
+            papers={sources}
+            discovered={discoveredPapers(turnParts.flatMap((part) => part.type === "tool" && part.state?.output ? [part.state.output] : []))}
+          />
+        )}
+      </div>
     </>
   );
 }
@@ -3594,6 +4290,8 @@ function renderParts(
   opts: {
     replies?: QuestionReplies;
     expansionState?: Map<string, boolean>;
+    revealNonce?: number;
+    revealPartId?: string;
     activePermissionId?: string | null;
     pendingTailToolId?: string | null;
     onOpenFile?: OpenTranscriptFile;
@@ -3611,6 +4309,8 @@ function renderParts(
   const {
     replies,
     expansionState,
+    revealNonce,
+    revealPartId,
     activePermissionId,
     pendingTailToolId,
     onOpenFile,
@@ -3631,13 +4331,20 @@ function renderParts(
     .at(-1);
   const rendered: React.ReactNode[] = [];
   let toolRun: ChatPart[] = [];
+  let discoveredCache: Map<string, PaperMeta> | null = null;
+  const discovered = () => discoveredCache ??= discoveredPapers(
+    parts.flatMap((part) => part.type === "tool" && part.state?.output ? [part.state.output] : []),
+  );
   const flushTools = () => {
     if (toolRun.length === 0) return;
     rendered.push(
-      <ToolGroup
+      <ResearchToolRun
         key={`tg-${toolRun[0].id}`}
         parts={toolRun}
+        discovered={discovered}
         expansionState={expansionState}
+        revealNonce={revealNonce}
+        revealPartId={revealPartId}
         pendingTail={toolRun.some((part) => part.id === pendingTailToolId)}
         streaming={predictTextTail}
         onOpenSubagent={onOpenSubagent}
@@ -3674,27 +4381,39 @@ function renderParts(
       rendered.push(
         <Md
           key={part.id}
+          partId={part.id}
           text={part.text!}
           onOpenFile={onOpenFile}
           onOpenRun={onOpenRun}
           predict={predictTextTail && part.id === visibleTail?.id}
         />,
       );
-    else if (part.type === "steer")
-      // A message the user sent into this turn while it ran — the same bubble a
-      // user message gets, sitting where the agent received it.
-      rendered.push(
+    else if (part.type === "steer") {
+      const { orx } = part;
+      rendered.push(orx ? (
+        <div key={part.id} className="my-2">
+          <AgentMessageCard
+            part={{ ...part, orx }}
+            runExperimentName={runExperimentName}
+            onOpenFile={onOpenFile}
+            onOpenRun={onOpenRun}
+          />
+        </div>
+      ) : (
+        // A message the user sent into this turn while it ran — the same bubble a
+        // user message gets, sitting where the agent received it.
         <div
           key={part.id}
           dir="auto"
           role="note"
           aria-label={m.chat_panel_you_mid_task()}
-          className="msg-steer my-2 ms-auto w-fit max-w-[88%] bg-panel rounded-2xl py-2.5 px-4 text-base whitespace-pre-wrap wrap-anywhere"
+          className={`msg-steer my-4 first:mt-0 last:mb-0 ms-auto w-fit max-w-[88%] ${USER_MESSAGE_BUBBLE_CLASS_NAME}`}
         >
           {replies?.questionById.has(part.id) && <div className="mb-1 truncate text-subtext">{replies.questionById.get(part.id)}</div>}
           {replies?.textById.get(part.id) ?? part.text}
-        </div>,
-      );
+        </div>
+      ));
+    }
     else if (part.type === "prompt" && part.prompt?.kind === "question" && !part.prompt.resolved)
       continue;
     else if (part.type === "prompt" && part.prompt)
@@ -3756,6 +4475,9 @@ export function findPartById(parts: ChatPart[], id: string): ChatPart | null {
 export function SubagentTranscript({
   spawn,
   expansionState,
+  searchQuery,
+  searchNonce,
+  searchPartId,
   onOpenFile,
   onOpenRun,
   runExperimentName,
@@ -3765,6 +4487,9 @@ export function SubagentTranscript({
 }: {
   spawn: ChatPart;
   expansionState?: Map<string, boolean>;
+  searchQuery?: string;
+  searchNonce?: number;
+  searchPartId?: string;
   onOpenFile?: OpenTranscriptFile;
   onOpenRun?: OpenTranscriptTarget;
   runExperimentName?: (runId: string) => string;
@@ -3783,6 +4508,8 @@ export function SubagentTranscript({
   // stored transcript of nothing but invisible parts must still read as empty.
   const rendered = renderParts(parts, {
     expansionState,
+    revealNonce: searchQuery ? searchNonce : undefined,
+    revealPartId: searchPartId,
     onOpenFile,
     onOpenRun,
     runExperimentName,
@@ -3812,11 +4539,20 @@ export function SubagentTranscript({
       ) : (
         <>
           {rendered}
-          {finalReport && <Md text={finalReport} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />}
+          {finalReport && <Md text={finalReport} partId={spawn.id} onOpenFile={onOpenFile} onOpenRun={onOpenRun} />}
         </>
       )}
     </div>
   );
+}
+
+const DisclosureState = createContext<Map<string, boolean> | undefined>(undefined);
+
+/** A `<details>` whose open state outlives its virtualized row. */
+function Disclosure({ id, ...props }: React.ComponentProps<"details"> & { id: string }) {
+  const state = useContext(DisclosureState);
+  const [open] = useState(() => state?.get(`details:${id}`) ?? false);
+  return <details {...props} open={open} onToggle={(event) => state?.set(`details:${id}`, event.currentTarget.open)} />;
 }
 
 function AgentUpdateRow({ part }: { part: ChatPart }) {
@@ -3824,12 +4560,12 @@ function AgentUpdateRow({ part }: { part: ChatPart }) {
   const label = <><ToolActivityIcon activity={{ kind: "agent", label: m.activity_sent_update_to_parent() }} className="text-muted" /><span className={`${TOOL_LINE_CLASS_NAME} text-subtext`}>{m.activity_sent_update_to_parent()}</span></>;
   if (!text) return <div className="tool-row flex items-start gap-2 min-w-0 py-1 px-1">{label}</div>;
   return (
-    <details className="min-w-0 [&[open]_.update-chevron]:rotate-90">
+    <Disclosure id={part.id} className="min-w-0 [&[open]_.update-chevron]:rotate-90">
       <summary className="tool-row flex cursor-pointer list-none items-center gap-2 min-w-0 py-1 px-1 rounded-sm focus-visible:outline-2 focus-visible:outline-focus [&::-webkit-details-marker]:hidden">
         {label}<ChevronRight size={12} className="update-chevron text-muted" aria-hidden="true" />
       </summary>
       <div className="ps-7 py-2 text-sm"><Md text={text} /></div>
-    </details>
+    </Disclosure>
   );
 }
 
@@ -3868,6 +4604,7 @@ function SubagentBlock({
   return (
     <button
       className="subagent-row flex items-start gap-2 w-full py-1 px-1 cursor-pointer text-text text-base text-start rounded-sm [&:hover:not(:disabled)]:bg-surface [&:disabled]:cursor-default"
+      data-part-id={part.id}
       title={errored && errorMessage ? errorMessage : m.chat_open_subagent_transcript()}
       {...tabOpenGestureHandlers<HTMLButtonElement>((intent) =>
         onOpenSubagent?.(part.id, activity.label, intent),
@@ -4019,9 +4756,15 @@ function useTranscriptAnnouncement(messages: ChatMessage[]): TranscriptAnnouncem
   return announcement;
 }
 
-// Measured heights outlive the per-chat remount so switching back paints at the real layout.
-const transcriptRowSizes = new Map<string, { size: number; width: number }>();
 const TRANSCRIPT_ROW_SIZES_LIMIT = 5_000;
+
+export type FocusedMessage = { sessionId: string; messageId: string; nonce: number; query?: string; partId?: string; spawnPartId?: string };
+
+// Transcripts remount per chat and side chats per tab switch; a request is handled once, not once per mount.
+let handledFocusNonce: number | undefined;
+let openedSearchNonce: number | undefined;
+/** The opened request whose plan or subagent tab may replace the side pane that searched for it. */
+let handedOffSearchNonce: number | undefined;
 
 const Transcript = memo(function Transcript({
   messages,
@@ -4045,7 +4788,20 @@ const Transcript = memo(function Transcript({
   onOpenSubagent,
   recoveringTurnId,
   onRecover,
+  failure,
   skills,
+  delegates,
+  onOpenDelegate,
+  project,
+  session,
+  focusedMessageId,
+  focusedPartId,
+  focusNonce,
+  searchQuery,
+  programmaticScroll,
+  highlightName,
+  assistantLabel,
+  onLeaveFeed,
 }: {
   /** The branch on screen, oldest first. */
   messages: ChatMessage[];
@@ -4071,8 +4827,27 @@ const Transcript = memo(function Transcript({
   onOpenSubagent?: OpenSubagent;
   recoveringTurnId?: string | null;
   onRecover?: (turnId: string, action: "retry" | "continue") => void;
+  failure?: FailureActions;
   skills?: SkillInfo[];
+  /** Chats this one delegated to, oldest first. */
+  delegates: DelegateRow[];
+  onOpenDelegate?: (sessionId: string) => void;
+  /** The chat and its project, for the projects its agent proposes to create. */
+  project?: Project;
+  session?: ChatSession;
+  focusedMessageId?: string | null;
+  focusedPartId?: string;
+  focusNonce?: number;
+  searchQuery?: string;
+  /** Where the virtualizer last scrolled, so the bottom pin follows only other scrolls. */
+  programmaticScroll: React.RefObject<number | null>;
+  highlightName: string;
+  /** Names each assistant article, as the Markdown export does. */
+  assistantLabel: string;
+  /** Ctrl+End and Ctrl+Home leave the feed, forward or back. */
+  onLeaveFeed: (forward: boolean) => void;
 }) {
+  const { transcriptRowSizes, transcriptDisclosures: disclosures } = useWorkspace();
   useLocale();
   const replies = useMemo(() => questionReplies(messages), [messages]);
   const activePermissionId = firstPendingPermission(messages)?.id ?? null;
@@ -4085,6 +4860,24 @@ const Transcript = memo(function Transcript({
     },
     [messages, activePermissionId],
   );
+  // Each delegate sits under the turn that started it: the last row begun before it was.
+  const delegatesByRow = useMemo(() => {
+    const rows = new Map<number, DelegateRow[]>();
+    for (const delegate of delegates) {
+      const { session } = delegate;
+      let index = -1;
+      visibleMessages.forEach((group, row) => {
+        if (group[0].createdAt <= session.createdAt) index = row;
+      });
+      if (index >= 0) rows.set(index, [...(rows.get(index) ?? []), delegate]);
+    }
+    return rows;
+  }, [visibleMessages, delegates]);
+  const proposalsByRow = useMemo(() => new Map(visibleMessages.flatMap((group, row) => {
+    const proposals = group.flatMap((message) => message.parts.flatMap((part) =>
+      part.type === "tool" ? toolActivity(part).projectProposal ?? [] : []));
+    return proposals.length ? [[row, proposals] as const] : [];
+  })), [visibleMessages]);
   // forkPositions indexes only non-local ids, so a local bearer would page as 0/1.
   const positions = useMemo(() => {
     const bearers = visibleMessages.filter(
@@ -4092,18 +4885,47 @@ const Transcript = memo(function Transcript({
     );
     return forkPositions(allMessages, messages, bearers.map((group) => group[0]), (id) => id.startsWith(LOCAL_PREFIX));
   }, [messages, visibleMessages, allMessages]);
-  // ponytail: interacted rows stay mounted for this visit; lift row state if retention becomes costly.
-  const retainedRows = useRef(new Set<string>());
-  const [fullHistory, setFullHistory] = useState(false);
+  const draftRows = useRef(new Set<string>());
+  const [selectedRows, setSelectedRows] = useState<Set<string>>(() => new Set());
+  const [focusedRow, setFocusedRow] = useState<string | null>(null);
+  const [jumping, setJumping] = useState(false);
+  const feedRef = useRef<HTMLDivElement>(null);
+  const rowIndexes = useMemo(() => new Map(visibleMessages.flatMap((group, index) => group.map((message) => [message.id, index] as const))), [visibleMessages]);
+  const targetIndex = focusedMessageId ? rowIndexes.get(focusedMessageId) : undefined;
   const getItemKey = useCallback((index: number) => visibleMessages[index][0].id, [visibleMessages]);
   const rangeExtractor = useCallback((range: VirtualRange) => {
-    if (fullHistory) return visibleMessages.map((_, index) => index);
     const indexes = new Set(defaultRangeExtractor(range));
-    visibleMessages.forEach((group, index) => {
-      if (retainedRows.current.has(group[0].id)) indexes.add(index);
-    });
+    for (const id of [...selectedRows, ...(focusedRow ? [focusedRow] : [])]) {
+      const index = rowIndexes.get(id);
+      if (index !== undefined) indexes.add(index);
+    }
+    for (const id of draftRows.current) {
+      const row = scrollRef.current?.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
+      const index = rowIndexes.get(id);
+      if (index !== undefined && row?.querySelector("input, textarea, [contenteditable=true]")) indexes.add(index);
+      else draftRows.current.delete(id);
+    }
+    if (jumping && targetIndex !== undefined) indexes.add(targetIndex);
     return [...indexes].sort((a, b) => a - b);
-  }, [visibleMessages, fullHistory]);
+  }, [rowIndexes, focusedRow, selectedRows, jumping, targetIndex, scrollRef]);
+  // The virtualizer re-estimates every unmeasured row whenever a message streams; groups keep their identity until they change.
+  const estimates = useRef(new WeakMap<ChatMessage[], number>());
+  const estimateSize = useCallback((index: number) => {
+    const group = visibleMessages[index];
+    const cached = estimates.current.get(group);
+    if (cached !== undefined) return cached;
+    const user = group[0].role === "user";
+    const response = user ? null : splitResponseParts(group, false);
+    const parts = response?.answer ?? group[0].parts;
+    const text = parts.filter((part) => part.type === "text" || part.type === "steer").map((part) => part.text ?? "").join("\n");
+    const width = scrollRef.current?.querySelector(".chat-thread-inner")?.clientWidth ?? 760;
+    const columns = Math.max(20, Math.floor((width - 32) / 8));
+    const lines = text.split("\n").reduce((total, line) => total + Math.max(1, Math.ceil(line.length / columns)), 0);
+
+    const size = (user ? 56 : response?.work.length ? 72 : 32) + lines * 26;
+    estimates.current.set(group, size);
+    return size;
+  }, [visibleMessages, scrollRef]);
   // Seed via the measurement cache, not estimateSize, so remembered rows count as measured for anchoring.
   const [initialMeasurementsCache] = useState(() => visibleMessages.flatMap((group, index) => {
     const remembered = transcriptRowSizes.get(group[0].id);
@@ -4113,11 +4935,16 @@ const Transcript = memo(function Transcript({
   }));
   // Offscreen rows keep their old height through a resize, so each height carries its measuring width.
   const measuredWidths = useRef(new Map<string, number>());
+  const transcriptColumn = scrollRef.current?.querySelector(".chat-thread-inner");
   const virtualizer = useVirtualizer({
+    useFlushSync: false,
     count: visibleMessages.length,
     getScrollElement: () => scrollRef.current,
     getItemKey,
-    estimateSize: () => 400,
+    estimateSize,
+    directDomUpdates: true,
+    directDomUpdatesMode: "position",
+    scrollMargin: Number.parseFloat(transcriptColumn ? getComputedStyle(transcriptColumn).paddingTop : "0") || 0,
     initialMeasurementsCache,
     measureElement: (element, entry, instance) => {
       const id = element.getAttribute("data-message-id");
@@ -4128,62 +4955,186 @@ const Transcript = memo(function Transcript({
     overscan: 4,
     initialRect: { width: scrollRef.current?.clientWidth ?? 0, height: scrollRef.current?.clientHeight ?? 0 },
     initialOffset: () => {
-      const remembered = initialMeasurementsCache.reduce((total, item) => total + item.size, 0);
-      const estimated = remembered + (visibleMessages.length - initialMeasurementsCache.length) * 400;
+      const remembered = new Map(initialMeasurementsCache.map((item) => [item.key, item.size]));
+      const estimated = visibleMessages.reduce((total, group, index) => total + (remembered.get(group[0].id) ?? estimateSize(index)), 0);
       return Math.max(0, estimated - (scrollRef.current?.clientHeight ?? 0));
     },
     anchorTo: stickToBottom.current ? "end" : "start",
     followOnAppend: true,
     scrollEndThreshold: 60,
     rangeExtractor,
+    scrollToFn: (offset, options, instance) => {
+      // virtual-core passes size corrections with the last scroll event's offset; apply them to the live scrollTop so a scroll since isn't undone.
+      const element = instance.scrollElement;
+      const target = options.adjustments === undefined ? offset : (element?.scrollTop ?? offset) + options.adjustments;
+      // A write that leaves scrollTop in place fires no scroll event, and a stale record would claim the user's next one.
+      const landing = element ? Math.max(0, Math.min(target, element.scrollHeight - element.clientHeight)) : target;
+      programmaticScroll.current = element && Math.abs(landing - element.scrollTop) < 0.5 ? null : landing;
+      elementScroll(target, { behavior: options.behavior }, instance);
+    },
   });
+  const setFeed = useCallback((node: HTMLDivElement | null) => { feedRef.current = node; virtualizer.containerRef(node); }, [virtualizer]);
   useLayoutEffect(() => {
-    const scroll = () => virtualizer.scrollToEnd();
+    const scroll = () => virtualizer.scrollToOffset(scrollRef.current?.scrollHeight ?? 0);
     scrollToEndRef.current = scroll;
     onPinToBottom();
     return () => { scrollToEndRef.current = null; };
-  }, [virtualizer, scrollToEndRef, onPinToBottom]);
+  }, [virtualizer, scrollToEndRef, onPinToBottom, scrollRef]);
   useLayoutEffect(() => () => {
     for (const [key, size] of virtualizer.itemSizeCache) {
       const id = String(key);
       const width = measuredWidths.current.get(id) ?? transcriptRowSizes.get(id)?.width;
       transcriptRowSizes.delete(id);
-      // Interacted rows remount with reset local state (e.g. collapsed work), so their height is stale.
-      if (!retainedRows.current.has(id) && width !== undefined) transcriptRowSizes.set(id, { size, width });
+      if (width !== undefined) transcriptRowSizes.set(id, { size, width });
     }
     for (const id of transcriptRowSizes.keys()) {
       if (transcriptRowSizes.size <= TRANSCRIPT_ROW_SIZES_LIMIT) break;
       transcriptRowSizes.delete(id);
     }
-  }, [virtualizer]);
+  }, [virtualizer, transcriptRowSizes]);
   useEffect(() => {
     const retainSelection = () => {
       const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || !selection.rangeCount) return;
-      const range = selection.getRangeAt(0);
-      for (const row of scrollRef.current?.querySelectorAll<HTMLElement>("[data-message-id]") ?? []) {
-        if (range.intersectsNode(row) && row.dataset.messageId) retainedRows.current.add(row.dataset.messageId);
+      const next = new Set<string>();
+      if (selection && !selection.isCollapsed && selection.rangeCount) {
+        const range = selection.getRangeAt(0);
+        for (const row of scrollRef.current?.querySelectorAll<HTMLElement>("[data-message-id]") ?? []) {
+          if (range.intersectsNode(row) && row.dataset.messageId) next.add(row.dataset.messageId);
+        }
       }
+      setSelectedRows((current) => current.size === next.size && [...next].every((id) => current.has(id)) ? current : next);
     };
     document.addEventListener("selectionchange", retainSelection);
     return () => document.removeEventListener("selectionchange", retainSelection);
   }, [scrollRef]);
+  const [markedRowId, setMarkedRowId] = useState<string | null>(null);
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    const feed = feedRef.current;
+    if (!scroll || !feed || targetIndex === undefined || focusNonce === undefined || handledFocusNonce === focusNonce) return;
+    handledFocusNonce = focusNonce;
+    const rowId = virtualizer.options.getItemKey(targetIndex);
+    const selector = `[data-message-id="${CSS.escape(String(rowId))}"]`;
+    const current = feed.querySelector<HTMLElement>(selector);
+    const requestedPart = focusedPartId ? current?.querySelector(`[data-part-id="${CSS.escape(focusedPartId)}"]`) : null;
+    if (!current || focusedPartId && (!requestedPart || requestedPart.closest("[inert], [aria-hidden=true]")) || Math.abs(current.getBoundingClientRect().top - scroll.getBoundingClientRect().top) > scroll.clientHeight * 2) feed.style.visibility = "hidden";
+    stickToBottom.current = false;
+    virtualizer.setOptions({ ...virtualizer.options, anchorTo: "start" });
+    setMarkedRowId(String(rowId));
+    setJumping(true);
+    let frame = 0, stable = 0, attempts = 0;
+    let observer: ResizeObserver | undefined;
+    let stopped = false;
+    const finish = () => { feed.style.visibility = ""; setJumping(false); };
+    const cancel = () => { stopped = true; cancelAnimationFrame(frame); observer?.disconnect(); finish(); };
+    const step = () => {
+      if (stopped) return;
+      const row = feed.querySelector<HTMLElement>(selector);
+      if (!row) { if (attempts++ < 12) frame = requestAnimationFrame(step); else finish(); return; }
+      virtualizer.resizeItem(targetIndex, row.getBoundingClientRect().height);
+      const anchor = () => {
+        const part = focusedPartId ? row.querySelector<HTMLElement>(`[data-part-id="${CSS.escape(focusedPartId)}"]`) : null;
+        const range = searchQuery ? chatSearchRanges(part ?? row, searchQuery)[0] : undefined;
+        return range?.getBoundingClientRect() ?? part?.getBoundingClientRect() ?? row.getBoundingClientRect();
+      };
+      const desired = Math.min(160, scroll.clientHeight / 3);
+      const offset = Math.max(0, Math.min(scroll.scrollHeight - scroll.clientHeight, scroll.scrollTop + anchor().top - scroll.getBoundingClientRect().top - desired));
+      const delta = offset - scroll.scrollTop;
+      if (Math.abs(delta) > 0.5) { stable = 0; virtualizer.scrollToOffset(offset); }
+      else stable++;
+      if (stable < 2 && attempts++ < 12) { frame = requestAnimationFrame(step); return; }
+      finish();
+      if (!document.activeElement?.closest("[role=search]")) row.focus({ preventScroll: true });
+      const anchoredAt = anchor().top - scroll.getBoundingClientRect().top;
+      observer = new ResizeObserver(() => {
+        const delta = anchor().top - scroll.getBoundingClientRect().top - anchoredAt;
+        if (!stopped && !stickToBottom.current && Math.abs(delta) > 0.5) virtualizer.scrollToOffset(scroll.scrollTop + delta);
+      });
+      observer.observe(row);
+    };
+    frame = requestAnimationFrame(step);
+    scroll.addEventListener("wheel", cancel, { passive: true });
+    scroll.addEventListener("touchstart", cancel, { passive: true });
+    scroll.addEventListener("pointerdown", cancel);
+    scroll.addEventListener("keydown", cancel);
+    return () => {
+      cancel();
+      scroll.removeEventListener("wheel", cancel);
+      scroll.removeEventListener("touchstart", cancel);
+      scroll.removeEventListener("pointerdown", cancel);
+      scroll.removeEventListener("keydown", cancel);
+    };
+  }, [focusedMessageId, focusedPartId, focusNonce, targetIndex, searchQuery, scrollRef, virtualizer, stickToBottom]);
+  const virtualItems = virtualizer.getVirtualItems();
+  useLayoutEffect(() => {
+    if (!("highlights" in CSS) || typeof Highlight === "undefined") return;
+    const row = focusedMessageId ? feedRef.current?.querySelector<HTMLElement>("[data-search-target=true]") : null;
+    if (!row || !searchQuery) { CSS.highlights.delete(highlightName); return; }
+    const part = focusedPartId ? row.querySelector<HTMLElement>(`[data-part-id="${CSS.escape(focusedPartId)}"]`) : null;
+    const highlight = new Highlight(...chatSearchRanges(part ?? row, searchQuery));
+    CSS.highlights.set(highlightName, highlight);
+    return () => { if (CSS.highlights.get(highlightName) === highlight) CSS.highlights.delete(highlightName); };
+  }, [focusedMessageId, focusedPartId, searchQuery, highlightName, virtualItems]);
+  useEffect(() => {
+    if (!markedRowId) return;
+    const timer = window.setTimeout(() => setMarkedRowId(null), 1600);
+    return () => window.clearTimeout(timer);
+  }, [markedRowId]);
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    const row = focusedRow ? scroll?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(focusedRow)}"]`) : null;
+    if (!scroll || !row || row.contains(document.activeElement)) return;
+    row.focus({ preventScroll: true });
+    const viewport = scroll.getBoundingClientRect();
+    const bounds = row.getBoundingClientRect();
+    if (bounds.top >= viewport.top && bounds.bottom <= viewport.bottom) return;
+    virtualizer.scrollToIndex(Number(row.dataset.index), { align: bounds.height > viewport.height ? "start" : "auto" });
+  }, [focusedRow, scrollRef, virtualizer]);
   const activeMessage = messages.at(-1);
   const transcriptAnnouncement = useTranscriptAnnouncement(messages);
   const pendingTailTool = busy ? streamTailTool(messages) : null;
+  const userLabel = m.chat_export_you();
+  const headingPrefix = useId();
   return (
     <>
       <span className="sr-only" role="status" aria-live="polite">
         <span key={transcriptAnnouncement.sequence}>{transcriptAnnouncement.text}</span>
       </span>
-      <button type="button" className="sr-only focus:not-sr-only" aria-pressed={fullHistory} onClick={() => setFullHistory((value) => !value)}>
-        {m.chat_show_full_conversation()}
-      </button>
-      <div className="relative" style={{ height: virtualizer.getTotalSize() }}>
-      {virtualizer.getVirtualItems().map((item) => {
+      {/* The WAI-ARIA feed pattern: assistive technology moves focus between articles, and the virtualizer mounts around it. */}
+      <div
+        role="feed"
+        aria-label={m.chat_messages_feed()}
+        aria-busy={jumping}
+        className="relative"
+        ref={setFeed}
+        onKeyDown={(event) => {
+          const target = event.target;
+          if (!(target instanceof HTMLElement) || target.isContentEditable || target.matches("input, textarea, select")) return;
+          if (event.altKey || event.metaKey || event.shiftKey) return;
+          if (event.ctrlKey && (event.key === "Home" || event.key === "End")) {
+            event.preventDefault();
+            onLeaveFeed(event.key === "End");
+            return;
+          }
+          const step = event.ctrlKey ? 0 : event.key === "PageDown" ? 1 : event.key === "PageUp" ? -1 : 0;
+          const article = target.closest<HTMLElement>("[role=article]");
+          const next = step && article ? visibleMessages[Number(article.dataset.index) + step] : undefined;
+          if (!next) return;
+          event.preventDefault();
+          setFocusedRow(next[0].id);
+        }}
+      >
+      {virtualItems.map((item) => {
         const group = visibleMessages[item.index];
         const m = group[group.length - 1];
         const rowId = group[0].id;
+        const headingId = `${headingPrefix}${rowId}`;
+        let expansionState = disclosures.get(rowId);
+        if (!expansionState) { expansionState = new Map(); disclosures.set(rowId, expansionState); }
+        const isTarget = group.some((message) => message.id === focusedMessageId);
+        const answerText = isTarget && searchQuery ? splitResponseParts(group, false).answer.map((part) => part.text ?? "").join("\n").toLowerCase() : "";
+        const revealWork = isTarget && (jumping || handledFocusNonce !== focusNonce) && ((focusedPartId && splitResponseParts(group, false).work.some((turn) => findPartById(turn.parts, focusedPartId)))
+          || searchQuery && !searchQuery.toLowerCase().split(/\s+/u).every((term) => answerText.includes(term)));
 
         // A session owns one turn slot, so one recovery disables every status
         // card until its durable admission resolves.
@@ -4191,21 +5142,38 @@ const Transcript = memo(function Transcript({
         return (
           <div
             key={rowId}
+            role="article"
+            tabIndex={0}
+            aria-labelledby={headingId}
+            aria-posinset={item.index + 1}
+            aria-setsize={visibleMessages.length}
             data-index={item.index}
             data-message-id={rowId}
+            data-search-target={isTarget || undefined}
             ref={virtualizer.measureElement}
-            className="absolute left-0 w-full pb-4"
-            style={{ top: item.start }}
+            className={`absolute left-0 w-full pb-4 isolate outline-none before:-z-10 before:pointer-events-none before:absolute before:-inset-x-2 before:-top-2 before:bottom-2 before:rounded-lg before:bg-highlight before:transition-opacity before:duration-700 motion-reduce:before:transition-none after:pointer-events-none after:absolute after:-inset-x-2 after:-top-2 after:bottom-2 after:rounded-lg focus-visible:after:outline-2 focus-visible:after:outline-focus ${rowId === markedRowId ? "before:opacity-60" : "before:opacity-0"}`}
             onClickCapture={(event) => {
               if (!(event.target instanceof Element) || !event.target.closest("[data-work-toggle]")) return;
               stickToBottom.current = false;
               virtualizer.setOptions({ ...virtualizer.options, anchorTo: "start" });
             }}
-            onPointerDownCapture={() => retainedRows.current.add(rowId)}
-            onFocusCapture={() => retainedRows.current.add(rowId)}
+            onInputCapture={() => draftRows.current.add(rowId)}
+            // Screen readers can move focus through every row as they read, so focus holds a row only while it lasts.
+            onFocusCapture={() => setFocusedRow(rowId)}
+            onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget)) setFocusedRow((current) => current === rowId ? null : current);
+            }}
           >
+          {/* NVDA leaves article names unspoken by default, so a hidden heading names the author. A reply nests under its prompt. */}
+          {group[0].role === "user"
+            ? <h5 id={headingId} className="sr-only select-none">{userLabel}</h5>
+            : <h6 id={headingId} className="sr-only select-none">{assistantLabel}</h6>}
+          <DisclosureState value={expansionState}>
           <Message
             message={m}
+            expansionState={expansionState}
+            revealNonce={revealWork ? focusNonce : undefined}
+            revealPartId={focusedPartId}
             responseMessages={group}
             replies={replies}
             forkCount={positions.get(m.id)?.count}
@@ -4230,9 +5198,25 @@ const Transcript = memo(function Transcript({
             busy={recoveryDisabled}
             recoveringTurnId={recoveringTurnId}
             onRecover={onRecover}
+            failure={failure}
             skills={skills}
             predictTextTail={busy && m === activeMessage && m.role === "assistant"}
           />
+          </DisclosureState>
+          {onOpenDelegate && delegatesByRow.has(item.index) && (
+            <div className="mt-3 flex flex-col gap-2">
+              {delegatesByRow.get(item.index)?.map(({ session, status }) => (
+                <DelegateCard key={session.id} session={session} status={status} onOpen={onOpenDelegate} />
+              ))}
+            </div>
+          )}
+          {proposalsByRow.has(item.index) && (
+            <div className="mt-3 flex flex-col gap-2">
+              {proposalsByRow.get(item.index)?.map((proposal, index) => (
+                <ProjectProposalCard key={index} proposal={proposal} proposedAt={visibleMessages[item.index][0].createdAt} project={project} session={session} />
+              ))}
+            </div>
+          )}
           </div>
         );
       })}
@@ -4244,6 +5228,9 @@ const Transcript = memo(function Transcript({
 // --- session rail ------------------------------------------------------------
 
 type SessionFilter = "active" | "archived" | "all";
+
+const SIDEBAR_GROUPINGS = ["projects", "list", "inbox"] as const;
+type SidebarGrouping = (typeof SIDEBAR_GROUPINGS)[number];
 
 /** Whether the rail's current filter shows a session in this archived state. */
 const matchesFilter = (filter: SessionFilter, archived: boolean) =>
@@ -4265,8 +5252,8 @@ function SessionFilterMenu({
 }: {
   value: SessionFilter;
   onChange: (next: SessionFilter) => void;
-  grouping: "projects" | "list";
-  onGroupingChange: (next: "projects" | "list") => void;
+  grouping: SidebarGrouping;
+  onGroupingChange: (next: SidebarGrouping) => void;
 }) {
   const { open, setOpen, ref } = usePopover();
   return (
@@ -4274,7 +5261,7 @@ function SessionFilterMenu({
       <Tooltip interactive content={m.chat_panel_filter_sessions()}>
         <IconButton size="small"
           className="rail-filter-btn text-subtext"
-          active={value !== "active"}
+          active={grouping !== "inbox" && value !== "active"}
           aria-label={m.chat_panel_filter_sessions()}
           onClick={() => setOpen((v) => !v)}
         >
@@ -4283,29 +5270,30 @@ function SessionFilterMenu({
       </Tooltip>
       {open && (
         <div className="option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-40 p-1 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down align-right">
-          <div className="px-2 py-0.5 text-sm text-subtext">{m.sidebar_group_by()}</div>
-          {(["projects", "list"] as const).map((mode) => (
-            <MenuItem size="compact" className="text-sm" key={mode} onClick={() => { onGroupingChange(mode); setOpen(false); }}>
-              <span>{mode === "projects" ? m.projects_home_projects() : m.sidebar_one_list()}</span>
+          <div className={MENU_LABEL}>{m.sidebar_group_by()}</div>
+          {SIDEBAR_GROUPINGS.map((mode) => (
+            <MenuItem key={mode} onClick={() => { onGroupingChange(mode); setOpen(false); }}>
+              <span>{mode === "projects" ? m.projects_home_projects() : mode === "list" ? m.sidebar_one_list() : m.sidebar_inbox()}</span>
               {grouping === mode && <Check size={14} />}
             </MenuItem>
           ))}
-          <div className="my-1 border-t border-border" />
-          <div className="px-2 py-0.5 text-sm text-subtext">{m.sidebar_filter()}</div>
-          {SESSION_FILTERS.map((f) => (
-            <MenuItem
-              size="compact" className="text-sm"
-              key={f.id}
+          {grouping !== "inbox" && <>
+            <div className={MENU_SEPARATOR} />
+            <div className={MENU_LABEL}>{m.sidebar_filter()}</div>
+            {SESSION_FILTERS.map((f) => (
+              <MenuItem
+                key={f.id}
 
-              onClick={() => {
-                onChange(f.id);
-                setOpen(false);
-              }}
-            >
-              <span>{f.label()}</span>
-              {value === f.id && <Check size={14} />}
-            </MenuItem>
-          ))}
+                onClick={() => {
+                  onChange(f.id);
+                  setOpen(false);
+                }}
+              >
+                <span>{f.label()}</span>
+                {value === f.id && <Check size={14} />}
+              </MenuItem>
+            ))}
+          </>}
         </div>
       )}
       <EscapeScope enabled={open} onEscape={() => setOpen(false)} />
@@ -4313,48 +5301,66 @@ function SessionFilterMenu({
   );
 }
 
-/** Per-character stagger, and the ceiling on the whole run — a long title
- * shouldn't take a second and a half to finish arriving. */
-const TITLE_CHAR_STAGGER_MS = 14;
-const TITLE_STAGGER_CAP_MS = 500;
-/** How long the reveal flag stays set: the capped stagger plus one character's
- * 240ms animation, plus slack. After this the title renders as plain text. */
-const TITLE_REVEAL_CLEAR_MS = 1200;
+/** How long the reveal flag stays set: the 700ms sweep plus slack. After this
+ * a remount (scrolling the rail, switching sessions) shows a static title. */
+const TITLE_REVEAL_CLEAR_MS = 1000;
 
-/** A session title that materializes character by character when a
+/** A session title that fades in behind a left-to-right mask when a
  * harness-generated one replaces the first-line placeholder. `animate` is false
  * everywhere else (initial load, renames, re-renders), and then this renders the
- * bare string — the animated form is deliberately the exception.
- *
- * The characters are `aria-hidden` and the whole title rides an `aria-label`:
- * a screen reader must hear one title, not forty single-letter spans. */
+ * bare string — the animated form is deliberately the exception. The text stays
+ * one run so kerning and antialiasing match the static title it settles into. */
 function TitleReveal({ title, animate }: { title: string; animate: boolean }) {
   if (!animate) return <>{title}</>;
-  return (
-    <span className="title-reveal" aria-label={title}>
-      {Array.from(title).map((ch, i) =>
-        // Spaces stay plain inline boxes: the animated characters must be
-        // inline-block (transform doesn't apply to inline boxes), but an
-        // inline-block space collapses to zero width and eats the word gap.
-        ch === " " ? (
-          <span key={i} aria-hidden>
-            {ch}
-          </span>
-        ) : (
-          <span
-            key={i}
-            aria-hidden
-            className="title-reveal-char inline-block animate-[title-char-in_240ms_ease-out_both] [@media((prefers-reduced-motion:_reduce))]:animate-none"
-            style={{
-              animationDelay: `${Math.min(i * TITLE_CHAR_STAGGER_MS, TITLE_STAGGER_CAP_MS)}ms`,
-            }}
-          >
-            {ch}
-          </span>
-        ),
-      )}
+  return <span className="title-reveal">{title}</span>;
+}
+
+/** The right of an inbox row's second line: an icon and what the chat is doing, timed from when it began. */
+function InboxStatus({ status, unread }: { status: ChatStatus; unread: boolean }) {
+  const timed = status.kind === "running" || status.kind === "queued" || status.kind === "background" || (status.kind === "working" && status.since !== null);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), timed ? 1000 : 30_000);
+    return () => window.clearInterval(timer);
+  }, [timed]);
+
+  const elapsed = "since" in status && status.since !== null ? fmtDuration(now - status.since) : "";
+  const [icon, label, tone, tip] = (() => {
+    switch (status.kind) {
+      case "input":
+        return [<HelpCircle size={12} />, m.chat_status_input(), "text-accent-purple", null];
+      case "running":
+        return [
+          <FlaskConical size={12} className="motion-safe:animate-[or-experiment-pulse_3s_ease-in-out_infinite]" />,
+          m.chat_status_running({ duration: elapsed }), "text-accent-green",
+          status.runs > 1 ? m.chat_status_experiments_running({ count: fmtNumber(status.runs) }) : m.chat_experiment_running(),
+        ];
+      case "queued":
+        return [<Clock size={12} />, m.chat_status_queued({ duration: elapsed }), "text-subtext", m.chat_status_waiting_compute()];
+      case "working":
+        return [<span className="busy-dot" />, elapsed ? m.chat_status_working_for({ duration: elapsed }) : m.chat_status_working(), "text-subtext", null];
+      case "background":
+        return [
+          <Hourglass size={12} />, m.chat_status_background({ duration: elapsed }), "text-accent-blue",
+          status.tasks > 1 ? m.chat_status_background_tasks({ count: fmtNumber(status.tasks) }) : m.chat_status_background_task(),
+        ];
+      case "limited":
+        return [<Gauge size={12} />, m.chat_status_limited(), "text-accent-amber", null];
+      case "failed":
+        return [<TriangleAlert size={12} />, m.chat_status_failed(), "text-accent-red", status.error && cleanToolError(status.error)];
+      case "done":
+        return unread
+          ? [<CircleCheck size={12} />, m.chat_status_done(), "text-accent-green", timeAgo(status.since)]
+          : [null, timeAgo(status.since), "text-muted", null];
+    }
+  })();
+  const body = (
+    <span className={`flex shrink-0 items-center gap-1.5 tabular-nums ${tone}`}>
+      {icon && <span className="inline-flex size-3 items-center justify-center" aria-hidden="true">{icon}</span>}
+      {label}
     </span>
   );
+  return tip ? <Tooltip content={tip} className="shrink-0">{body}</Tooltip> : body;
 }
 
 /** One Recents row. Hover swaps the timestamp for a three-dot menu with
@@ -4366,25 +5372,33 @@ function SessionRow({
   unread,
   busy,
   waiting,
-  experimentRunning,
+  runs,
+  variant,
   revealTitle,
   onOpen,
   onRename,
   onSetArchived,
+  onMoveToProject,
   onDelete,
+  onProjectSettings,
   onOpenExperiment,
   modelName,
+  project,
   projectName,
   harnessLogo,
   cardWarmUntil,
 }: {
   session: ChatSession;
+  project: Project;
   active: boolean;
   unread: boolean;
   busy: boolean;
   /** An actionable question or held approval needs the user's attention. */
   waiting: boolean;
-  experimentRunning: boolean;
+  /** The chat's experiment runs in flight. */
+  runs: readonly ChatActiveRun[];
+  /** `inbox`: title and agent, then project and what the chat is doing. `done`: one line, restored from its hover button. */
+  variant: "list" | "inbox" | "done";
   /** Nonce set while this row's freshly auto-generated title should play its
    * reveal; it doubles as the remount key so a second retitle replays it.
    * Undefined the rest of the time (static title). */
@@ -4392,14 +5406,23 @@ function SessionRow({
   onOpen: () => void;
   onRename: (title: string) => void;
   onSetArchived: (archived: boolean) => void;
+  /** Makes the chat a project of its own; labelled for a chat without one. */
+  onMoveToProject?: { label: string; run: () => void };
   onDelete: () => void;
+  onProjectSettings: () => void;
   onOpenExperiment: (projectId: string, experimentId: string) => void;
   modelName: string | null;
   projectName?: string;
   harnessLogo?: string;
   cardWarmUntil: React.RefObject<number>;
 }) {
-  const { open, setOpen, ref } = usePopover();
+  const ref = useRef<HTMLDivElement>(null);
+  const inbox = variant === "inbox";
+  const plain = variant === "list";
+  /** Where the row's menu opens: the cursor for a right-click, the kebab for a click. */
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
+  const open = menuAt !== null;
+  const experimentRunning = runs.length > 0;
   const title = session.title?.trim() || m.chat_untitled();
   const sessionDescription = `${title} · ${harnessLabel(session.harness, session.harnessName)}${modelName ? ` · ${modelName}` : ""}`;
   const [editing, setEditing] = useState(false);
@@ -4474,6 +5497,31 @@ function SessionRow({
     }
   }, [editing]);
 
+  const titleInput = (
+    <input
+      ref={inputRef}
+      className={!plain
+        ? "-my-1 -ms-1.5 h-6 min-w-0 flex-1 rounded-sm border border-focus-border bg-background ps-1.5 text-text outline-none [font:inherit]"
+        : "session-title-input"}
+      aria-label={m.chat_panel_session_title()}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+        } else if (e.key === "Escape") {
+          e.stopPropagation();
+          e.preventDefault();
+          setEditing(false);
+        }
+      }}
+    />
+  );
+
   // Not a <button>: the kebab is a real button and can't nest inside one.
   return (
     <div
@@ -4508,15 +5556,21 @@ function SessionRow({
         if (!ref.current?.contains(event.relatedTarget) && !cardRef.current?.contains(event.relatedTarget)) dismissed.current = false;
         scheduleClose();
       }}
-      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:size-6 [&_.session-menu-btn]:-mx-1 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-blue [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:absolute [&_.session-title-input]:inset-0 [&_.session-title-input]:size-full [&_.session-title-input]:py-0 [&_.session-title-input]:ps-0 [&_.session-title-input]:pe-[9px] [&_.session-title-input]:indent-[9px] [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-md [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
+      className={`session-row relative flex items-center gap-2 w-full ${inbox ? "inbox h-12.5" : variant === "done" ? "h-8" : "h-8.5"} text-start px-2.25 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:size-6 [&_.session-menu-btn]:-mx-1 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-blue [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:absolute [&_.session-title-input]:inset-0 [&_.session-title-input]:size-full [&_.session-title-input]:py-0 [&_.session-title-input]:ps-0 [&_.session-title-input]:pe-[9px] [&_.session-title-input]:indent-[9px] [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-md [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden [&_.session-done-btn]:hidden [&:hover_.session-done-btn]:inline-flex [&:focus-visible_.session-done-btn]:inline-flex [&_.session-done-btn:focus-visible]:inline-flex [&_.session-done-btn:focus-within]:inline-flex [&:has(.session-done-btn:focus-within)_.session-logo]:hidden [&.card-open_.session-done-btn]:inline-flex [&:has(.session-done-btn):hover_.session-logo]:hidden [&:has(.session-done-btn):focus-visible_.session-logo]:hidden [&:has(.session-done-btn:focus-visible)_.session-logo]:hidden [&.card-open:has(.session-done-btn)_.session-logo]:hidden [&.editing_.session-done-btn]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
         editing ? "editing" : ""
         }`}
+      onContextMenu={(e) => {
+        if (editing) return;
+        e.preventDefault();
+        closeCard();
+        setMenuAt({ x: e.clientX, y: e.clientY });
+      }}
       onClick={() => {
         // While editing, a body click is a no-op; blur/Enter/Esc drive it.
         if (editing) return;
         // With the menu open, a body click just dismisses it — switching
         // sessions underneath an open menu would leave it orphaned.
-        if (open) setOpen(false);
+        if (open) setMenuAt(null);
         else { closeCard(); onOpen(); }
       }}
       onKeyDown={(e) => {
@@ -4532,34 +5586,72 @@ function SessionRow({
           closeCard();
           // Mirror the click branch: dismiss an open menu instead of
           // navigating underneath it.
-          if (open) setOpen(false);
+          if (open) setMenuAt(null);
           else onOpen();
         }
       }}
     >
-      {editing ? (
-        <input
-          ref={inputRef}
-          className="session-title-input"
-          aria-label={m.chat_panel_session_title()}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onClick={(e) => e.stopPropagation()}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            e.stopPropagation();
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commit();
-            } else if (e.key === "Escape") {
-              e.stopPropagation();
-              e.preventDefault();
-              setEditing(false);
-            }
-          }}
-        />
+      {variant === "done" ? <>
+        <ProjectIconTile project={project} size="sm" />
+        {editing ? titleInput : (
+          <span className={`session-title ${unread ? "text-title-unread" : "text-title-read"}`} onDoubleClick={startEditing}>
+            <TitleReveal key={revealTitle ?? "static"} title={title} animate={revealTitle !== undefined} />
+          </span>
+        )}
+        {!editing && <span className="session-logo shrink-0 text-xs tabular-nums text-muted">{timeAgo(session.updatedAt)}</span>}
+        {!editing && (
+          <Tooltip content={m.chat_inbox_restore()} className="session-done-btn -my-1 -me-1 shrink-0">
+            <button
+              className="inline-flex size-6 items-center justify-center rounded-sm text-subtext hover:bg-panel hover:text-text"
+              aria-label={m.chat_inbox_restore()}
+              onClick={(e) => {
+                e.stopPropagation();
+                closeCard();
+                onSetArchived(false);
+              }}
+            >
+              <Undo2 size={14} aria-hidden="true" />
+            </button>
+          </Tooltip>
+        )}
+      </> : editing && plain ? titleInput : inbox ? (
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <div className="flex items-center gap-2">
+            {editing ? titleInput : (
+              <span className={`session-title ${unread || waiting ? "text-title-unread" : "text-title-read"}`} onDoubleClick={startEditing}>
+                <TitleReveal key={revealTitle ?? "static"} title={title} animate={revealTitle !== undefined} />
+              </span>
+            )}
+            <span className="session-logo inline-flex w-4 shrink-0 items-center justify-center">
+              {session.model
+                ? <ModelMark model={{ id: session.model, displayName: modelName ?? undefined }} harness={session.harness} size={14} />
+                : <HarnessLogo harness={session.harness} logo={harnessLogo} size={14} />}
+            </span>
+            {!session.archived && !editing && (
+              <button
+                className="session-done-btn -my-1 -me-1 h-6 shrink-0 items-center gap-1 rounded-sm px-1.5 text-xs text-subtext hover:bg-panel hover:text-text"
+                aria-label={m.chat_inbox_mark_done()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeCard();
+                  onSetArchived(true);
+                }}
+              >
+                <Check size={12} aria-hidden="true" />
+                {m.chat_inbox_done_action()}
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-2 text-xs text-subtext">
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              <ProjectIconTile project={project} size="sm" />
+              {!project.scratch && <span className="truncate">{projectName}</span>}
+            </span>
+            <InboxStatus status={chatStatus(session, busy, waiting, runs)} unread={unread} />
+          </div>
+        </div>
       ) : (
-        <span className="session-title">
+        <span className="session-title" onDoubleClick={startEditing}>
           <TitleReveal
             key={revealTitle ?? "static"}
             title={title}
@@ -4567,36 +5659,37 @@ function SessionRow({
           />
         </span>
       )}
-      {experimentRunning && !editing && (
+      {plain && experimentRunning && !editing && (
         <Tooltip content={m.chat_experiment_running()} className="shrink-0 text-accent-green">
           <FlaskConical size={14} className="motion-safe:animate-[or-experiment-pulse_3s_ease-in-out_infinite]" aria-label={m.chat_experiment_running()} />
         </Tooltip>
       )}
-      {waiting && !editing && (
+      {plain && waiting && !editing && (
         <Tooltip content={m.chat_panel_waiting_for_your_input()} className="shrink-0 text-accent-amber">
           <HelpCircle size={14} aria-hidden="true" />
         </Tooltip>
       )}
-      <span className="session-dot">
+      {plain && <span className="session-dot">
         {busy && !waiting ? (
           <span className="busy-dot" />
         ) : (
           unread && !waiting && <span className="unread-dot" />
         )}
-      </span>
-      <Tooltip interactive content={m.chat_panel_session_options()} className="session-menu-btn">
+      </span>}
+      {plain && <Tooltip interactive content={m.chat_panel_session_options()} className="session-menu-btn">
         <button
           className="flex w-full h-full items-center justify-center"
           aria-label={m.chat_panel_session_options()}
           onClick={(e) => {
             e.stopPropagation();
             closeCard();
-            setOpen((v) => !v);
+            const button = e.currentTarget.getBoundingClientRect();
+            setMenuAt(open ? null : { x: button.left, y: button.bottom + 4 });
           }}
         >
           <MoreHorizontal size={14} />
         </button>
-      </Tooltip>
+      </Tooltip>}
       {anchor && !open && !editing && (
         <SessionHoverCard
           session={session}
@@ -4611,45 +5704,165 @@ function SessionRow({
           onLeave={() => { cardWarmUntil.current = Date.now() + 500; pointerInside.current = false; scheduleClose(); }}
           onOpenExperiment={(projectId, experimentId) => { closeCard(); onOpenExperiment(projectId, experimentId); }}
           onReturnToRow={() => ref.current?.focus()}
-          onContinue={() => { closeCard(); ref.current?.querySelector<HTMLButtonElement>(".session-menu-btn button")?.focus(); }}
+          onContinue={() => {
+            closeCard();
+            const next = ref.current?.querySelector<HTMLButtonElement>(".session-menu-btn button, .session-done-btn");
+            if (next) next.focus();
+            else ref.current?.focus();
+          }}
         />
       )}
-      {open && (
-        <div className="option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down session-menu">
-          <MenuItem
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              startEditing();
-            }}
-          >
-            <span>{m.chat_panel_rename()}</span>
-          </MenuItem>
-          <MenuItem
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              onSetArchived(!session.archived);
-            }}
-          >
-            <span>{session.archived ? m.chat_unarchive() : m.chat_archive()}</span>
-          </MenuItem>
-          <MenuItem danger
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              onDelete();
-            }}
-          >
-            <span>{m.chat_panel_delete()}</span>
-          </MenuItem>
-        </div>
+      {menuAt && (
+        <SessionMenu
+          at={menuAt}
+          label={title}
+          archiveLabel={!plain
+            ? session.archived ? m.chat_inbox_restore() : m.chat_inbox_mark_done()
+            : session.archived ? m.chat_unarchive() : m.chat_archive()}
+          onClose={() => setMenuAt(null)}
+          onRename={startEditing}
+          onSetArchived={() => onSetArchived(!session.archived)}
+          onMoveToProject={onMoveToProject}
+          onProjectSettings={project.scratch ? undefined : onProjectSettings}
+          onDelete={onDelete}
+        />
       )}
-      <EscapeScope enabled={open} onEscape={() => setOpen(false)} />
       <EscapeScope enabled={!!anchor && !editing && !open} exclusive={false} onEscape={() => { dismissed.current = true; if (cardRef.current?.contains(document.activeElement)) ref.current?.focus(); closeCard(); }} />
     </div>
   );
 }
+
+/** A chat's actions, opened at a point: the cursor, or below the row's kebab. */
+function SessionMenu({ at, label, archiveLabel, onClose, onRename, onSetArchived, onMoveToProject, onProjectSettings, onDelete }: {
+  at: { x: number; y: number };
+  label: string;
+  archiveLabel: string;
+  onClose: () => void;
+  onRename: () => void;
+  onSetArchived: () => void;
+  onMoveToProject?: { label: string; run: () => void };
+  /** Absent for a chat without a project, which has no settings of its own. */
+  onProjectSettings?: () => void;
+  onDelete: () => void;
+}) {
+  const { portalContainer } = useContext(WorkspaceDomContext);
+  const item = <MenuItem size="compact" className="data-highlighted:bg-surface" />;
+  return (
+    <DirectionProvider direction={typeof document !== "undefined" && document.documentElement.dir === "rtl" ? "rtl" : "ltr"}>
+      <Menu.Root open modal={false} onOpenChange={(open) => { if (!open) onClose(); }}>
+        <Menu.Portal container={portalContainer}>
+          <Menu.Positioner
+            positionMethod="fixed"
+            anchor={{ getBoundingClientRect: () => new DOMRect(at.x, at.y, 0, 0) }}
+            side="bottom"
+            align="start"
+            collisionPadding={8}
+            className="z-100"
+          >
+            <Menu.Popup
+              aria-label={label}
+              className="option-menu min-w-44 max-h-(--available-height) overflow-y-auto rounded-md border border-border bg-background p-1 shadow-menu outline-none"
+              onClick={(event) => event.stopPropagation()}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              <Menu.Item nativeButton render={item} onClick={onRename}>{m.chat_panel_rename()}</Menu.Item>
+              <Menu.Item nativeButton render={item} onClick={onSetArchived}>{archiveLabel}</Menu.Item>
+              {onMoveToProject && <Menu.Item nativeButton render={item} onClick={onMoveToProject.run}>{onMoveToProject.label}</Menu.Item>}
+              {onProjectSettings && <Menu.Item nativeButton render={item} onClick={onProjectSettings}>{m.sidebar_project_settings()}</Menu.Item>}
+              <Menu.Separator className="my-1 border-t border-border" />
+              <Menu.Item nativeButton render={<MenuItem size="compact" danger className="data-highlighted:bg-surface" />} onClick={onDelete}>{m.chat_panel_delete()}</Menu.Item>
+            </Menu.Popup>
+          </Menu.Positioner>
+        </Menu.Portal>
+      </Menu.Root>
+    </DirectionProvider>
+  );
+}
+
+interface SidebarActions {
+  toggleProjectCollapsed: (project: Project) => void;
+  pinProject: (project: Project) => void;
+  projectRemoved: (project: Project) => void;
+  newProjectChat: (project: Project) => void;
+  openProjectSettings: (project: Project) => void;
+  openSession: (session: ChatSession, project: Project) => void;
+  openExperiment: (session: ChatSession, projectId: string, experimentId: string) => void;
+  rename: (session: ChatSession, title: string) => void;
+  setArchived: (session: ChatSession, archived: boolean) => void;
+  moveToProject: (session: ChatSession, project: Project) => void;
+  remove: (session: ChatSession) => void;
+}
+
+const RAIL_MOVE_MS = 380;
+const RAIL_FADE_MS = 180;
+/** Eases in gently, then settles on a long tail. */
+const RAIL_CURVE = [0.47, 0.44, 0, 1] as const;
+const RAIL_EASE = `cubic-bezier(${RAIL_CURVE.join(", ")})`;
+
+/** `RAIL_EASE` at time `t`, to sample what a row overlaps along the way. */
+function railEase(t: number) {
+  const [x1, y1, x2, y2] = RAIL_CURVE;
+  const at = (a: number, b: number, s: number) => 3 * a * s * (1 - s) ** 2 + 3 * b * s ** 2 * (1 - s) + s ** 3;
+  let low = 0;
+  let high = 1;
+  for (let i = 0; i < 24; i++) {
+    const mid = (low + high) / 2;
+    if (at(x1, x2, mid) < t) low = mid;
+    else high = mid;
+  }
+  return at(y1, y2, (low + high) / 2);
+}
+
+// Sidebar rows skip the panel's per-keystroke renders: `actions` is a stable ref
+// the panel refreshes every render, so handlers still reach its current state.
+const SidebarProjectCard = memo(function SidebarProjectCard({
+  actions,
+  project,
+  ...card
+}: Omit<React.ComponentProps<typeof ProjectInfoCard>, "onToggleCollapsed" | "onPin" | "onRemoved" | "onNewChat" | "onOpenSettings"> & {
+  actions: React.RefObject<SidebarActions>;
+}) {
+  useLocale();
+  return (
+    <ProjectInfoCard
+      {...card}
+      project={project}
+      onToggleCollapsed={() => actions.current.toggleProjectCollapsed(project)}
+      onPin={() => actions.current.pinProject(project)}
+      onRemoved={() => actions.current.projectRemoved(project)}
+      onNewChat={() => actions.current.newProjectChat(project)}
+      onOpenSettings={() => actions.current.openProjectSettings(project)}
+    />
+  );
+});
+
+const SidebarSessionRow = memo(function SidebarSessionRow({
+  actions,
+  project,
+  ...row
+}: Omit<React.ComponentProps<typeof SessionRow>, "onOpen" | "onOpenExperiment" | "onRename" | "onSetArchived" | "onMoveToProject" | "onDelete" | "onProjectSettings"> & {
+  actions: React.RefObject<SidebarActions>;
+  project: Project;
+}) {
+  useLocale();
+  const { session } = row;
+  return (
+    <SessionRow
+      {...row}
+      project={project}
+      onOpen={() => actions.current.openSession(session, project)}
+      onOpenExperiment={(projectId, experimentId) => actions.current.openExperiment(session, projectId, experimentId)}
+      onRename={(title) => actions.current.rename(session, title)}
+      onSetArchived={(archived) => actions.current.setArchived(session, archived)}
+      onMoveToProject={session.pendingProject ? undefined : {
+        label: project.scratch ? m.create_project_menu() : m.create_project_move_menu(),
+        run: () => actions.current.moveToProject(session, project),
+      }}
+      onDelete={() => actions.current.remove(session)}
+      onProjectSettings={() => actions.current.openProjectSettings(project)}
+    />
+  );
+});
 
 // --- panel -------------------------------------------------------------------
 
@@ -4671,50 +5884,6 @@ const STARTER_TONES = [
 ];
 const STARTER_GRID_CLASS =
   "mt-7 grid w-full max-w-readable grid-cols-1 gap-3 sm:grid-cols-2";
-const composerStashes = new Map<string, ComposerStash>();
-const mountedComposers = new Map<string, (failed: ComposerStash) => void>();
-subscribeWorkspace(() => { composerStashes.clear(); });
-
-function mergeFailedComposer(current: ComposerStash, failed: ComposerStash): ComposerStash {
-  const annotations = [...current.annotations];
-  for (const annotation of failed.annotations) {
-    if (annotations.some((item) => item.id === annotation.id && item.text === annotation.text)) continue;
-    let id = annotation.id;
-    while (annotations.some((item) => item.id === id)) id += ":recovered";
-    annotations.unshift(id === annotation.id ? annotation : { ...annotation, id });
-  }
-  return {
-    draft: [failed.draft, current.draft].filter(Boolean).join("\n\n"),
-    attachments: [...failed.attachments.filter((item) => !current.attachments.includes(item)), ...current.attachments],
-    annotations,
-    unconfirmedSend: current.unconfirmedSend ?? failed.unconfirmedSend,
-    pendingClientTurn: current.pendingClientTurn ?? failed.pendingClientTurn,
-  };
-}
-
-/** Reconcile the settings attached to a selected model without treating the
- * catalog as an allowlist. The picker deliberately accepts free-form ids, so
- * replacing an unlisted id with the catalog's first entry changes both what
- * the composer displays and what the next request sends. Invalid ids should
- * reach the CLI and surface its real error instead. */
-export function deriveComposerSelection(
-  rawSelection: ModelSelection | null,
-  activeHarness: Harness | undefined,
-): ModelSelection | null {
-  if (!rawSelection) return null;
-  const model = (rawSelection.harness === "codex" || rawSelection.harness === "claude-code") && (rawSelection.model == null || rawSelection.model === "default")
-    ? resolveHarnessDefaultModel(activeHarness) ?? rawSelection.model ?? null
-    : rawSelection.model ?? null;
-  const readyHarness = activeHarness?.catalogPending || (activeHarness?.id === "codex" && !activeHarness.models.length)
-    ? undefined
-    : activeHarness;
-  return {
-    ...rawSelection,
-    model,
-    serviceTier: reconcileServiceTier(readyHarness, model, rawSelection.serviceTier),
-    reasoningLevel: reconcileReasoning(readyHarness, model, rawSelection.reasoningLevel),
-  };
-}
 
 export function ChatPanel({
   projectId,
@@ -4736,12 +5905,18 @@ export function ChatPanel({
   onOpenFile,
   onOpenRun,
   runExperimentName,
+  chatInfo,
+  onOpenMessage,
+  onOpenSearchHit,
+  onClearSearch,
+  focusedMessage,
   onOpenExperiment,
   experimentName,
   onOpenPlan,
   onOpenSubagent,
   runtime,
   composerFocusNonce = 0,
+  find,
   activeSessionId,
   onActiveSessionChange,
   onStartHarnessDraft,
@@ -4752,6 +5927,7 @@ export function ChatPanel({
   embedded = false,
   sideParentSessionId,
   onOpenSideChat,
+  onOpenDelegate,
   onRunSetup,
   children,
 }: {
@@ -4775,8 +5951,8 @@ export function ChatPanel({
   /** Run a harness setup command (`path` is its setup route) in the right panel's terminal tab. */
   onRunSetup?: (command: string, path: string) => void;
   /** Settings sections replace chat; Artifacts remains a right-panel tool. */
-  mainView: "chat" | "skills" | SettingsTab;
-  onSelectMainView: (view: "chat" | "skills" | SettingsTab) => void;
+  mainView: "chat" | SettingsTab;
+  onSelectMainView: (view: "chat" | SettingsTab) => void;
   /** Open a project file in the right pane (chat tool rows are clickable).
    * `sessionId` is the chat session the click came from, so relative paths
    * can resolve against that session's worktree. */
@@ -4793,6 +5969,14 @@ export function ChatPanel({
   onOpenRun?: OpenTranscriptTarget;
   /** Resolve a run to the experiment name shown on tool activity links. */
   runExperimentName?: (runId: string) => string;
+  /** A chat in this project, or undefined for one elsewhere. */
+  chatInfo?: ChatLinks["chat"];
+  /** Open the chat a message an agent cited lives in, at that message. */
+  onOpenMessage?: (cited: string) => void;
+  /** A message to scroll to and mark once its chat is on screen. */
+  focusedMessage?: FocusedMessage | null;
+  onOpenSearchHit: (hit: ChatSearchHit, query: string) => void;
+  onClearSearch: () => void;
   /** Open an experiment overview, where its notes are displayed. */
   onOpenExperiment?: OpenTranscriptTarget;
   /** Resolve an experiment id to the name shown on tool activity links. */
@@ -4815,6 +5999,8 @@ export function ChatPanel({
   runtime: RuntimeInfo;
   /** Requests composer focus on change; a nonzero value also focuses on mount. */
   composerFocusNonce?: number;
+  /** Find-box state owned by the parent so its toolbar can open it; side chats own theirs. */
+  find?: readonly [number | null, Dispatch<SetStateAction<number | null>>];
   /** Demo run currently executing, for the monitor-it hint above the composer. */
   activeSessionId: string | null;
   onActiveSessionChange: (sessionId: string | null, options?: { replace?: boolean; projectId?: string }) => void;
@@ -4830,36 +6016,72 @@ export function ChatPanel({
   sideParentSessionId?: string;
   /** Branch a side chat off `parentSessionId`; a question, if given, is its first message. */
   onOpenSideChat?: (parentSessionId: string, question: string) => void;
+  /** Open a chat this one delegated to. */
+  onOpenDelegate?: (sessionId: string) => void;
   /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
-  const setChatSessionPermissionModeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionPermissionMode>) => setChatSessionPermissionMode(...args) });
-  const setChatSessionPlanModeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionPlanMode>) => setChatSessionPlanMode(...args) });
-  const setChatSessionAutonomyMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionAutonomy>) => setChatSessionAutonomy(...args) });
-  const setChatSessionGoalMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionGoal>) => setChatSessionGoal(...args) });
-  const importNativeChatMutation = useMutation({ mutationFn: (args: Parameters<typeof importNativeChat>) => importNativeChat(...args) });
-  const openSideChatMutation = useMutation({ mutationFn: openSideChat });
-  const createChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof createChatSession>) => createChatSession(...args) });
-  const setChatSessionArchivedMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionArchived>) => setChatSessionArchived(...args) });
-  const renameChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof renameChatSession>) => renameChatSession(...args) });
-  const deleteChatSessionMutation = useMutation({ mutationFn: deleteChatSession });
+  const { portalContainer } = useContext(WorkspaceDomContext);
+
+  const { showCustomDialog, showConfirmDialog } = useWorkspace().dialogs;
+
+  const { captureUiEvent, sendChatMessage, getChatSubmission, getChatSession, patchChatSession } = useWorkspace().api;
+  const {
+    listProjectsQuery,
+    listProjectActivityQuery,
+    listChatSessionsQuery,
+    listSidebarChatSessionsQuery,
+    listChatActiveRunsQuery,
+    getHarnessesQuery,
+    getUiStateQuery,
+    getSkillsQuery,
+    getHarnessSetupCommandsQuery,
+    getCodeTreeQuery,
+    getChatMessagesQuery,
+    getProjectStarterPromptsQuery,
+    citedMessageQuery,
+  } = useWorkspace().queries;
+  // The alphaXiv account and library belong to the machine the app runs on.
+  const owner = useMachines().owner;
+  const { setScopedQueryData, queryClient, isCurrentScope, deletedSessionIds } = useWorkspace();
+  const workspace = useWorkspace();
+  const { useChatState, serialize: queueSessionMutation } = workspace.chat;
+  const patchSession = (session: Pick<ChatSession, "id" | "projectId">, changes: ChatSessionPatch) =>
+    mutPatchChatSession.runAsHeadlessPromise(workspace, session, changes, {});
+  const agentSwitch = useMutate(mutPatchChatSession);
+  // Covers a switch still waiting behind another write to the session, not only the request itself.
+  const switchingAgent = agentSwitch.isOptimisticData;
+  const { composerStashes, mountedComposers, composerSeed, forgetComposerSeed } = useWorkspace().composers;
+  const { onChatEvent } = useWorkspace().events;
+  const { removeSession: removeCachedSession, removeProject: removeCachedProject } = useWorkspace().invalidation;
 
   const navigate = useNavigate();
+  const createProject = useCreateProject();
   const { data: sidebarProjects = [] } = useQuery({ ...listProjectsQuery(), enabled: !embedded });
+  const latestProject = sidebarProjects.reduce<Project | undefined>((latest, project) => project.scratch || (latest && project.updatedAt <= latest.updatedAt) ? latest : project, undefined);
   const { data: projectActivity = [] } = useQuery({ ...listProjectActivityQuery(), enabled: !embedded });
-  const [sidebarGrouping, setSidebarGrouping] = useState<"projects" | "list">(() => {
-    try { return localStorage.getItem("sidebar-grouping") === "list" ? "list" : "projects"; }
+  const [sidebarGrouping, setSidebarGrouping] = useState<SidebarGrouping>(() => {
+    try { return SIDEBAR_GROUPINGS.find((mode) => mode === localStorage.getItem("sidebar-grouping")) ?? "projects"; }
     catch { return "projects"; }
   });
+  const [collapsedInbox, setCollapsedInbox] = useState<string[]>(() => {
+    try {
+      const stored: unknown = JSON.parse(localStorage.getItem("sidebar-inbox-collapsed") ?? '["done"]');
+      return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : [];
+    } catch { return []; }
+  });
+  const machineSuffix = runtime.kind === "ssh" ? `:${encodeURIComponent(runtime.session.host)}` : "";
+  const pinnedProjectsKey = `sidebar-pinned-projects${machineSuffix}`;
+  const collapsedProjectsKey = `sidebar-collapsed-projects${machineSuffix}`;
   const [pinnedProjects, setPinnedProjects] = useState<string[]>(() => {
     try {
-      const stored: unknown = JSON.parse(localStorage.getItem("sidebar-pinned-projects") ?? "[]");
+      const stored: unknown = JSON.parse(localStorage.getItem(pinnedProjectsKey) ?? "[]");
       return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : [];
     } catch { return []; }
   });
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>(() => {
     try {
-      const stored: unknown = JSON.parse(localStorage.getItem("sidebar-collapsed-projects") ?? "[]");
+      const stored: unknown = JSON.parse(localStorage.getItem(collapsedProjectsKey) ?? "[]");
       return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : [];
     } catch { return []; }
   });
@@ -4881,25 +6103,58 @@ export function ChatPanel({
     return () => { observer.disconnect(); railBodyRef.current = null; };
   }, [embedded]);
   const recentActivity = new Map(projectActivity.map((activity) => [activity.projectId, activity.lastActivityAt]));
-  const sortedProjects = [...sidebarProjects].sort((a, b) => Number(pinnedProjects.includes(b.id)) - Number(pinnedProjects.includes(a.id)) || Math.max(recentActivity.get(b.id) ?? 0, b.updatedAt) - Math.max(recentActivity.get(a.id) ?? 0, a.updatedAt));
-  const candidateLimit = sidebarGrouping === "list" || sidebarExpanded ? sortedProjects.length : Math.max(1, Math.ceil(railHeight / 36));
-  let shownProjects = sortedProjects.slice(0, candidateLimit);
+  const byRecency = (a: Project, b: Project) => Math.max(recentActivity.get(b.id) ?? 0, b.updatedAt) - Math.max(recentActivity.get(a.id) ?? 0, a.updatedAt);
   const currentProject = sidebarProjects.find((project) => project.id === projectId);
-  if (currentProject && !shownProjects.some((project) => project.id === projectId)) {
-    shownProjects = [...shownProjects.slice(0, candidateLimit - 1), currentProject];
+  // Each chat without a project has a scratch project of its own; the newest one stands for the group.
+  const chatCounts = new Map(projectActivity.map((activity) => [activity.projectId, activity.totalAgents]));
+  const scratchProjects = sidebarProjects.filter((project) => project.scratch && (project.id === projectId || chatCounts.get(project.id))).sort(byRecency);
+  const scratchGroup = currentProject?.scratch ? currentProject : scratchProjects[0];
+  // Chats without a project stay on top, so opening one never reshuffles the projects below.
+  const sortedProjects = [
+    ...(scratchGroup ? [scratchGroup] : []),
+    ...sidebarProjects.filter((project) => !project.scratch)
+      .sort((a, b) => Number(pinnedProjects.includes(b.id)) - Number(pinnedProjects.includes(a.id)) || byRecency(a, b)),
+  ];
+  const candidateLimit = sidebarGrouping !== "projects" || sidebarExpanded ? sortedProjects.length : Math.max(1, Math.ceil(railHeight / 36));
+  let shownProjects = sortedProjects.slice(0, candidateLimit);
+  const shownCurrent = currentProject?.scratch ? scratchGroup : currentProject;
+  if (shownCurrent && !shownProjects.includes(shownCurrent)) {
+    shownProjects = [...shownProjects.slice(0, candidateLimit - 1), shownCurrent];
   }
+  const scratchLimit = chatLimits.scratch ?? 6;
+  const queriedScratch = scratchProjects.slice(0, scratchLimit);
+  if (currentProject?.scratch && !queriedScratch.includes(currentProject)) queriedScratch.push(currentProject);
+  const queriedProjects = sidebarGrouping === "projects" ? shownProjects.flatMap((project) => project.scratch ? queriedScratch : [project]) : [];
   const projectSessionsQueries = useQueries({
-    queries: (sidebarGrouping === "projects" ? shownProjects : []).map((project) => ({
+    queries: queriedProjects.map((project) => ({
       ...listChatSessionsQuery(project.id),
       enabled: !embedded,
     })),
   });
   const flatSessions = useInfiniteQuery({
-    queryKey: workspaceKey("listSidebarChatSessions", sessionFilter),
-    queryFn: ({ pageParam, signal }: { pageParam: SidebarChatCursor | null; signal: AbortSignal }) => readSidebarChatPage(sessionFilter, pageParam, signal),
-    initialPageParam: null,
-    getNextPageParam: (page): SidebarChatCursor | undefined => page.next ?? undefined,
-    enabled: !embedded && sidebarGrouping === "list",
+    ...listSidebarChatSessionsQuery(sidebarGrouping === "inbox" ? "active" : sessionFilter),
+    enabled: !embedded && sidebarGrouping !== "projects",
+  });
+  const doneExpanded = sidebarGrouping === "inbox" && !collapsedInbox.includes("done");
+  // Done is a place to look something up, not a view to stay in: opening a chat or clicking away closes it.
+  const closeDone = useCallback(() => setCollapsedInbox((collapsed) => {
+    if (collapsed.includes("done")) return collapsed;
+    const next = [...collapsed, "done"];
+    try { localStorage.setItem("sidebar-inbox-collapsed", JSON.stringify(next)); } catch {}
+    return next;
+  }), []);
+  useEffect(() => {
+    if (!doneExpanded) return;
+    const away = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest("[data-done-area], [role=menu], [role=dialog], [data-session-hover-card]")) return;
+      closeDone();
+    };
+    document.addEventListener("pointerdown", away, true);
+    return () => document.removeEventListener("pointerdown", away, true);
+  }, [doneExpanded, closeDone]);
+  const doneSessions = useInfiniteQuery({
+    ...listSidebarChatSessionsQuery("archived"),
+    enabled: !embedded && doneExpanded,
   });
   const sessionsOptions = useMemo(() => listChatSessionsQuery(projectId), [projectId]);
   const { data: sessions = EMPTY_SESSIONS, isSuccess: sessionsLoaded } = useQuery(sessionsOptions);
@@ -4917,6 +6172,23 @@ export function ChatPanel({
     });
   }, [sessionsOptions]);
   const activeId = activeSessionId;
+  // Session rows keep their identity across unrelated updates, so the memoized
+  // transcript only re-renders when one of its delegates or their status changes.
+  const delegatesRef = useRef<DelegateRow[]>(EMPTY_DELEGATES);
+  const chatLinks = useMemo<ChatLinks | null>(
+    () => (chatInfo && onOpenDelegate && onOpenMessage ? { chat: chatInfo, onOpenChat: onOpenDelegate, onOpenMessage } : null),
+    [chatInfo, onOpenDelegate, onOpenMessage],
+  );
+  const delegates = useMemo(() => {
+    const next = activeId
+      ? delegatesOf(sessions, activeId).map((session) => ({ session, status: delegateStatus(session, sessions) }))
+      : EMPTY_DELEGATES;
+    const previous = delegatesRef.current;
+    const changed = next.length !== previous.length
+      || next.some((row, index) => row.session !== previous[index].session || row.status !== previous[index].status);
+    if (changed) delegatesRef.current = next;
+    return delegatesRef.current;
+  }, [sessions, activeId]);
   const onActiveSessionChangeRef = useRef(onActiveSessionChange);
   onActiveSessionChangeRef.current = onActiveSessionChange;
   const projectVisitRef = useRef({ projectId });
@@ -4941,6 +6213,7 @@ export function ChatPanel({
   const goalArmed = goalScope === composerScopeRef.current;
   // Pasted/dropped/uploaded attachments waiting in the composer, as data URLs.
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
+  const cited = citedAttachments(draft, attachments);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [imageRefusedFor, setImageRefusedFor] = useState<string | null>(null);
   // Unsent composer content belongs to the scope it was typed in — stash on
@@ -5008,16 +6281,21 @@ export function ChatPanel({
     };
   }, [stashKey, composerPrefill]);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const settingsMutationTail = useRef<Promise<void>>(Promise.resolve());
   const settingsMutationSeq = useRef(0);
   const planMutationSeq = useRef(0);
   const [planModeOverride, setPlanModeOverride] = useState<boolean | null>(null);
   const planModeOverrideRef = useRef<boolean | null>(null);
   const queuedPlanOverrideSeen = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { data: activeRuns = [] } = useQuery(listChatActiveRunsQuery());
+  const { data: activeRuns = EMPTY_RUNS } = useQuery(listChatActiveRunsQuery());
+  const runsBySession = useMemo(() => {
+    const bySession = new Map<string, ChatActiveRun[]>();
+    for (const item of activeRuns) bySession.set(item.sessionId, [...bySession.get(item.sessionId) ?? [], item]);
+    return bySession;
+  }, [activeRuns]);
   const [state, dispatch, historyQuery] = useChatState(projectId, mainView === "chat" ? activeId : null);
   const { data: harnesses = EMPTY_HARNESSES } = useQuery(getHarnessesQuery());
+  const modelName = useModelName();
   const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
   useEffect(() => setSelection(preferredAgent), [preferredAgent]);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
@@ -5034,8 +6312,9 @@ export function ChatPanel({
   const [recoveringTurnId, setRecoveringTurnId] = useState<string | null>(null);
   const recoveringTurnRef = useRef(false);
   const activeLeafRef = useRef<string | null>(null);
-  const [retryingQueuedId, setRetryingQueuedId] = useState<string | null>(null);
   const preparingSend = useRef(false);
+  /** A new chat's first message, shown from send until its session can hold it. */
+  const [launch, setLaunch] = useState<{ projectId: string; sessionId: string | null; reached?: boolean; left?: boolean; message: ChatMessage } | null>(null);
   // Sessions whose title was just replaced by a harness-generated one, mapped
   // to a nonce that bumps per reveal so a second retitle remounts the spans and
   // replays the animation instead of sitting on a finished one.
@@ -5050,11 +6329,49 @@ export function ChatPanel({
   // Render-fresh mirror of `sessions` for callbacks memoized on projectId
   // alone (syncSessionList snapshots it before fetching).
   const threadRef = useRef<HTMLDivElement>(null);
+  const localFind = useState<number | null>(null);
+  const [findRequest, setFindRequest] = find ?? localFind;
+  const [branchReturn, setBranchReturn] = useState<{ sessionId: string; leafId: string } | null>(null);
+  const searchRegion = useSyncExternalStore(subscribeCommandRegion, commandRegion);
+  const openFind = useCallback(() => setFindRequest(Date.now()), []);
+  const closeFind = useCallback(() => {
+    const anchor = threadRef.current?.querySelector<HTMLElement>("[data-search-target=true]");
+    const top = anchor?.getBoundingClientRect().top;
+    setFindRequest(null);
+    setBranchReturn(null);
+    requestAnimationFrame(() => {
+      const scroll = threadRef.current;
+      if (scroll && anchor?.isConnected && top !== undefined) scroll.scrollTop += anchor.getBoundingClientRect().top - top;
+      const pane = threadRef.current?.closest(".chat-pane");
+      const target = pane?.querySelector<HTMLElement>("[data-search-target=true][data-part-id]") ?? pane?.querySelector<HTMLElement>("[data-search-target=true]");
+      target?.focus({ preventScroll: true });
+    });
+  }, []);
+  const findOpen = findRequest !== null;
+  const unmounting = useRef(false);
+  useLayoutEffect(() => {
+    unmounting.current = false;
+    return () => { unmounting.current = true; };
+  }, []);
+  // A hit can open in the other chat pane, which highlights it until this box closes or unmounts,
+  // unless this pane gave way to the plan or subagent tab that still shows the hit.
+  useLayoutEffect(() => {
+    if (findOpen) return () => { if (!unmounting.current || handedOffSearchNonce !== openedSearchNonce) onClearSearch(); };
+  }, [findOpen, onClearSearch]);
   const threadInnerRef = useRef<HTMLDivElement>(null);
   const scrollToEndRef = useRef<(() => void) | null>(null);
   const stickToBottom = useRef(true);
+  const programmaticScroll = useRef<number | null>(null);
+  const lastTranscriptTop = useRef(0);
   const [transcriptAtBottom, setTranscriptAtBottom] = useState(true);
-  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<ComposerEditorHandle>(null);
+  useEffect(() => {
+    const focused = document.activeElement;
+    if (switchingAgent
+      && (focused === document.body || (focused instanceof HTMLButtonElement && focused.disabled))) {
+      composerRef.current?.focus();
+    }
+  }, [switchingAgent]);
   const connection = useRemoteConnection();
   const resumeCancelRef = useRef<(() => void) | null>(null);
   const dataSources = usePopover();
@@ -5083,8 +6400,6 @@ export function ChatPanel({
   const [skillMenuDismissed, setSkillMenuDismissed] = useState(false);
   const [modelPickerRequest, setModelPickerRequest] = useState(0);
   const [composerCursor, setComposerCursor] = useState(0);
-  // IME guard: mid-composition text can transiently look like a full command.
-  const composingRef = useRef(false);
 
   // Only reachable while the menu is open, which needs a live slash context.
   function pickSkill(skill: SkillInfo) {
@@ -5096,61 +6411,36 @@ export function ChatPanel({
       return;
     }
     // The command replaces the `/query` token in place, so the chip lands where
-    // it was typed and the rest of the message stays untouched. Only a skill
-    // chip is painted wider than its token, so only it reserves a margin.
-    const tokenName = skill.name.replace(/@u$/, "^").replace(/@p$/, "~");
-    const marginSpaces = skill.source === "command" ? 1 : skillMarginSpaces(tokenName, composerRef.current);
-    const next = insertSlashCommand(draft, slashContext, tokenName, marginSpaces);
-    setDraft(next.text);
-    window.requestAnimationFrame(() => {
-      composerRef.current?.focus();
-      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
-      setComposerCursor(next.cursor);
-    });
+    // it was typed and the rest of the message stays untouched.
+    const next = insertSlashCommand(draft, slashContext, skill.name.replace(/@u$/, "^").replace(/@p$/, "~"));
+    composerRef.current?.setText(next.text, next.cursor);
   }
 
-  function pickFileMention(match: FileMentionMatch) {
+  function pickMention(match: MentionMatch) {
     if (!mentionContext) return;
-    const next = insertFileMention(draft, mentionContext, match);
-    setDraft(next.text);
-    window.requestAnimationFrame(() => {
-      composerRef.current?.focus();
-      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
-      setComposerCursor(next.cursor);
-    });
-  }
-
-  /** Backspace just behind a chip deletes the whole command, the way the chip
-   * it paints reads — a single object, not eight characters. */
-  function deleteCommandBehindCaret(textarea: HTMLTextAreaElement): boolean {
-    if (typingCommand) return false;
-    const cursor = textarea.selectionStart;
-    if (composingRef.current || cursor !== textarea.selectionEnd) return false;
-    const tokenEnd = draft.slice(0, cursor).replace(/[ \t]+$/, "").length;
-    const context = slashCommandContext(draft, tokenEnd);
-    if (!context || context.end !== tokenEnd) return false;
-    if (!knownCommand(context.query)) return false;
-    if (cursor > tokenEnd && cursor - tokenEnd !== skillMarginSpaces(context.query, textarea)) return false;
-    const next = removeSlashCommand(draft, { ...context, end: cursor });
-    setDraft(next.text);
-    setComposerCursor(next.cursor);
-    window.requestAnimationFrame(() =>
-      textarea.setSelectionRange(next.cursor, next.cursor),
-    );
-    return true;
+    const next = match.kind === "file"
+      ? insertFileMention(draft, mentionContext, match)
+      : insertMentionToken(draft, mentionContext, match.kind === "paper" ? paperToken(match.paper) : match.id);
+    composerRef.current?.setText(next.text, next.cursor);
   }
 
   /** Queue files (upload button, clipboard paste, or drag-drop) as composer
-   * attachments — images and PDFs, which the harness reads off disk by path. */
-  function addFiles(files: File[]) {
+   * attachments — images and PDFs, which the harness reads off disk by path —
+   * cited in the draft at the caret. */
+  function addFiles(
+    files: File[],
+    target?: { scope: typeof composerScopeRef.current; stashKey: string },
+  ) {
     // Per-file and total caps keep the base64-inflated (~33%) request body
-    // under the backend's 64 MB limit — a single 30 MB file or a batch summing
-    // to 40 MB both stay clear once encoded.
+    // under the backend's 64 MiB limit — a single 30 MiB file or a batch summing
+    // to 40 MiB both stay clear once encoded.
     const MAX_BYTES = 30 * 1024 * 1024;
     const TOTAL_BYTES = 40 * 1024 * 1024;
     setAttachError(null);
     setImageRefusedFor(null);
-    let total = attachments.reduce((n, a) => n + a.size, 0);
+    let total = cited.attachments.reduce((n, a) => n + a.size, 0);
+    const scope = target?.scope ?? composerScopeRef.current;
+    const attachmentStashKey = target?.stashKey ?? stashKey;
     for (const file of files) {
       if (!/^(image\/(png|jpeg|gif|webp)|application\/pdf)$/.test(file.type)) continue;
       if (noImageInputError && file.type.startsWith("image/")) {
@@ -5158,20 +6448,19 @@ export function ChatPanel({
         continue;
       }
       if (file.size > MAX_BYTES) {
-        setAttachError(m.chat_attachment_too_large({ name: ltr(file.name) }));
+        setAttachError(m.chat_attachment_too_large({ name: ltr(file.name), size: fmtBytes(MAX_BYTES) }));
         continue;
       }
       if (total + file.size > TOTAL_BYTES) {
-        setAttachError(m.chat_attachments_total_too_large());
+        setAttachError(m.chat_attachments_total_too_large({ size: fmtBytes(TOTAL_BYTES) }));
         continue;
       }
       total += file.size;
-      const scope = composerScopeRef.current;
-      const attachmentStashKey = stashKey;
       const reader = new FileReader();
       reader.onload = () => {
         if (!isCurrentScope(sessionsOptions.queryKey)) return;
         const attachment = {
+          id: nextAttachmentId(),
           dataUrl: reader.result as string,
           mediaType: file.type,
           name: file.name,
@@ -5179,13 +6468,15 @@ export function ChatPanel({
         };
         // The decode is async — if the composer moved on, the file belongs to
         // the scope it was pasted into, not whatever chat is now showing.
-        if (composerMountedRef.current && composerScopeRef.current.projectId === scope.projectId && composerScopeRef.current.activeId === scope.activeId) {
+        if (composerMountedRef.current && composerScopeRef.current.projectId === scope.projectId && composerScopeRef.current.activeId === scope.activeId && composerScopeRef.current.mainView === scope.mainView) {
           setAttachments((cur) => [...cur, attachment]);
+          composerRef.current?.insertToken(attachmentToken(attachment));
           return;
         }
         const stash = composerStashes.get(attachmentStashKey) ?? EMPTY_COMPOSER_STASH;
         composerStashes.set(attachmentStashKey, {
           ...stash,
+          draft: [stash.draft, attachmentToken(attachment)].filter(Boolean).join(" "),
           attachments: [...stash.attachments, attachment],
         });
       };
@@ -5193,8 +6484,10 @@ export function ChatPanel({
     }
   }
 
-  function onComposerPaste(e: React.ClipboardEvent) {
-    const files = Array.from(e.clipboardData.items)
+  function onComposerPaste(e: ClipboardEvent) {
+    const data = e.clipboardData;
+    if (!data) return;
+    const files = Array.from(data.items)
       .filter(
         (item) =>
           item.kind === "file" &&
@@ -5202,15 +6495,39 @@ export function ChatPanel({
       )
       .map((item) => item.getAsFile())
       .filter((f): f is File => f !== null);
-    if (files.length > 0) {
+    const usable = files.filter((file) => file.size > 0);
+    if (usable.length > 0) {
       e.preventDefault();
-      addFiles(files);
+      addFiles(usable);
+      return;
     }
+    const types = Array.from(data.types);
+    const hasImageType =
+      types.some((type) => type.startsWith("image/")) ||
+      files.some((file) => file.type.startsWith("image/"));
+    const mayContainImage = hasImageType || types.length === 0 || types.includes("Files");
+    const hasText =
+      types.some((type) => type.startsWith("text/")) ||
+      Boolean(data.getData("text/plain"));
+    if (!mayContainImage || (hasText && !hasImageType)) {
+      return;
+    }
+    if (!navigator.clipboard?.read) {
+      return;
+    }
+    e.preventDefault();
+    const scope = composerScopeRef.current;
+    const attachmentStashKey = stashKey;
+    void (async () => {
+      const file = await readClipboardImage();
+      if (file) {
+        addFiles([file], { scope, stashKey: attachmentStashKey });
+      }
+    })();
   }
 
-  // The open session, if any (its harness is locked; its model/mode/reasoning
-  // are what the composer should reflect and edit).
   const openSession = sessions.find((s) => s.id === activeId);
+  const assistantLabel = openSession ? harnessLabel(openSession.harness, openSession.harnessName) : m.chat_the_agent();
 
   // The selection the composer displays and edits:
   //  * with a session open — that session's stored settings, with any unsent
@@ -5223,6 +6540,7 @@ export function ChatPanel({
   const rawSelection: ModelSelection | null = openSession
     ? {
       harness: openSession.harness,
+      profile: openSession.profile ?? null,
       model: sessionOverride.model !== undefined ? sessionOverride.model
         : retryOptions?.model !== undefined ? retryOptions.model : openSession.model,
       serviceTier: sessionOverride.serviceTier !== undefined ? sessionOverride.serviceTier
@@ -5236,9 +6554,8 @@ export function ChatPanel({
       ? { ...savedSelection, ...sessionOverride }
       : null;
   const { data: skills = EMPTY_SKILLS } = useQuery(getSkillsQuery(rawSelection?.harness, projectId));
-  const catalogHarness = rawSelection
-    ? harnesses.find((h) => h.id === rawSelection.harness)
-    : undefined;
+  const { data: uiState } = useQuery(getUiStateQuery());
+  const catalogHarness = selectionHarness(harnesses, rawSelection);
   const activeHarness = sessionAcpHarness(openSession, catalogHarness);
   const acpOptions = nativeOptions(openSession?.nativeConfiguration, { model: m.model_picker_model(), mode: m.model_picker_mode() });
   const acpModel = acpOptions.find((option) => option.category === "model");
@@ -5283,31 +6600,63 @@ export function ChatPanel({
   const mentionQuery = mentionContext?.end === composerCursor ? mentionContext.query : null;
   const mentionTree = useQuery({
     ...getCodeTreeQuery(projectId, activeId ? { sessionId: activeId } : {}),
-    enabled: mentionQuery !== null,
+    // Also loaded for `@path` tokens already in the draft, which chip only when the path exists.
+    enabled: mentionQuery !== null || /(^|\s)@\S/.test(draft),
   });
   const mentionEntries = mentionTree.data?.entries;
   const mentionPool = useMemo(() => mentionCandidates(mentionEntries ?? []), [mentionEntries]);
-  const mentionMatches = useMemo(
-    () => (mentionQuery !== null && !skillMenuDismissed ? matchFileMentions(mentionPool, mentionQuery) : []),
-    [mentionPool, mentionQuery, skillMenuDismissed],
-  );
+  const libraryUserId = owner.queries.useOpenResearchAccount().data?.user?.id;
+  // A `/` in the query browses the checkout, so papers and chats sit that out.
+  const searchesBeyondFiles = mentionQuery !== null && !mentionQuery.includes("/");
+  const paperSearch = useDebouncedValue(mentionQuery ?? "", 200);
+  const mentionPapers = useQuery({
+    queryKey: owner.workspaceKey("mentionPapers", libraryUserId, paperSearch),
+    queryFn: ({ signal }) => owner.api.getAlphaXivPapers(null, null, paperSearch || undefined, signal),
+    enabled: Boolean(libraryUserId) && searchesBeyondFiles,
+    staleTime: 60_000,
+    retry: false,
+  }, owner.queryClient);
+  const mentionMatches = useMemo((): MentionMatch[] => {
+    if (mentionQuery === null || skillMenuDismissed) return [];
+    const files = matchFileMentions(mentionPool, mentionQuery).map((match) => ({ kind: "file" as const, ...match }));
+    if (!searchesBeyondFiles) return files;
+
+    const needle = mentionQuery.toLowerCase();
+    const papers = (mentionPapers.data?.papers ?? [])
+      .slice(0, 3)
+      .map((paper) => ({ kind: "paper" as const, paper }));
+    const chats = sessions
+      .filter((session) => session.id !== activeId && !session.archived)
+      .map((session) => ({
+        kind: "chat" as const,
+        id: session.id,
+        title: chatInfo?.(session.id)?.title ?? session.title ?? m.chat_untitled(),
+        harness: session.harness,
+      }))
+      .filter((chat) => chat.title.toLowerCase().includes(needle))
+      .slice(0, 3);
+    // Room for every section above the fold.
+    return [...files.slice(0, papers.length + chats.length > 0 ? 4 : undefined), ...papers, ...chats];
+  }, [mentionPool, mentionQuery, skillMenuDismissed, searchesBeyondFiles, mentionPapers.data, sessions, activeId, chatInfo]);
   const mentionMenuOpen = mentionMatches.length > 0;
+  const mentionPaths = useMemo(() => new Set(mentionPool.map((candidate) => candidate.path)), [mentionPool]);
   const activeMentionIdx = Math.min(mentionIdx, Math.max(0, mentionMatches.length - 1));
   useEffect(() => setMentionIdx(0), [mentionQuery]);
-  // Reconcile the selected model's settings, including stale saved preferences,
-  // without replacing custom model IDs that are absent from the catalog.
+  // Reconcile the selected model's settings, including stale saved preferences.
   const composerSelection = deriveComposerSelection(acpModel && rawSelection ? { ...rawSelection, model: acpModel.currentValue } : rawSelection, activeHarness);
   // Reasoning choices follow the *selected model*, not just the harness — an
   // OpenCode model with no `variants` hides the picker entirely, and Codex's
   // top tiers appear only on the models that accept them.
   const reasoning = reasoningFor(activeHarness, composerSelection?.model);
   const selectedModel = activeHarness?.models.find((model) => model.id === composerSelection?.model);
+  // A new chat starts only on a model its agent lists; a side chat runs its parent's.
+  const canRun = !!activeHarness?.agentReady && (!!activeId || !!sideParentSessionId || !!selectedModel);
   // OpenCode reports a text-only model's image Read as both success and error, so refuse up front.
   const noImageInputError = selectedModel?.imageInput === false
     ? m.chat_model_no_image_input({ model: ltr(harnessModelLabel(selectedModel)) })
     : null;
   const imageInputBlocked =
-    !!noImageInputError && attachments.some((a) => a.mediaType.startsWith("image/"));
+    !!noImageInputError && cited.attachments.some((a) => a.mediaType.startsWith("image/"));
   const imageRefused = !!selectedModel && imageRefusedFor === selectedModel.id;
   const imageInputError = imageInputBlocked || imageRefused ? noImageInputError : null;
   useEffect(() => setImageRefusedFor(null), [selectedModel?.id]);
@@ -5330,9 +6679,29 @@ export function ChatPanel({
     composerLiveRef.current = { ...composerLiveRef.current, pendingClientTurn: null };
   };
   const selectModel = (next: Partial<ModelSelection>) => {
+    const otherAgent = next.harness !== undefined && (next.harness !== openSession?.harness || (next.profile ?? null) !== (openSession.profile ?? null));
+    if (openSession && composerSelection && otherAgent) {
+      const agent = { ...composerSelection, ...next };
+      const scope = stashKey;
+      invalidatePendingRetry();
+      setSettingsError(null);
+      setSelection(agent);
+      void onPreferredAgentChange(agent).catch(() => {});
+      agentSwitch.runWithOptions(workspace, openSession, { agent }, {
+        onSuccessData: () => {
+          if (pendingScope.current !== scope) return;
+          setSessionOverride({});
+          setRecoveryOverrides({});
+        },
+        onError: (error) => {
+          if (pendingScope.current === scope) setSettingsError(error instanceof Error ? error.message : m.chat_switch_agent_failed());
+        },
+      });
+      return;
+    }
     if (openSession?.harness.startsWith("acp:") && acpModel && next.model) {
       if (next.model !== acpModel.currentValue) invalidatePendingRetry();
-      void setChatConfiguration(openSession.id, acpModel.id, next.model).catch((error: unknown) => showAlert(error instanceof Error ? error.message : String(error), "error"));
+      mutSetChatConfiguration.run(workspace, openSession, acpModel.id, next.model);
       return;
     }
     if (!composerSelection) return;
@@ -5360,14 +6729,14 @@ export function ChatPanel({
     void onPreferredAgentChange(merged).catch(() => {});
     if (openSession) {
       setSessionOverride((cur) => ({ ...cur, ...next }));
-    } else if (next.harness && next.harness !== composerSelection.harness) {
+    } else if (next.harness && (next.harness !== composerSelection.harness || (next.profile ?? null) !== (composerSelection.profile ?? null))) {
       setSessionOverride({});
     }
   };
-  function startHarness(harness: Harness) {
-    const model = resolveHarnessDefaultModel(harness);
+  function startHarness(harness: Harness, model: string) {
     const next: ModelSelection = {
       harness: harness.id,
+      profile: harness.profile?.id ?? null,
       model,
       serviceTier: reconcileServiceTier(harness.catalogPending ? undefined : harness, model, null),
       permissionMode: harness.options?.defaultPermissionMode ?? null,
@@ -5378,17 +6747,6 @@ export function ChatPanel({
     if (onStartHarnessDraft) onStartHarnessDraft();
     else onActiveSessionChangeRef.current(null, { projectId });
   }
-  const queueSessionMutation = useCallback(<T,>(mutation: () => Promise<T>): Promise<T> => {
-    const result = settingsMutationTail.current.catch(() => {}).then(() => {
-      if (!isCurrentScope(sessionsOptions.queryKey)) throw new DOMException("Workspace changed", "AbortError");
-      return mutation();
-    });
-    settingsMutationTail.current = result.then(
-      () => {},
-      () => {},
-    );
-    return result;
-  }, [sessionsOptions]);
   const setPermissionMode = (id: string) => {
     // Plan is session-scoped. Claude exposes it in the permission dropdown,
     // but it must not become the saved default for future sessions.
@@ -5405,29 +6763,21 @@ export function ChatPanel({
       selectModel({ permissionMode: id });
     }
     if (!openSession) return;
-    const sessionId = openSession.id;
     const mutation = ++settingsMutationSeq.current;
+    const clearOverride = () =>
+      setSessionOverride((current) => {
+        const next = { ...current };
+        delete next.permissionMode;
+        return next;
+      });
     setSettingsError(null);
-    void queueSessionMutation(() => setChatSessionPermissionModeMutation.mutateAsync([sessionId, id]))
-      .then((session) => {
-        setSessions((current) =>
-          current.map((candidate) => (candidate.id === session.id ? session : candidate)),
-        );
-        if (settingsMutationSeq.current === mutation) {
-          setSessionOverride((current) => {
-            const next = { ...current };
-            delete next.permissionMode;
-            return next;
-          });
-        }
+    void patchSession(openSession, { permissionMode: id })
+      .then(() => {
+        if (settingsMutationSeq.current === mutation) clearOverride();
       })
       .catch(() => {
         if (settingsMutationSeq.current !== mutation) return;
-        setSessionOverride((current) => {
-          const next = { ...current };
-          delete next.permissionMode;
-          return next;
-        });
+        clearOverride();
         setSettingsError(m.chat_update_permissions_failed());
       });
   };
@@ -5439,24 +6789,11 @@ export function ChatPanel({
       else onPreferredAutonomyChange(autonomy);
       return;
     }
-    const sessionId = openSession.id;
-    const previous = openSession.autonomy;
     const mutation = ++settingsMutationSeq.current;
-    const replace = (session: ChatSession) =>
-      setSessions((current) => current.map((row) => (row.id === session.id ? session : row)));
-    replace({ ...openSession, autonomy });
     setSettingsError(null);
-    void queueSessionMutation(() => setChatSessionAutonomyMutation.mutateAsync([sessionId, autonomy]))
-      .then((session) => {
-        replace(session);
-        onPreferredAutonomyChange(session.autonomy);
-      })
+    void patchSession(openSession, { autonomy })
+      .then((session) => onPreferredAutonomyChange(session.autonomy))
       .catch(() => {
-        setSessions((current) =>
-          current.map((row) =>
-            row.id === sessionId && row.autonomy === autonomy ? { ...row, autonomy: previous } : row,
-          ),
-        );
         if (settingsMutationSeq.current === mutation) setSettingsError(m.chat_update_autonomy_failed());
       });
   };
@@ -5477,21 +6814,17 @@ export function ChatPanel({
     if (acpMode && openSession) {
       const next = planMode ? "plan" : acpMode.choices.find((choice) => choice.id !== "plan")?.id;
       if (!next) throw new Error(m.chat_toggle_plan_failed());
-      await queueSessionMutation(() => setChatConfiguration(openSession.id, acpMode.id, next));
+      await mutSetChatConfiguration.runAsHeadlessPromise(workspace, openSession, acpMode.id, next, {});
       return;
     }
     setRecoveryOverrides((current) => ({ ...current, planMode }));
     planModeOverrideRef.current = planMode;
     setPlanModeOverride(planMode);
     if (!openSession) return;
-    const sessionId = openSession.id;
     const mutation = ++planMutationSeq.current;
     setSettingsError(null);
     try {
-      const session = await queueSessionMutation(() => setChatSessionPlanModeMutation.mutateAsync([sessionId, planMode]));
-      setSessions((current) =>
-        current.map((candidate) => (candidate.id === session.id ? session : candidate)),
-      );
+      await patchSession(openSession, { planMode });
       if (planMutationSeq.current === mutation) {
         planModeOverrideRef.current = null;
         setPlanModeOverride(null);
@@ -5588,10 +6921,10 @@ export function ChatPanel({
         const markdown = openSession
           ? transcriptMarkdown(title, messages, {
             user: m.chat_export_you(),
-            assistant: harnessLabel(openSession.harness, openSession.harnessName),
+            assistant: assistantLabel,
           })
           : null;
-        if (markdown) downloadMarkdown(transcriptFileName(title), markdown);
+        if (markdown) downloadFile(transcriptFileName(title), new Blob([markdown], { type: "text/markdown;charset=utf-8" }));
         else showAlert(m.chat_nothing_to_export(), "info");
         return false;
       }
@@ -5609,9 +6942,7 @@ export function ChatPanel({
     setSettingsError(null);
     const visit = projectVisitRef.current;
     try {
-      const session = await importNativeChatMutation.mutateAsync([projectId, chat]);
-      // The adopted chat is no longer one of the agent's unclaimed ones.
-      void queryClient.invalidateQueries({ queryKey: listNativeChatsQuery().queryKey });
+      const session = await mutImportNativeChat.runAsHeadlessPromise(workspace, projectId, chat, {});
       if (projectVisitRef.current !== visit) return;
       setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
       setSessionFilter("all");
@@ -5638,7 +6969,7 @@ export function ChatPanel({
     // Declaring the goal before the first message is the natural moment for it,
     // so an empty composer gets a session rather than losing the goal.
     if (!sessionId) {
-      if (!activeHarness?.agentReady || !composerSelection) {
+      if (!canRun || !composerSelection) {
         setSettingsError(m.chat_selected_harness_unavailable());
         return;
       }
@@ -5654,10 +6985,7 @@ export function ChatPanel({
     }
     const clearing = /^(clear|none|off)$/i.test(wanted);
     try {
-      const session = await queueSessionMutation(() =>
-        setChatSessionGoalMutation.mutateAsync([sessionId, clearing ? null : wanted]),
-      );
-      setSessions((current) => current.map((candidate) => (candidate.id === session.id ? session : candidate)));
+      await patchSession({ id: sessionId, projectId }, { goal: clearing ? null : wanted });
       showAlert(clearing ? m.chat_goal_cleared() : m.chat_goal_set(), "success");
     } catch (err) {
       if (!inSourceScope()) return;
@@ -5684,7 +7012,7 @@ export function ChatPanel({
     const sourceScope = composerScopeRef.current;
     try {
       // SSE may deliver the final result before this initial progress response.
-      const { message } = await compactChatSession(sessionId);
+      const { message } = await mutCompactChatSession.runAsHeadlessPromise(workspace, sessionId, {});
       dispatch({ type: "upsertMessage", sessionId, message, onlyIfMissing: true });
     } catch (err) {
       if (composerScopeRef.current.activeId !== sourceScope.activeId) return;
@@ -5697,12 +7025,7 @@ export function ChatPanel({
     setDraft(next.text);
     setSkillMenuDismissed(true);
     if (runComposerCommand(name)) return;
-    window.requestAnimationFrame(() => {
-      if (composerRef.current?.value !== next.text) return;
-      composerRef.current?.focus();
-      composerRef.current?.setSelectionRange(next.cursor, next.cursor);
-      setComposerCursor(next.cursor);
-    });
+    composerRef.current?.setText(next.text, next.cursor);
   }
 
   // Reconcile deletions and title animations after missed session events.
@@ -5761,13 +7084,13 @@ export function ChatPanel({
   }, [projectId, syncSessionList]);
 
   useEffect(() => {
-    setRecoveryOverrides(EMPTY_RECOVERY_OVERRIDES);
-  }, [activeId]);
-
-  useEffect(() => {
     return onChatEvent((ev) => {
       switch (ev.type) {
         case "session": {
+          if (ev.session.id === composerScopeRef.current.activeId && ev.session.projectId !== projectId) {
+            onActiveSessionChangeRef.current(ev.session.id, { projectId: ev.session.projectId, replace: true });
+            return;
+          }
           if (ev.session.projectId !== projectId) return;
           if (deletedSessionIds.has(ev.session.id)) return;
           // A generated title landing on a session already on screen is the
@@ -5783,8 +7106,7 @@ export function ChatPanel({
               next.set(ev.session.id, (cur.get(ev.session.id) ?? 0) + 1);
               return next;
             });
-            // Drop the flag once the run is over (longest stagger + one char
-            // duration, plus slack) so later re-renders show a static title.
+            // Drop the flag once the sweep is over so later remounts don't replay it.
             window.setTimeout(() => {
               setTitleReveals((cur) => {
                 if (!cur.has(ev.session.id)) return cur;
@@ -5805,7 +7127,7 @@ export function ChatPanel({
 
   useEffect(() => onChatEvent((event) => {
     if (event.type === "reconnected") void syncSessionList(true);
-    if (event.type === "runsChanged" || event.type === "reconnected") {
+    if (event.type === "runsChanged") {
       void queryClient.invalidateQueries({ queryKey: listChatActiveRunsQuery().queryKey });
     }
   }), [syncSessionList]);
@@ -5830,9 +7152,17 @@ export function ChatPanel({
   const canFork = !busy && !!activeHarness?.agentReady;
   const hasPendingTailTool = busy && streamTailTool(messages) != null;
   const hasStreamingText = busy && streamTailIsText(messages);
-  // Messages the user parked behind the running turn (oldest first). Populated
-  // by chat.queued events and the seed snapshot; each runs when its turn ends.
-  const queued = activeId ? (state.queuedBySession[activeId] ?? []) : [];
+  // Messages the user parked behind the running turn (oldest first), and steers
+  // its agent has not read yet. Populated by chat.queued events and the seed
+  // snapshot; a parked one runs when its turn ends.
+  const queueItems = activeId ? state.queuedBySession[activeId] : undefined;
+  const [queued, unreadSteers] = useMemo(() => {
+    const items = queueItems ?? [];
+    return [
+      items.filter((item) => item.dispatchState !== "steering"),
+      items.filter((item) => item.dispatchState === "steering"),
+    ];
+  }, [queueItems]);
   const hasRetryingQueue = queued.some((item) => item.dispatchState === "retrying");
   const firstBlockedQueueIndex = queued.findIndex((item) => item.dispatchState === "blocked");
   const nextQueueRetryAt = queued.reduce<number | null>((latest, item) => {
@@ -5867,14 +7197,6 @@ export function ChatPanel({
     }
   }, [queued]);
   const historyLoading = !!activeId && historyQuery.isPending;
-  const waitingSessions = useMemo(() => {
-    const waiting = new Set<string>();
-    for (const [id, messages] of Object.entries(state.messagesBySession)) {
-      const busy = state.busySessions.has(id);
-      if (hasPendingInput(activePath(messages, state.activeLeafBySession[id]), busy)) waiting.add(id);
-    }
-    return waiting;
-  }, [state.busySessions, state.messagesBySession, state.activeLeafBySession]);
   // Async questions can await an answer while the agent continues working.
   const awaitingInput = busy && messages.some((message) => message.parts.some(
     (part) => part.type === "prompt" && part.prompt && !part.prompt.resolved && part.prompt.nativeId,
@@ -5883,14 +7205,17 @@ export function ChatPanel({
     part.type === "prompt" && part.prompt?.kind === "question" && !part.prompt.resolved && (!part.prompt.nativeId || busy),
   )), [messages, busy]);
   const activeSession = openSession;
+  // Once the user writes in a delegate, whether it still reports to its parent is theirs to decide.
+  const steeringDelegate = Boolean(activeSession?.delegate?.notifies) && (draft.trim() !== ""
+    || messages.some((message) => message.parts.some((part) =>
+      (part.type === "steer" || (message.role === "user" && part.type === "text")) && Boolean(part.text) && !part.orx)));
   // Nonce while the open session's title is mid-reveal; undefined = static.
   const activeTitleReveal = activeSession ? titleReveals.get(activeSession.id) : undefined;
 
-  // The newest unresolved plan prompt, if any — it drives the docked strip
-  // above the composer. Resolution re-emits the message over SSE, so this
-  // recomputes to null and the strip disappears on its own.
+  // Shell exchanges don't start a new agent turn or resolve its pending plan.
   const pendingPlan = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && !shellExchangePart(messages[i])) break;
       for (const part of messages[i].parts) {
         if (part.type === "prompt" && part.prompt?.kind === "plan" && !part.prompt.resolved) {
           return {
@@ -5916,6 +7241,27 @@ export function ChatPanel({
     }
     return draft.trim().toLowerCase() === `/${name}`;
   };
+
+  const draftRefs = useMemo(
+    () => [...new Set(Array.from(draft.matchAll(CITED_ID), ([cited]) => cited).filter((cited) => cited.startsWith("msg_")))],
+    [draft],
+  );
+  const combineCited = useCallback(
+    (results: { data?: CitedMessage }[]) => new Map(results.flatMap((result, i) => (result.data ? [[draftRefs[i], result.data] as const] : []))),
+    [draftRefs],
+  );
+  const citedInDraft = useQueries({ queries: draftRefs.map(citedMessageQuery), combine: combineCited });
+
+  const chipSource = useMemo<ChipSource>(() => ({
+    isCommand: knownCommand,
+    message: (ref) => citedInDraft.get(ref),
+    chat: (id) => chatInfo?.(id),
+    skill: (name) => commands.find((command) => command.name === canonicalSkillName(name) && command.source !== "command"),
+    isPath: (path) => !bashMode && mentionPaths.has(path),
+    attachment: (id) => attachments.find((attachment) => attachment.id === id),
+    // `knownCommand` reads the draft, commands and bash mode.
+  }), [draft, commands, bashMode, mentionPaths, attachments, citedInDraft, chatInfo]);
+
   /** Sent messages keep any command token as prose — it was never intercepted. */
   const transcriptSkills = useMemo(
     () => commands.filter((command) => command.source !== "command"),
@@ -5947,7 +7293,7 @@ export function ChatPanel({
     !pendingPlan &&
     !awaitingInput &&
     !pendingPermission &&
-    attachments.length === 0 &&
+    cited.attachments.length === 0 &&
     annotations.length === 0;
 
   // Plan opens are stamped with the session like file opens are. Memoized
@@ -5987,8 +7333,13 @@ export function ChatPanel({
   );
 
   // Drop any unsent composer tweak when switching sessions, so it never bleeds
-  // from one session's pickers onto another's.
+  // from one session's pickers onto another's. A hidden machine's effects rerun
+  // when it is shown again, so only a real session change resets them.
+  const overridesSession = useRef<string | null | undefined>(undefined);
   useEffect(() => {
+    if (overridesSession.current === activeId) return;
+    overridesSession.current = activeId;
+    setRecoveryOverrides(EMPTY_RECOVERY_OVERRIDES);
     settingsMutationSeq.current += 1;
     planMutationSeq.current += 1;
     const queuedMode = (activeId ? state.queuedBySession[activeId] ?? [] : []).reduce<
@@ -6001,37 +7352,58 @@ export function ChatPanel({
     setSettingsError(null);
   }, [activeId]);
 
+  // A launch belongs to its new-chat route until the created chat's route takes over, and ends once the user leaves either.
+  const launchHere = mainView === "chat" && launch?.projectId === projectId
+    && (activeId === launch.sessionId || (activeId === null && !launch.reached));
+  if (launch && !launch.left && !launchHere) setLaunch({ ...launch, left: true });
+  else if (launch?.sessionId && !launch.reached && activeId === launch.sessionId) setLaunch({ ...launch, reached: true });
+  const launching = launch && !launch.left && launchHere ? launch : null;
+  const launchMessages = useMemo(() => launching ? [launching.message] : null, [launching?.message]);
+  // A chat's first turn sets up its checkout before the agent says anything.
+  const firstTurnStarting = launching !== null || (busy && allMessages.length === 1);
+  const statusLine = firstTurnStarting ? (activeSession?.sideParentSessionId || sideParentSessionId ? m.chat_starting() : m.chat_setting_up_worktree())
+    : busy && !awaitingInput && !hasPendingTailTool && !hasStreamingText ? m.chat_thinking() : null;
+  const statusLineRef = useRef<HTMLDivElement>(null);
+  /** Finds the message a send just added, and keeps finding it as the server's copy replaces the local one. */
+  const sentTail = () => {
+    let sent: string | null = null;
+    return (started: boolean) => {
+      const bubble = [...threadInnerRef.current?.querySelectorAll(".msg-user") ?? []].at(-1);
+      const row = bubble?.closest<HTMLElement>("[data-message-id]");
+      if (!bubble || !row) return null;
+      // Only the local copy starts a rise; after that, only a row with the same text, never another chat's prompt.
+      if (started ? bubble.textContent !== sent : !row.dataset.messageId?.startsWith(LOCAL_PREFIX)) return null;
+      sent = bubble.textContent;
+      const status = statusLineRef.current;
+      return { rising: status ? [row, status] : [row], fading: status };
+    };
+  };
+
   // Opening a session or returning from settings starts pinned at the latest messages.
-  const threadMounted = mainView === "chat" && (messages.length > 0 || busy);
+  const threadMounted = launching !== null || (mainView === "chat" && (messages.length > 0 || busy));
 
   // Keyed by project so a switch never shows another project's prompts; a
   // harness or model switch keeps them, and only a failed harness is retried.
   const starterHarness = composerSelection?.harness ?? null;
   const starterModel = composerSelection?.model ?? null;
   const historyError = !historyQuery.data ? historyQuery.error : null;
-  const starterVisible = mainView === "chat" && !embedded && !threadMounted && !contentLoading && !contentError && !historyLoading && !historyError;
+  // A chat without a project has no project to suggest a start from.
+  const starterVisible = mainView === "chat" && !embedded && !threadMounted && !contentLoading && !contentError && !historyLoading && !historyError && !currentProject?.scratch;
   const starterQuery = useQuery({
-    ...getProjectStarterPromptsQuery(projectId, starterHarness ?? "claude-code", starterModel, getLocale()),
+    ...getProjectStarterPromptsQuery(projectId, starterHarness ?? "claude-code", starterModel, getLocale(), composerSelection?.profile ?? null),
     enabled: starterVisible && starterHarness !== null,
     subscribed: starterVisible && starterHarness !== null,
   });
-  const starterPrompts = starterQuery.data?.blank
-    ? blankStarterPrompts()
-    : (starterQuery.data?.prompts ?? null);
-  const starterLoading = starterHarness !== null && starterQuery.isPending;
+  const starterPrompts = !starterVisible ? null
+    : starterQuery.data?.blank ? blankStarterPrompts()
+      : (starterQuery.data?.prompts ?? null);
+  const starterLoading = starterVisible && starterHarness !== null && starterQuery.isPending;
   // The demo project is the only surface that isn't a user-created project.
   const telemetrySurface: FirstActionSurface =
     projectId === DEMO_PROJECT_ID ? "demo" : "project";
   const applyStarterPrompt = (prompt: string) => {
-    setDraft(prompt);
     setSkillMenuDismissed(false);
-    window.requestAnimationFrame(() => {
-      const el = composerRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(prompt.length, prompt.length);
-      setComposerCursor(prompt.length);
-    });
+    composerRef.current?.setText(prompt, prompt.length);
   };
   // Seeds without taking focus; focus may still belong to the welcome dialog.
   // Declared after the stash-restore effect so `current` below is the scope's
@@ -6042,40 +7414,36 @@ export function ChatPanel({
     setSkillMenuDismissed(false);
     setComposerCursor(composerPrefill.length);
   }, [composerPrefill]);
-  const [newChatFocusProject, setNewChatFocusProject] = useState<string | null>(null);
-  const focusedComposerNonce = useRef(0);
-  useEffect(() => {
-    // The composer is inert while its chat is loading. Keep the
-    // request pending until it can take focus, and consume it only once.
-    const newChatPending = newChatFocusProject === projectId && activeId === null;
-    const composerPending = composerFocusNonce !== 0 && composerFocusNonce !== focusedComposerNonce.current;
-    if ((!newChatPending && !composerPending) || mainView !== "chat" || contentLoading || contentError || historyLoading) return;
-    // The welcome dialog restores its previous focus on unmount; run after that.
-    const frame = window.requestAnimationFrame(() => {
-      const el = composerRef.current;
-      if (!el) return;
-      el.focus();
-      if (document.activeElement !== el) return;
-      focusedComposerNonce.current = composerFocusNonce;
-      if (newChatPending) setNewChatFocusProject(null);
-      el.setSelectionRange(el.value.length, el.value.length);
-      el.scrollIntoView({ block: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [composerFocusNonce, newChatFocusProject, projectId, activeId, mainView, contentLoading, contentError, historyLoading]);
+  const requestNewChatFocus = useComposerFocus(
+    composerRef,
+    composerFocusNonce,
+    mainView === "chat" && !contentLoading && !contentError && !historyLoading,
+    projectId,
+    activeId,
+  );
   const demoHintId = useId();
   const unconfirmedSendId = useId();
   const demoHintVisible =
     projectId === DEMO_PROJECT_ID && draft === DEMO_RUN_EXPERIMENT_PROMPT && !demoHintDismissed;
   const updateTranscriptBottom = useCallback((el: HTMLDivElement) => {
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    stickToBottom.current = atBottom;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distance < 60;
+    // Wheels, keys, focus moves and screen readers scroll unannounced; only the virtualizer's own scrolls are recorded.
+    const programmatic = programmaticScroll.current !== null && Math.abs(el.scrollTop - programmaticScroll.current) <= 1;
+    const movedUp = el.scrollTop < lastTranscriptTop.current;
+    programmaticScroll.current = null;
+    lastTranscriptTop.current = el.scrollTop;
+    // Trackpads scroll a pixel at a time, so any upward scroll lets go before the next resize re-pins it.
+    if (!programmatic) stickToBottom.current = distance <= 1 || (atBottom && !movedUp);
     setTranscriptAtBottom(atBottom);
   }, []);
   const pinTranscriptToBottom = useCallback(() => {
     stickToBottom.current = true;
     setTranscriptAtBottom(true);
     scrollToEndRef.current?.();
+  }, []);
+  const leaveTranscriptFeed = useCallback((forward: boolean) => {
+    (forward ? composerRef.current : threadRef.current)?.focus();
   }, []);
   useEffect(() => {
     const el = threadRef.current;
@@ -6099,6 +7467,7 @@ export function ChatPanel({
 
   /** `queue` (the ⌘/Ctrl+Enter chord) parks the message even on a harness that steers. */
   async function send({ queue = false, starter }: { queue?: boolean; starter?: string } = {}) {
+    if (switchingAgent) return;
     // Slash tokens stay in the wire form: the server resolves every selected
     // skill and supplies this exact message as their shared request context.
     const originalText = (starter ?? draft).trim();
@@ -6145,8 +7514,11 @@ export function ChatPanel({
     const planPermissionMode = planRequested && activeHarness?.id === "claude-code"
       ? toggledPlanMode ? "plan" : "auto"
       : undefined;
-    const text = composerCommand ? composerCommand.prompt : originalText;
-    const pending = attachments;
+    // Attachments travel in the order the text cites them.
+    const sending = citedAttachments(composerCommand ? composerCommand.prompt : originalText, attachments);
+    const text = sending.text;
+    const pending = sending.attachments;
+    const attachmentsAtSend = attachments;
     const pendingAnnotations = annotations;
     const wireAnnotations = pendingAnnotations.map((annotation) => ({
       text: annotation.text,
@@ -6244,7 +7616,7 @@ export function ChatPanel({
     if ((!text && pending.length === 0 && pendingAnnotations.length === 0) || (goalRequested && !text)) return;
     const persistMessageGoal = async (sessionId: string) => {
       if (!goalRequested) return;
-      const session = await setChatSessionGoalMutation.mutateAsync([sessionId, text]);
+      const session = await patchChatSession(sessionId, { goal: text });
       setSessions((current) => current.map((candidate) => candidate.id === session.id ? session : candidate));
     };
     const clientTurnId = retry?.id ?? `ct_${crypto.randomUUID()}`;
@@ -6280,11 +7652,11 @@ export function ChatPanel({
       composerLiveRef.current = {
         ...live,
         draft: live.draft === draft ? "" : live.draft,
-        attachments: live.attachments === pending ? [] : live.attachments,
+        attachments: live.attachments === attachmentsAtSend ? [] : live.attachments,
         annotations: live.annotations === pendingAnnotations ? [] : live.annotations,
       };
       setDraft((current) => current === draft ? "" : current);
-      setAttachments((current) => current === pending ? [] : current);
+      setAttachments((current) => current === attachmentsAtSend ? [] : current);
       setAnnotations((current) => current === pendingAnnotations ? [] : current);
       setAttachError(null);
       setImageRefusedFor(null);
@@ -6300,6 +7672,17 @@ export function ChatPanel({
         return;
       }
       const sid = activeId;
+      if (mode === "steer") {
+        const waiting = () => threadInnerRef.current?.querySelector(".msg-steer-pending");
+        const waitingBefore = waiting()?.childElementCount ?? 0;
+        riseIntoPlace(threadRef, threadInnerRef, () => {
+          const steers = waiting();
+          const label = steers?.lastElementChild;
+          const steer = label?.previousElementSibling;
+          if (!steers || steers.childElementCount <= waitingBefore || !(steer instanceof HTMLElement) || !(label instanceof HTMLElement)) return null;
+          return { rising: [steer, label], fading: waitingBefore === 0 ? label : null };
+        }, 3000);
+      }
       clearComposer();
       if (inSourceScope()) setSessionOverride({});
       const images: ChatImageAttachment[] = pending.map((a) => ({
@@ -6347,8 +7730,9 @@ export function ChatPanel({
       }
       return;
     }
-    if (!activeHarness?.agentReady) {
+    if (!canRun) {
       clearFailedPlanCommand();
+      if (activeHarness?.agentReady) setModelPickerRequest((request) => request + 1);
       return;
     }
     // `composerSelection` already resolves to the open session's settings (+ any
@@ -6367,7 +7751,14 @@ export function ChatPanel({
       preparingSend.current = true;
       try {
         if (!sid) {
-          const session = await openNewSession(effective, independentPlanMode);
+          riseIntoPlace(threadRef, threadInnerRef, sentTail(), 500);
+          const launchMessage = optimisticUserMessage({
+            text: text || m.chat_asked_about_selection(),
+            attachments: pending.map((a) => ({ url: a.dataUrl, mediaType: a.mediaType, name: a.name })),
+            annotations: pendingAnnotations,
+          }, null);
+          setLaunch({ projectId, sessionId: null, message: launchMessage });
+          const session = await openNewSession(effective, independentPlanMode, launchMessage);
           sid = session.id;
           sourceSessionId = session.id;
           sourceStashKey = `${stashScope}${embedded ? `side:${session.id}` : session.id}`;
@@ -6387,10 +7778,13 @@ export function ChatPanel({
         await awaitHistory();
       } finally {
         preparingSend.current = false;
+        // Same tick as the optimistic message below, so the handoff never paints between them.
+        setLaunch(null);
       }
       if (!isCurrentScope(sessionsOptions.queryKey) || deletedSessionIds.has(sid)
         || (sideParentSessionId && deletedSessionIds.has(sideParentSessionId))) return;
       if (!(retry && mode === "steer")) {
+        if (activeId !== null && inSourceScope()) riseIntoPlace(threadRef, threadInnerRef, sentTail(), 500);
         dispatch({
           type: "optimisticUser",
           sessionId: sid,
@@ -6465,28 +7859,33 @@ export function ChatPanel({
   }
 
   /** Create the session a first message (or `!` command) lands in and open it. */
-  async function openNewSession(selection: ModelSelection, planMode: boolean | undefined) {
+  async function openNewSession(selection: ModelSelection, planMode: boolean | undefined, launchMessage?: ChatMessage) {
     const scope = composerScopeRef.current;
     const visit = projectVisitRef.current;
     let session = sideParentSessionId
-      ? await openSideChatMutation.mutateAsync(sideParentSessionId)
-      : await createChatSessionMutation.mutateAsync([projectId, selection.harness, {
+      ? await mutOpenSideChat.runAsHeadlessPromise(workspace, sideParentSessionId, {})
+      : await mutCreateChatSession.runAsHeadlessPromise(workspace, projectId, selection.harness, {
+        profile: selection.profile,
         model: selection.model,
         serviceTier: selection.serviceTier,
         permissionMode: selection.permissionMode,
         planMode,
         reasoningLevel: selection.reasoningLevel,
         autonomy: preferredAutonomy,
-      }]);
+      }, {});
     if (sideParentSessionId && sideDraftAutonomy !== null && session.autonomy !== sideDraftAutonomy) {
-      session = await setChatSessionAutonomyMutation.mutateAsync([session.id, sideDraftAutonomy]);
+      session = await patchSession(session, { autonomy: sideDraftAutonomy });
     }
-    if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit) {
+    // A chat without a project can land in a scratch project of its own.
+    const here = session.projectId === projectId;
+    if (here && isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit) {
       setSessions((cur) => [session, ...cur.filter((row) => row.id !== session.id)]);
       if (!queryClient.getQueryData(sessionsOptions.queryKey)) void syncSessionList(true);
     }
     if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit && composerScopeRef.current === scope) {
-      onActiveSessionChangeRef.current(session.id, { replace: true });
+      // Synchronous, so no frame shows the new route without the launch it continues.
+      if (launchMessage) flushSync(() => setLaunch((current) => current?.message === launchMessage ? { ...current, sessionId: session.id } : current));
+      onActiveSessionChangeRef.current(session.id, { replace: true, projectId: session.projectId });
       composerScopeRef.current = { ...scope, activeId: session.id };
     }
     return session;
@@ -6494,17 +7893,13 @@ export function ChatPanel({
 
   function exitBashMode() {
     const next = withoutBashPrefix(draft);
-    setDraft(next);
-    window.requestAnimationFrame(() => {
-      composerRef.current?.focus();
-      composerRef.current?.setSelectionRange(next.length, next.length);
-      setComposerCursor(next.length);
-    });
+    composerRef.current?.setText(next, next.length);
   }
 
   /** Enter in bash mode: run the command where the agent works and show the
    * exchange on the branch. A new chat gets its session first, as send() does. */
   async function runShell() {
+    if (switchingAgent) return;
     const command = shellCommand;
     if (!command) return;
     setSettingsError(null);
@@ -6529,7 +7924,7 @@ export function ChatPanel({
     setSkillMenuDismissed(false);
     let sid = activeId;
     if (!sid) {
-      if (!activeHarness?.agentReady || !composerSelection) {
+      if (!canRun || !composerSelection) {
         restoreDraft();
         setSettingsError(m.chat_selected_harness_unavailable());
         return;
@@ -6555,7 +7950,7 @@ export function ChatPanel({
     dispatch({ type: "localShell", sessionId: sid, id: localId, command });
     if (inSourceScope()) pinTranscriptToBottom();
     try {
-      const { message } = await runShellCommand(sid, command);
+      const { message } = await mutRunShellCommand.runAsHeadlessPromise(workspace, sid, command, {});
       dispatch({ type: "upsertMessage", sessionId: sid, message });
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -6571,8 +7966,8 @@ export function ChatPanel({
 
   function stop() {
     if (!activeId) return;
-    void interruptChat(activeId).catch(() => {
-      setSettingsError(m.chat_stop_failed());
+    mutInterruptChat.runWithOptions(workspace, activeId, {
+      onError: (error) => setSettingsError(m.chat_stop_failed({ error: ltr(error instanceof Error ? error.message : String(error)) })),
     });
   }
 
@@ -6591,32 +7986,63 @@ export function ChatPanel({
           reasoningLevel: recoveryOverrides.reasoningLevel,
         });
         const sessionId = activeId;
-        const response = await recoverChatTurn(sessionId, turnId, action, turnOpts);
+        const response = await mutRecoverChatTurn.runAsHeadlessPromise(workspace, sessionId, turnId, action, turnOpts, {});
         if (response.turn.existing) await reseedSession(sessionId);
         setRecoveryOverrides(EMPTY_RECOVERY_OVERRIDES);
-      } catch {
-        setSettingsError(m.chat_recover_failed());
+      } catch (error) {
+        setSettingsError(m.chat_recover_failed({ error: ltr(error instanceof Error ? error.message : String(error)) }));
       } finally {
         recoveringTurnRef.current = false;
         setRecoveringTurnId(null);
       }
     },
-    [activeId, recoveryOverrides, reseedSession],
+    [workspace, activeId, recoveryOverrides, reseedSession],
   );
+  const signIn = useAgentSignIn();
+  const agentName = activeHarness?.profile?.name ?? (activeHarness && harnessDisplayName(activeHarness));
+  const composerSignedOut = activeHarness?.authState === "needsLogin" && (activeHarness.id !== "claude-code" || Boolean(activeHarness.profile) || activeHarness.loginEligible);
+  const signedOutTurn = composerSignedOut && messages.at(-1)?.parts.find((part) => part.id === "turn-recovery" && isSignInFailure(part));
+  const signInTurn = signedOutTurn ? signedOutTurn.state?.input : undefined;
+  const signInRecovery = parseRecoveryAction(signInTurn?.recoveryAction);
+  // Without a sign-in here, the composer keeps the agent's note and its command.
+  const composerSignIn = composerSignedOut ? signIn(activeHarness, () => {
+    if (signInTurn?.turnId && (signInRecovery === "retry" || signInRecovery === "continue")) {
+      void recoverFailedTurn(signInTurn.turnId, signInRecovery);
+    }
+  }) : undefined;
+  /** The agent or account a failure ran on; a failure saved before it was named is the chat's own. */
+  const failedAgent = (input: FailureInput) => input.harness
+    ? selectionHarness(harnesses, { harness: input.harness, profile: input.profile ?? null }) ?? (input.harness === activeHarness?.id ? activeHarness : undefined)
+    : activeHarness;
+  const failureActions: FailureActions | undefined = activeHarness && {
+    agent: failedAgent,
+    fix: (cause, input) => {
+      if (cause === "sign_in") {
+        const agent = failedAgent(input);
+        const action = parseRecoveryAction(input.recoveryAction);
+        // A ready agent may still hold the token the turn saw rejected, so Sign in stays beside Retry.
+        if (agent && harnessKey(agent) === harnessKey(activeHarness) && composerSignIn) return undefined;
+        return signIn(agent, () => { if (input.turnId && (action === "retry" || action === "continue")) void recoverFailedTurn(input.turnId, action); });
+      }
+      if (cause === "model_unavailable") return () => setModelPickerRequest((request) => request + 1);
+      if (cause === "context_full" && activeHarness.supportsCompaction) return () => void compactSession();
+      return undefined;
+    },
+  };
 
   const forkTurn = useCallback(
     (messageId: string, text: string) => {
       if (!activeId || busy || !activeHarness?.agentReady) return;
       const sid = activeId;
-      dispatch({ type: "busy", sessionId: sid, busy: true });
       pinTranscriptToBottom();
-      void queueSessionMutation(() => forkChatTurn(sid, messageId, text)).catch((err) => {
-        dispatch({ type: "busy", sessionId: sid, busy: false });
-        const detail = err instanceof Error ? err.message : String(err);
-        dispatch({ type: "localError", sessionId: sid, text: m.chat_resend_failed({ error: ltr(detail) }) });
+      mutForkChatTurn.runWithOptions(workspace, { id: sid, projectId }, messageId, text, {
+        onError: (err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          dispatch({ type: "localError", sessionId: sid, text: m.chat_resend_failed({ error: ltr(detail) }) });
+        },
       });
     },
-    [activeId, busy, activeHarness?.agentReady, pinTranscriptToBottom, queueSessionMutation],
+    [workspace, activeId, projectId, busy, activeHarness?.agentReady, pinTranscriptToBottom],
   );
 
   /** Show a different fork. The server descends to that branch's newest tip and
@@ -6627,47 +8053,99 @@ export function ChatPanel({
       // turn's reply on whichever branch the pointer stopped at.
       if (!activeId || busy) return;
       const sid = activeId;
-      // Via the ref, not a dep: the leaf changes on every new message, and this
-      // callback reaches every row through the memoized `Message`.
-      const previous = activeLeafRef.current;
-      dispatch({ type: "activeLeaf", sessionId: sid, leafId });
-      void queueSessionMutation(() => selectChatBranch(sid, leafId)).catch((err) => {
-        // Leaving the client on a branch the server did not switch to would send
-        // the next message somewhere other than what is on screen.
-        dispatch({ type: "activeLeaf", sessionId: sid, leafId: previous });
-        const detail = err instanceof Error ? err.message : String(err);
-        dispatch({ type: "localError", sessionId: sid, text: m.chat_switch_fork_failed({ error: ltr(detail) }) });
+      mutSelectChatBranch.runWithOptions(workspace, sid, leafId, {
+        onError: (err) => {
+          const detail = err instanceof Error ? err.message : String(err);
+          dispatch({ type: "localError", sessionId: sid, text: m.chat_switch_fork_failed({ error: ltr(detail) }) });
+        },
       });
     },
-    [activeId, busy, queueSessionMutation],
+    [workspace, activeId, busy],
   );
 
-  // Durable cancellation wins before the chip disappears. If persistence
-  // fails, leave it visible so a restart cannot surprise the user by sending it.
+  const forkedForNonce = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (!focusedMessage || focusedMessage.sessionId !== activeId || busy) return;
+    if (forkedForNonce.current === focusedMessage.nonce) return;
+    const { messageId } = focusedMessage;
+    if (messages.some((message) => message.id === messageId)) {
+      forkedForNonce.current = focusedMessage.nonce;
+      return;
+    }
+    if (!allMessages.some((message) => message.id === messageId)) return;
+    forkedForNonce.current = focusedMessage.nonce;
+    const previous = activeLeafRef.current;
+    if (focusedMessage.query && previous) {
+      setBranchReturn((current) => current?.sessionId === activeId ? current : { sessionId: activeId, leafId: previous });
+    }
+    selectBranch(messageId);
+  }, [focusedMessage, activeId, busy, messages, allMessages, selectBranch]);
+  const restoreSearchBranch = useCallback(() => {
+    if (!branchReturn || branchReturn.sessionId !== activeId) return;
+    selectBranch(branchReturn.leafId);
+    setBranchReturn(null);
+  }, [branchReturn, activeId, selectBranch]);
+  const searchedPart = useMemo(() => {
+    if (focusedMessage?.sessionId !== activeId || !focusedMessage?.partId) return;
+    const message = allMessages.find((message) => message.id === focusedMessage.messageId);
+    return message && findPartById(message.parts, focusedMessage.partId);
+  }, [focusedMessage, activeId, allMessages]);
+  /** Deliver a card answer; resolves `false` when delivery failed (so a
+   * caller can e.g. restore a consumed draft). Stable per session so the
+   * memoized Message rows don't re-render on unrelated state changes. */
+  const respond = useCallback(
+    (answer: PromptAnswer): Promise<boolean> => {
+      if (!activeId) return Promise.resolve(false);
+      return mutRespondChat.runAsHeadlessPromise(workspace, { id: activeId, projectId }, answer, {}).then(() => true, (error: unknown) => {
+        showAlert(error instanceof Error ? error.message : String(error), "error");
+        return false;
+      });
+    },
+    [workspace, activeId, projectId],
+  );
+
+  const questions = useQuestions(activeId, pendingQuestions, respond);
+  const asking = questions.part !== null;
+  const showQuestion = questions.show;
+  const searchedPartId = focusedMessage?.sessionId === activeId ? focusedMessage.partId : undefined;
+  useEffect(() => {
+    if (searchedPartId) showQuestion(searchedPartId);
+  }, [searchedPartId, showQuestion]);
+
+  useEffect(() => {
+    if (contentLoading || historyLoading || !focusedMessage?.query || focusedMessage.sessionId !== activeId || openedSearchNonce === focusedMessage.nonce) return;
+    const message = messages.find((message) => message.id === focusedMessage.messageId);
+    if (!message) return;
+    openedSearchNonce = focusedMessage.nonce;
+    const part = focusedMessage.partId ? findPartById(message.parts, focusedMessage.partId) : undefined;
+    handedOffSearchNonce = (focusedMessage.spawnPartId ? openSubagent : part?.prompt?.kind === "plan" && openPlan) ? focusedMessage.nonce : undefined;
+    if (focusedMessage.spawnPartId) openSubagent?.(focusedMessage.spawnPartId, undefined, "preview");
+    else if (part?.prompt?.kind === "plan") openPlan?.(part.prompt.plan ?? "", part.id, "preview");
+  }, [contentLoading, historyLoading, focusedMessage, activeId, messages, openSubagent, openPlan]);
+  useLayoutEffect(() => {
+    if (!focusedMessage?.query || !focusedMessage.partId || focusedMessage.sessionId !== activeId) return;
+    const root = threadRef.current?.closest(".chat-pane")?.querySelector<HTMLElement>(`.chat-prompt-questions [data-part-id="${CSS.escape(focusedMessage.partId)}"]`);
+    if (!root || !("highlights" in CSS) || typeof Highlight === "undefined") return;
+    const name = embedded ? "side-chat-search-prompt" : "chat-search-prompt";
+    const highlight = new Highlight(...chatSearchRanges(root, focusedMessage.query));
+    CSS.highlights.set(name, highlight);
+    root.scrollIntoView({ block: "nearest" });
+    return () => { if (CSS.highlights.get(name) === highlight) CSS.highlights.delete(name); };
+  }, [focusedMessage, activeId, questions.part, embedded]);
+
   function cancelQueued(itemId: string) {
     if (!activeId) return;
-    const sid = activeId;
-    void cancelQueuedMessage(sid, itemId)
-      .then(({ removed }) => {
-        if (!removed) return;
-        return reseedSession(sid);
-      })
-      .catch(() => setSettingsError(m.chat_remove_queued_failed()));
+    mutCancelQueuedMessage.runWithOptions(workspace, activeId, itemId, {
+      onError: (error) => setSettingsError(m.chat_remove_queued_failed({ error: ltr(error instanceof Error ? error.message : String(error)) })),
+    });
   }
 
-  async function retryQueued(itemId: string) {
-    if (!activeId || retryingQueuedId) return;
-    const sid = activeId;
+  function retryQueued(itemId: string) {
+    if (!activeId) return;
     setSettingsError(null);
-    setRetryingQueuedId(itemId);
-    try {
-      await retryQueuedMessage(sid, itemId);
-      await reseedSession(sid);
-    } catch {
-      setSettingsError(m.chat_retry_queued_failed());
-    } finally {
-      setRetryingQueuedId(null);
-    }
+    mutRetryQueuedMessage.runWithOptions(workspace, activeId, itemId, {
+      onError: (error) => setSettingsError(m.chat_retry_queued_failed({ error: ltr(error instanceof Error ? error.message : String(error)) })),
+    });
   }
 
   useHotkey("Escape", () => {
@@ -6702,104 +8180,77 @@ export function ChatPanel({
     seenTitles.current.delete(sessionId);
   }
 
-  function updateSidebarSession(session: ChatSession, changes: Partial<ChatSession>) {
-    const options = listChatSessionsQuery(session.projectId);
-    markLiveUpdate(queryClient, options.queryKey, session.id);
-    setScopedQueryData(options.queryKey, (current) =>
-      current?.map((row) => row.id === session.id ? { ...row, ...changes } : row),
-    );
+  function setArchived(session: ChatSession, archived: boolean) {
+    mutPatchChatSession.run(workspace, session, { archived });
   }
 
-  function setArchived(session: ChatSession, archived: boolean) {
-    // Optimistic; the server also broadcasts the row over chat.session. On
-    // failure restore the pre-request snapshot (not the request's negation,
-    // which could undo a concurrent authoritative update).
-    const prev = session.archived;
-    updateSidebarSession(session, { archived });
-    void setChatSessionArchivedMutation.mutateAsync([session.id, archived]).catch(() => {
-      updateSidebarSession(session, { archived: prev });
-    });
+  function stopNotifyingParent(session: ChatSession) {
+    mutPatchChatSession.run(workspace, session, { notifyParent: false });
   }
 
   function rename(session: ChatSession, title: string) {
-    // Optimistic; the server trims and re-broadcasts the row over chat.session.
-    // On failure restore the pre-request title (not the draft) so a concurrent
-    // authoritative update isn't undone.
-    const prev = session.title;
-    updateSidebarSession(session, { title });
-    void renameChatSessionMutation.mutateAsync([session.id, title]).catch(() => {
-      updateSidebarSession(session, { title: prev });
-    });
+    mutPatchChatSession.run(workspace, session, { title });
   }
 
   function removeSession(session: ChatSession) {
     const title = session.title?.trim() || m.chat_untitled();
+    const scratch = sidebarProjects.find((project) => project.id === session.projectId)?.scratch;
+    const siblings = queryClient.getQueryData(listChatSessionsQuery(session.projectId).queryKey)?.filter((row) => row.id !== session.id && !row.sideParentSessionId);
+    // The last chat without a project takes its scratch project with it.
+    const lastOfScratch = scratch && !siblings?.length;
     showConfirmDialog({
       title: m.chat_panel_delete(),
-      description: m.chat_delete_session_confirm({ title: autoDir(title) }),
+      description: lastOfScratch
+        ? m.chat_delete_scratch_session_confirm({ title: autoDir(title) })
+        : m.chat_delete_session_confirm({ title: autoDir(title) }),
       confirmLabel: m.chat_panel_delete(),
       destructive: true,
       onCancel: "close",
-      onConfirm: async () => {
-        await deleteChatSessionMutation.mutateAsync(session.id);
-        forgetSession(session.id);
+      onConfirm: () => {
+        const active = session.id === activeId;
+        if (active && !lastOfScratch) onActiveSessionChangeRef.current(null, { replace: true });
+        mutDeleteChatSession.runWithOptions(workspace, session, { onSuccessData: () => {
+          forgetSession(session.id);
+          if (!lastOfScratch) return;
+          setScopedQueryData(listProjectsQuery().queryKey, (rows) => rows?.filter((row) => row.id !== session.projectId));
+          removeCachedProject(session.projectId);
+          if (active) void navigate({ to: "/projects", replace: true });
+        } });
       },
     });
   }
 
-  /** Deliver a card answer; resolves `false` when delivery failed (so a
-   * caller can e.g. restore a consumed draft). Stable per session so the
-   * memoized Message rows don't re-render on unrelated state changes. */
-  const respond = useCallback(
-    (answer: PromptAnswer): Promise<boolean> => {
-      if (!activeId) return Promise.resolve(false);
-      const sid = activeId;
-      // The resumed turn streams over SSE; optimistically mark busy.
-      dispatch({ type: "busy", sessionId: sid, busy: true });
-      return queueSessionMutation(() => respondChat(sid, answer))
-        .then(() => true)
-        .catch((error: unknown) => {
-          showAlert(error instanceof Error ? error.message : String(error), "error");
-          return false;
-        })
-        .finally(() => {
-          if (!isCurrentScope(sessionsOptions.queryKey)) return;
-          // Reconcile with the store: if this tab's copy of the card was stale
-          // (e.g. the held turn timed out and resolved it while our SSE was
-          // dropped), the answer no-ops server-side and nothing re-broadcasts —
-          // without this the card stays actionable forever and every answer
-          // silently dead-ends. Busy is reconciled from the server for THIS
-          // session only (a whole-set replace could stomp another session's
-          // just-started optimistic flag), so the optimistic dispatch above
-          // can't wedge true after a no-op or failure.
-          void queryClient.fetchQuery({ ...getChatMessagesQuery(sid), staleTime: 0 }).catch(() => {});
-          void queryClient.fetchQuery({ ...listChatSessionsQuery(projectId), staleTime: 0 }).catch(() => {});
-        });
-    },
-    [activeId, projectId, queueSessionMutation, sessionsOptions],
-  );
-
-  const newTaskHotkey = useAppHotkeys()["task.new"].hotkey;
-  const newTaskShortcut = newTaskHotkey ? formatForDisplay(newTaskHotkey) : undefined;
   const queueChord = formatForDisplay("Mod+Enter");
   const startProjectTask = useCallback(() => {
     setSessionFilter("active");
-    setNewChatFocusProject(projectId);
+    requestNewChatFocus(projectId);
     onActiveSessionChange(null);
   }, [onActiveSessionChange, projectId]);
+  /** A new chat without a project gets a scratch project of its own. */
+  const startScratchChat = useCallback(async () => {
+    try {
+      const project = await mutCreateScratchProject.runAsHeadlessPromise(workspace, {});
+      setSessionFilter("active");
+      requestNewChatFocus(project.id);
+      onActiveSessionChange(null, { projectId: project.id });
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    }
+  }, [onActiveSessionChange]);
   const startNewTask = useCallback(async () => {
     try {
       const activity = await queryClient.fetchQuery({ ...listProjectActivityQuery(), staleTime: 0 });
       const latest = activity.reduce<(typeof activity)[number] | undefined>((current, item) =>
         !current || item.lastActivityAt > current.lastActivityAt ? item : current, undefined);
-      setSessionFilter("active");
       const targetProject = latest?.projectId ?? projectId;
-      setNewChatFocusProject(targetProject);
+      if (sidebarProjects.find((project) => project.id === targetProject)?.scratch) return void startScratchChat();
+      setSessionFilter("active");
+      requestNewChatFocus(targetProject);
       onActiveSessionChange(null, { projectId: targetProject });
     } catch (error) {
       showAlert(error instanceof Error ? error.message : String(error), "error");
     }
-  }, [projectId, onActiveSessionChange]);
+  }, [projectId, onActiveSessionChange, sidebarProjects, startScratchChat]);
 
   const openSpawnedSession = useCallback(
     async (sessionId: string) => {
@@ -6822,140 +8273,546 @@ export function ChatPanel({
     if (commandRegion() === "right" && document.querySelector(".right-pane [data-side-chat]")) return;
     startNewTask();
   };
-  useHotkey(appHotkeys["task.new"], newTask, { enabled: !embedded, requireReset: true });
-  useHotkey("Mod+Shift+Enter", newTask, { enabled: !embedded, requireReset: true });
+  useHotkey(appHotkeys["task.new"], newTask, { enabled: !embedded, requireReset: true, conflictBehavior: "allow" });
+  useHotkey(appHotkeys["chat.find"], openFind, { enabled: mainView === "chat" && !contentInert && (embedded ? searchRegion === "right" : searchRegion !== "right"), requireReset: true, ignoreInputs: false, capture: true, conflictBehavior: "allow" });
+  useHotkey("Mod+Shift+Enter", newTask, { enabled: !embedded, requireReset: true, conflictBehavior: "allow" });
 
-  const sessionWaiting = (session: ChatSession) => state.messagesBySession[session.id]
-    ? waitingSessions.has(session.id) : session.awaitingInput === true;
+  const sessionWaiting = (session: ChatSession) => session.id === activeId && historyQuery.data
+    ? hasPendingInput(messages, busy) : session.awaitingInput === true;
   const sessionBusy = (project: Project, session: ChatSession) => project.id === projectId ? state.busySessions.has(session.id) : session.busy;
   const sidebarRows: SidebarRow[] = [];
-  if (sidebarGrouping === "projects") shownProjects.forEach((project, index) => {
-    const query = projectSessionsQueries[index];
-    const projectSessions = project.id === projectId ? sessions : query.data ?? EMPTY_SESSIONS;
-    const matching = projectSessions
-      .filter((session) => !session.sideParentSessionId && (matchesFilter(sessionFilter, session.archived) || session.id === activeId))
+  if (sidebarGrouping === "projects") shownProjects.forEach((project) => {
+    const group = sidebarGroup(project);
+    const members = project.scratch ? queriedScratch : [project];
+    const queries = members.map((member) => projectSessionsQueries[queriedProjects.indexOf(member)]);
+    const projectOf = new Map(members.map((member) => [member.id, member]));
+    const matching = members.flatMap((member, index) => member.id === projectId ? sessions : queries[index].data ?? EMPTY_SESSIONS)
+      .filter((session) => !session.sideParentSessionId && !session.delegate && (matchesFilter(sessionFilter, session.archived) || session.id === activeId))
       .sort((a, b) => b.updatedAt - a.updatedAt);
-    const chatLimit = chatLimits[project.id] ?? 6;
+    const chatLimit = chatLimits[group] ?? 6;
     let visible = matching.slice(0, chatLimit);
     const selected = matching.find((session) => session.id === activeId);
     if (selected && !visible.some((session) => session.id === activeId)) visible = [...visible.slice(0, chatLimit - 1), selected];
-    const collapsed = collapsedProjects.includes(project.id);
-    sidebarRows.push({ kind: "project", project, collapsed, busy: collapsed && matching.some((session) => sessionBusy(project, session) && !sessionWaiting(session)) });
+    const collapsed = collapsedProjects.includes(group);
+    const rowProject = (session: ChatSession) => projectOf.get(session.projectId) ?? project;
+    sidebarRows.push({ kind: "project", project, collapsed, busy: collapsed && matching.some((session) => sessionBusy(rowProject(session), session) && !sessionWaiting(session)) });
     if (collapsed) return;
-    visible.forEach((session) => sidebarRows.push({ kind: "chat", project, session }));
-    if (matching.length > 6) sidebarRows.push({ kind: "more", project });
-    if (!visible.length && (sidebarGrouping === "projects" || query.isPending || query.error)) sidebarRows.push({ kind: "status", project, pending: query.isPending, error: Boolean(query.error), retry: () => { void query.refetch(); } });
+    visible.forEach((session) => sidebarRows.push({ kind: "chat", project: rowProject(session), session }));
+    if (matching.length > 6 || (project.scratch && scratchProjects.length > 6)) sidebarRows.push({ kind: "more", project });
+    const pending = queries.some((query) => query.isPending);
+    const error = queries.some((query) => query.error);
+    if (!visible.length) sidebarRows.push({ kind: "status", project, pending, error, retry: () => { for (const query of queries) void query.refetch(); } });
   });
-  if (sidebarGrouping === "list") {
-    const flat = flatSessions.data?.pages.flatMap((page) => page.sessions) ?? [];
+  const listedChats = (listed: readonly ChatSession[], archived: boolean | null) => {
+    const byId = new Map(listed.map((session) => [session.id, session]));
     const selected = sessions.find((session) => session.id === activeId);
-    if (selected && !flat.some((session) => session.id === selected.id)) flat.push(selected);
-    flat.filter((session) => !deletedSessionIds.has(session.id)).sort((a, b) => b.updatedAt - a.updatedAt).forEach((session) => {
+    if (selected && !selected.delegate && !byId.has(selected.id) && (archived === null || selected.archived === archived)) byId.set(selected.id, selected);
+    return [...byId.values()].filter((session) => !deletedSessionIds.has(session.id)).sort((a, b) => b.updatedAt - a.updatedAt).flatMap((session) => {
       const project = sidebarProjects.find((project) => project.id === session.projectId);
-      if (project) sidebarRows.push({ kind: "chat", project, session });
+      return project ? [{ project, session }] : [];
     });
-    const project = currentProject ?? sidebarProjects[0];
-    if (project && (!sidebarRows.length || flatSessions.isFetchingNextPage || flatSessions.isError)) {
-      sidebarRows.push({ kind: "status", project, pending: flatSessions.isPending || flatSessions.isFetchingNextPage, error: flatSessions.isError,
-        retry: () => { void (flatSessions.isFetchNextPageError ? flatSessions.fetchNextPage() : flatSessions.refetch()); } });
+  };
+  const statusProject = currentProject ?? sidebarProjects[0];
+  const pushListStatus = (query: typeof flatSessions, empty: boolean, emptyText?: string) => {
+    if (statusProject && (empty || query.isFetchingNextPage || query.isError)) {
+      sidebarRows.push({ kind: "status", project: statusProject, pending: query.isPending || query.isFetchingNextPage, error: query.isError, empty: emptyText,
+        retry: () => { void (query.isFetchNextPageError ? query.fetchNextPage() : query.refetch()); } });
     }
+  };
+  // Rows past this index belong to Working and Done; paging the open chats only needs to keep up with the rows above it.
+  let inboxEnd = 0;
+  const flatListed = flatSessions.data?.pages.flatMap((page) => page.sessions) ?? EMPTY_SESSIONS;
+  if (sidebarGrouping === "list") {
+    listedChats(flatListed, null).forEach(({ project, session }) => sidebarRows.push({ kind: "chat", project, session }));
+    pushListStatus(flatSessions, !sidebarRows.length);
+  } else if (sidebarGrouping === "inbox") {
+    const open = listedChats(flatListed, false);
+    const working = open.filter(({ project, session }) =>
+      chatStatusWorking(chatStatus(session, sessionBusy(project, session), sessionWaiting(session), runsBySession.get(session.id) ?? EMPTY_RUNS)));
+    // Newest first by creation, so streaming updates don't reshuffle what's running.
+    working.sort((a, b) => b.session.createdAt - a.session.createdAt);
+    open.filter((chat) => !working.includes(chat)).forEach(({ project, session }) => sidebarRows.push({ kind: "inbox", project, session }));
+    pushListStatus(flatSessions, !open.length);
+    inboxEnd = sidebarRows.length;
+
+    const workingCollapsed = collapsedInbox.includes("working");
+    if (working.length) {
+      sidebarRows.push({ kind: "section", section: "working", collapsed: workingCollapsed, count: working.length });
+      if (!workingCollapsed) working.forEach(({ project, session }) => sidebarRows.push({ kind: "inbox", project, session }));
+    }
+    sidebarRows.push({ kind: "section", section: "done", collapsed: !doneExpanded, count: 0 });
+    const doneStart = sidebarRows.length;
+    if (doneExpanded) {
+      const done = listedChats(doneSessions.data?.pages.flatMap((page) => page.sessions) ?? EMPTY_SESSIONS, true);
+      done.forEach(({ project, session }) => sidebarRows.push({ kind: "done", project, session }));
+      pushListStatus(doneSessions, !done.length, m.chat_inbox_done_empty());
+    }
+
+    // Mid-archive a chat is briefly in both lists; it stays where it was until the other list catches up.
+    const seen = new Set<string>();
+    const unique = sidebarRows.filter((row) => !("session" in row) || (!seen.has(row.session.id) && Boolean(seen.add(row.session.id))));
+    sidebarRows.splice(0, sidebarRows.length, ...unique);
+
+    // Holds Working and a preview of Done at the rail's foot while the inbox is short; scrolling closes the gap first.
+    const heightOf = (rows: SidebarRow[]) => rows.reduce((total, row) => total + sidebarRowHeight(row), 0);
+    const height = heightOf(sidebarRows.slice(0, doneStart)) + Math.min(heightOf(sidebarRows.slice(doneStart)), DONE_PREVIEW_HEIGHT);
+    if (height < railHeight) sidebarRows.splice(inboxEnd, 0, { kind: "spacer", height: railHeight - height });
   }
-  const sidebarScrollable = sidebarGrouping === "list" || sidebarExpanded;
+  const sidebarScrollable = sidebarGrouping !== "projects" || sidebarExpanded;
+  const inboxPinned = sidebarScrollable && sidebarRows[inboxEnd]?.kind === "spacer";
   const initialRows = fitSidebarRows(sidebarRows, railHeight, activeId);
   const hasHiddenProjects = initialRows.length < sidebarRows.length || shownProjects.length < sortedProjects.length;
   const defaultRows = sidebarGrouping === "projects" && hasHiddenProjects
     ? fitSidebarRows(sidebarRows, Math.max(0, railHeight - 38), activeId) : initialRows;
   const showProjectMore = sidebarGrouping === "projects" && !sidebarExpanded && hasHiddenProjects;
   const defaultRowsHeight = defaultRows.reduce((height, row) => height + sidebarRowHeight(row), 0);
-  const sidebarRowKey = (row: SidebarRow) => row.kind === "chat" ? row.session.id : `${row.kind}:${row.project.id}`;
+  const sidebarRowKey = (row: SidebarRow) => row.kind === "chat" || row.kind === "inbox" || row.kind === "done" ? row.session.id
+    : row.kind === "section" ? `section:${row.section}` : row.kind === "spacer" ? row.kind
+    : row.kind === "status" ? `status:${row.project.id}:${row.empty ?? ""}` : `${row.kind}:${sidebarGroup(row.project)}`;
   const sidebarVirtualizer = useVirtualizer({
+    useFlushSync: false,
     count: sidebarRows.length,
     getScrollElement: () => railBodyRef.current,
     getItemKey: (index) => sidebarRowKey(sidebarRows[index]),
     estimateSize: (index) => sidebarRowHeight(sidebarRows[index]),
     overscan: 5,
     rangeExtractor: (range) => {
-      const indexes = defaultRangeExtractor(range);
+      // Pinned inbox rows and section headers stay on screen wherever the list is scrolled.
+      const pinned = sidebarRows.flatMap((row, index) => row.kind === "section" || (inboxPinned && index < inboxEnd) ? [index] : []);
+      const indexes = [...new Set([...pinned, ...railFlightIndexes, ...defaultRangeExtractor(range)])].sort((a, b) => a - b);
       const focused = sidebarRows.findIndex((row) => sidebarRowKey(row) === focusedSidebarRow);
       return focused < 0 || indexes.includes(focused) ? indexes : [...indexes, focused].sort((a, b) => a - b);
     },
     enabled: sidebarScrollable && railOpen && !embedded,
   });
 
+  let railTop = 0;
+  const railTops = sidebarRows.map((row) => (railTop += sidebarRowHeight(row)) - sidebarRowHeight(row));
+  // Rows glide between places, fade in when new and fade out where they were when gone.
+  const railLayout = new Map(sidebarRows.map((row, index) => [sidebarRowKey(row), { row, top: railTops[index] }]));
+  const railCommitted = useRef<{ grouping: SidebarGrouping; layout: typeof railLayout; scrollTop: number } | null>(null);
+  const railGhosts = useRef(new Map<string, { row: SidebarRow; top: number }>());
+  const [, setRailGhostsSettled] = useState(0);
+  const railReducedMotion = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const railSameList = railCommitted.current?.grouping === sidebarGrouping && sidebarScrollable && !railReducedMotion;
+  if (!railSameList) railGhosts.current.clear();
+  // A row leaving the screen stays mounted until it has slid out of view.
+  const railFlight = useRef(new Map<string, number>());
+  // Where a row that left and came back in a later update was last drawn, to slide from.
+  const railReturns = useRef(new Map<string, number>());
+  const now = performance.now();
+  for (const [key, until] of railFlight.current) if (until < now) railFlight.current.delete(key);
+  for (const [key, ghost] of railGhosts.current) {
+    if (!railLayout.has(key)) continue;
+    railGhosts.current.delete(key);
+    railReturns.current.set(key, ghost.top);
+    railFlight.current.set(key, now + RAIL_MOVE_MS);
+  }
+  if (railSameList) {
+    const viewTop = sidebarVirtualizer.scrollOffset ?? 0;
+    for (const [key, was] of railCommitted.current?.layout ?? []) {
+      const onScreen = was.top < viewTop + railHeight && was.top + sidebarRowHeight(was.row) > viewTop;
+      if (!onScreen || was.row.kind === "spacer") continue;
+      const next = railLayout.get(key);
+      if (!next) railGhosts.current.set(key, was);
+      else if (next.top !== was.top) railFlight.current.set(key, now + RAIL_MOVE_MS);
+    }
+  }
+  const railFlightIndexes = sidebarRows.flatMap((row, index) => railFlight.current.has(sidebarRowKey(row)) ? [index] : []);
   const sidebarVirtualItems = sidebarVirtualizer.getVirtualItems();
+
+  // A section just opened scrolls into view far enough to show its first rows.
+  const railReveal = useRef<"working" | "done" | null>(null);
+  // Where each row was last drawn at rest, from the top of the rail's viewport.
+  const railRest = useRef(new Map<string, number>());
+  useLayoutEffect(() => {
+    const previous = railCommitted.current;
+    const body = railBodyRef.current;
+    railCommitted.current = { grouping: sidebarGrouping, layout: railLayout, scrollTop: body?.scrollTop ?? 0 };
+    if (!body) return;
+
+    const reveal = railReveal.current;
+    const start = sidebarRows.findIndex((row) => row.kind === "section" && row.section === reveal);
+    if (reveal && start >= 0) {
+      railReveal.current = null;
+      let end = start;
+      while (end + 1 < sidebarRows.length && sidebarRows[end + 1].kind !== "section") end++;
+      const sectionTop = railTops[start];
+      const shown = Math.min(railTops[end] + sidebarRowHeight(sidebarRows[end]), sectionTop + sidebarRowHeight(sidebarRows[start]) + DONE_PREVIEW_HEIGHT);
+      const target = Math.min(sectionTop, shown + railStickyBottom(reveal) - body.clientHeight);
+      if (target > body.scrollTop) body.scrollTo({ top: target, behavior: railReducedMotion ? "instant" : "smooth" });
+    }
+
+    // Rows are measured where they are drawn, so a row held by `sticky` moves from where it sits, not from its slot in the list.
+    const viewTop = body.getBoundingClientRect().top;
+    syncRailPins();
+    const pinned = [...railPins.current?.querySelectorAll<HTMLElement>("[data-pin]") ?? []].filter((pin) => pin.style.visibility === "visible");
+    const shown = [
+      ...[...body.querySelectorAll<HTMLElement>("[data-rail-key]")].filter((el) => el.style.visibility !== "hidden").map((el) => ({ el, key: el.dataset.railKey! })),
+      ...pinned.map((el) => ({ el, key: `section:${el.dataset.pin}` })),
+    ];
+    const rows = shown.map(({ el, key }) => {
+      const transform = el.getAnimations().length ? getComputedStyle(el).transform : "none";
+      const drawn = transform === "none" ? 0 : new DOMMatrixReadOnly(transform).m42;
+      return { el, key, drawn, at: el.getBoundingClientRect().top - viewTop - drawn };
+    });
+    const before = railRest.current;
+    railRest.current = new Map(rows.map(({ key, at }) => [key, at]));
+
+    const settled = (layout: typeof railLayout) => [...layout.values()].some(({ row }) => "session" in row);
+    if (!previous || previous.grouping !== sidebarGrouping || previous.layout === railLayout || !settled(previous.layout)) return;
+    const changed = previous.layout.size !== railLayout.size || [...railLayout].some(([key, { top }]) => previous.layout.get(key)?.top !== top);
+    if (!changed) return;
+    if (railReducedMotion) return;
+
+    const delay = 0;
+
+    const moves: { el: HTMLElement; key: string; at: number; offset: number; from: number | undefined }[] = [];
+    for (const { el, key, drawn, at } of rows) {
+      const known = previous.layout.get(key)?.top;
+      const returning = railReturns.current.get(key);
+      const was = returning !== undefined ? returning - previous.scrollTop : before.get(key) ?? (known === undefined ? undefined : known - previous.scrollTop);
+      if (was === undefined) {
+        el.animate([{ opacity: 0 }, { opacity: 1 }], { duration: RAIL_FADE_MS, delay, easing: "ease-out", fill: "backwards" });
+        continue;
+      }
+      // Start from where the row is drawn now, so a move that interrupts another doesn't jump.
+      moves.push({ el, key, at, offset: was + drawn - at, from: returning ?? known });
+    }
+
+    const move = { duration: RAIL_MOVE_MS, delay, easing: RAIL_EASE, fill: "backwards" } as const;
+    const heightOf = (key: string) => sidebarRowHeight(railLayout.get(key)!.row);
+    const offsets = new Map(moves.map(({ key, offset }) => [key, offset]));
+    for (const { el, key, at, offset, from } of moves) {
+      if (Math.abs(offset) < 0.5) continue;
+      el.getAnimations().forEach((animation) => animation.cancel());
+      el.animate([{ transform: `translateY(${offset}px)` }, { transform: "none" }], move);
+
+      // A row passing several others goes behind them: faint where it overlaps them, whole in the gap it lands in.
+      // Rows a mover slides past each pass it once; only the mover passes several.
+      const to = railLayout.get(key)!.top;
+      const passed = from === undefined ? 0 : [...railLayout].filter(([other, { top }]) => {
+        const otherWas = previous.layout.get(other)?.top;
+        return other !== key && otherWas !== undefined && (otherWas < from) !== (top < to);
+      }).length;
+      if (passed < 2) continue;
+      const height = heightOf(key);
+      const frames = Array.from({ length: 25 }, (_, step) => {
+        const progress = railEase(step / 24);
+        const top = at + offset * (1 - progress);
+        const covered = rows.reduce((sum, other) => {
+          if (other.key === key) return sum;
+          const otherTop = other.at + (offsets.get(other.key) ?? 0) * (1 - progress);
+          return sum + Math.max(0, Math.min(top + height, otherTop + heightOf(other.key)) - Math.max(top, otherTop));
+        }, 0);
+        return { offset: step / 24, opacity: 1 - 0.8 * Math.min(1, covered / height) };
+      });
+      el.animate(frames, { ...move, easing: "linear" });
+    }
+
+    railReturns.current.clear();
+
+    // A list that got shorter at its end clamps the scroll; leaving rows hold their place on screen.
+    const scrolled = previous ? previous.scrollTop - body.scrollTop : 0;
+    for (const el of body.querySelectorAll<HTMLElement>("[data-rail-ghost]:not([data-fading])")) {
+      el.dataset.fading = "";
+      const key = el.dataset.railGhost!;
+      const held = `translateY(${-scrolled}px)`;
+      el.animate([{ opacity: 1, transform: held }, { opacity: 0, transform: held }], { duration: RAIL_FADE_MS / 2, easing: "ease-out", fill: "forwards" }).finished.then(() => {
+        railGhosts.current.delete(key);
+        setRailGhostsSettled((settled) => settled + 1);
+      }, () => {});
+    }
+
+    if (railFlight.current.size) {
+      const landed = window.setTimeout(() => setRailGhostsSettled((settled) => settled + 1), RAIL_MOVE_MS + 20);
+      return () => window.clearTimeout(landed);
+    }
+  });
   const pendingSidebarFocus = useRef<number | null>(null);
   useLayoutEffect(() => {
     if (pendingSidebarFocus.current === null) return;
-    const row = railBodyRef.current?.querySelector<HTMLElement>(`[data-index="${pendingSidebarFocus.current}"] [data-sidebar-keyboard-row]`);
+    // A pinned header has a copy in the list and one at the rail's foot; focus the one showing.
+    const rows = railBodyRef.current?.parentElement?.querySelectorAll<HTMLElement>(`[data-index="${pendingSidebarFocus.current}"] [data-sidebar-keyboard-row]`) ?? [];
+    const row = [...rows].find((el) => getComputedStyle(el).visibility !== "hidden");
     if (row) {
       pendingSidebarFocus.current = null;
       row.focus();
     }
   });
-  const lastVisibleIndex = sidebarVirtualItems.at(-1)?.index ?? -1;
+  // The visible range, not the rendered rows: pinned headers are always rendered.
+  const lastVisibleIndex = sidebarVirtualizer.range?.endIndex ?? -1;
+  const listEnd = sidebarGrouping === "inbox" ? inboxEnd : sidebarRows.length;
   useEffect(() => {
-    if (sidebarGrouping === "list" && railOpen && !embedded && lastVisibleIndex >= sidebarRows.length - 6
-      && flatSessions.hasNextPage && !flatSessions.isFetching && !flatSessions.isError) {
-      void flatSessions.fetchNextPage();
+    if (!railOpen || embedded || sidebarGrouping === "projects") return;
+    const page = (query: typeof flatSessions, end: number) => {
+      if (lastVisibleIndex >= end - 6 && query.hasNextPage && !query.isFetching && !query.isError) void query.fetchNextPage();
+    };
+    page(flatSessions, listEnd);
+    if (sidebarGrouping === "inbox" && doneExpanded) page(doneSessions, sidebarRows.length);
+  }, [sidebarGrouping, railOpen, embedded, lastVisibleIndex, listEnd, flatSessions, doneExpanded, doneSessions, sidebarRows.length]);
+  const sidebarActions = useRef<SidebarActions>(null!);
+  sidebarActions.current = {
+    toggleProjectCollapsed: (project) => {
+      const group = sidebarGroup(project);
+      const next = collapsedProjects.includes(group) ? collapsedProjects.filter((id) => id !== group) : [...collapsedProjects, group];
+      setCollapsedProjects(next);
+      try { localStorage.setItem(collapsedProjectsKey, JSON.stringify(next)); } catch {}
+    },
+    pinProject: (project) => {
+      const next = pinnedProjects.includes(project.id) ? pinnedProjects.filter((id) => id !== project.id) : [...pinnedProjects, project.id];
+      setPinnedProjects(next);
+      try { localStorage.setItem(pinnedProjectsKey, JSON.stringify(next)); } catch {}
+    },
+    projectRemoved: (project) => { if (project.id === projectId) void navigate({ to: "/projects" }); },
+    openProjectSettings: (project) => void navigate({ href: `/projects/${encodeURIComponent(project.id)}/settings/project` }),
+    newProjectChat: (project) => {
+      if (project.scratch) void startScratchChat();
+      else if (project.id === projectId) startProjectTask();
+      else void navigate({ to: "/projects/$projectId/tasks/new", params: { projectId: project.id } });
+    },
+    openSession: (s, project) => {
+      closeDone();
+      onActiveSessionChange(s.id, { projectId: project.id });
+      if (project.id === DEMO_PROJECT_ID) {
+        markDemoSessionRead(s.id);
+        const experiment = DEMO_EXPERIMENT_LABELS[s.id];
+        if (experiment) {
+          captureUiEvent({
+            name: "demo_experiment_started",
+            kind: "curated",
+            experiment,
+          });
+          captureUiEvent({
+            name: "first_action",
+            surface: "demo",
+            action: "open_experiment",
+          });
+        }
+      }
+    },
+    openExperiment: (s, targetProjectId, experimentId) => {
+      void navigate({ href: taskLocation(targetProjectId, targetProjectId === s.projectId ? s.id : null, { kind: "experiment", experimentId, view: "overview" }) });
+    },
+    rename,
+    setArchived,
+    moveToProject: (s, project) => createProject(project, s),
+    remove: (s) => void removeSession(s),
+  };
+  const openRuntimeDetails = useCallback(() => onSelectMainView("openresearch"), [onSelectMainView]);
+  const openSettings = useCallback(() => onSelectMainView("settings"), [onSelectMainView]);
+
+  /** How far above the rail's foot a section header pins: Working sits on Done's header. */
+  const railStickyBottom = (section: "working" | "done") => {
+    const done = section === "working" ? sidebarRows.find((row) => row.kind === "section" && row.section === "done") : undefined;
+    return done ? sidebarRowHeight(done) : 0;
+  };
+  const railGap = inboxPinned ? sidebarVirtualizer.measurementsCache[inboxEnd]?.size ?? 0 : 0;
+
+  // Section headers below the fold pin to the rail's foot in a layer outside the scroller, which fades
+  // the rows out beneath them; a mask, unlike a fill, works over the window material. Scrolling updates
+  // which are pinned straight from the scroll event, so the handoff doesn't wait for a render.
+  const railPins = useRef<HTMLDivElement>(null);
+  const railPinState = useRef({ rows: sidebarRows, tops: railTops });
+  railPinState.current = { rows: sidebarRows, tops: railTops };
+  const syncRailPins = useCallback(() => {
+    const body = railBodyRef.current;
+    const pins = railPins.current;
+    if (!body || !pins) return;
+    const { rows, tops } = railPinState.current;
+    const viewBottom = body.scrollTop + body.clientHeight;
+    const pinned = new Set<string>();
+    let below = 0;
+    for (let index = rows.length - 1; index >= 0; index--) {
+      const row = rows[index];
+      if (row.kind !== "section") continue;
+      if (tops[index] + sidebarRowHeight(row) <= viewBottom - below + 0.5) break;
+      pinned.add(row.section);
+      below += sidebarRowHeight(row);
     }
-  }, [sidebarGrouping, railOpen, embedded, lastVisibleIndex, sidebarRows.length, flatSessions.hasNextPage, flatSessions.isFetching, flatSessions.isError, flatSessions.fetchNextPage]);
+    // One copy of a header shows at a time: the pinned one, or the one in the list.
+    for (const pin of pins.querySelectorAll<HTMLElement>("[data-pin]")) {
+      const shown = pinned.has(pin.dataset.pin!);
+      pin.style.visibility = shown ? "visible" : "hidden";
+      const inList = body.querySelector<HTMLElement>(`[data-rail-key="section:${pin.dataset.pin}"]`);
+      if (!inList) continue;
+      inList.style.visibility = shown ? "hidden" : "";
+      const [from, to] = shown ? [inList, pin] : [pin, inList];
+      if (from.contains(document.activeElement)) to.querySelector<HTMLElement>("[data-sidebar-keyboard-row]")?.focus({ preventScroll: true });
+    }
+    body.style.setProperty("--rail-pinned", `${below}px`);
+    body.toggleAttribute("data-pinned", below > 0);
+  }, []);
+  useEffect(() => {
+    const body = railBodyRef.current;
+    body?.addEventListener("scroll", syncRailPins, { passive: true });
+    return () => body?.removeEventListener("scroll", syncRailPins);
+  }, [syncRailPins, railHeight]);
+
+  // Each row sits at the end of a wrapper that starts at the top of the list, so `sticky`
+  // can hold the inbox at the top while the gap below it closes.
+  // Wrappers stack in flow, each pulling the next back to the top with a negative margin;
+  // WebKit doesn't stick inside absolutely positioned boxes.
+  const placeRailRow = (row: SidebarRow, top: number, index: number, ghostKey?: string) => {
+    if (row.kind === "spacer") return null;
+    const key = sidebarRowKey(row);
+    const height = sidebarRowHeight(row);
+    const pinTop = !ghostKey && railGap > 0 && index < inboxEnd;
+    const wrapper = top + height + (pinTop ? railGap : 0);
+    return (
+      <div key={ghostKey ? `ghost:${ghostKey}` : key} className={`pointer-events-none ${ghostKey ? "absolute inset-x-0 top-0" : "relative"}`}
+        style={{ height: wrapper, marginBottom: ghostKey ? undefined : -wrapper }}>
+        {/* A spacer, not a margin: sticky keeps a row's margin box inside its wrapper. */}
+        <div style={{ height: top }} />
+        <div data-rail-key={ghostKey ? undefined : key} data-rail-ghost={ghostKey} inert={Boolean(ghostKey)}
+          data-done-area={row.kind === "done" || (row.kind === "section" && row.section === "done") ? "" : undefined}
+          className={`${pinTop ? "sticky" : "relative"} ${ghostKey ? "" : "pointer-events-auto"}`}
+          style={{ height, top: pinTop ? top : undefined }}>
+          {renderRailRow({ row, top, index })}
+        </div>
+      </div>
+    );
+  };
+
+  const renderRailRow = ({ row, top, index }: { row: SidebarRow; top: number; index: number }) => {
+    if (row.kind === "spacer") return null;
+    if (row.kind === "section") {
+      const setCollapsed = (collapsed: boolean) => {
+        const next = collapsed ? [...collapsedInbox, row.section] : collapsedInbox.filter((id) => id !== row.section);
+        setCollapsedInbox(next);
+        try { localStorage.setItem("sidebar-inbox-collapsed", JSON.stringify(next)); } catch {}
+      };
+      const toggle = () => {
+        const body = railBodyRef.current;
+        // A header pinned to the rail's foot opens and shows its section instead of folding it away unseen.
+        const pinned = body && top + sidebarRowHeight(row) > body.scrollTop + body.clientHeight - railStickyBottom(row.section) + 1;
+        if (row.collapsed || pinned) {
+          setCollapsed(false);
+          railReveal.current = row.section;
+          if (!row.collapsed) setRailGhostsSettled((settled) => settled + 1);
+          return;
+        }
+        setCollapsed(true);
+      };
+      return (
+        <div key={sidebarRowKey(row)} data-index={index} className="relative" style={{ height: sidebarRowHeight(row) }}
+          onFocusCapture={() => setFocusedSidebarRow(sidebarRowKey(row))}>
+          <button data-sidebar-keyboard-row aria-expanded={!row.collapsed} onClick={toggle}
+            className="group/section flex h-full w-full items-end gap-1 rounded-md px-2.25 pb-1.5 text-start text-sm font-medium text-subtext hover:text-text">
+            <span>{row.section === "working" ? m.chat_inbox_working() : m.chat_inbox_done()}</span>
+            {row.section === "working" && row.collapsed && <span className="tabular-nums text-muted">{fmtNumber(row.count)}</span>}
+            <ChevronRight size={14} aria-hidden="true"
+              className={`mb-px shrink-0 text-muted transition-transform duration-120 ease-standard motion-reduce:transition-none ${row.collapsed ? "" : "rotate-90"}`} />
+            <span aria-hidden="true" className="mb-2.5 ms-1.5 h-px flex-1 bg-border-variant" />
+          </button>
+        </div>
+      );
+    }
+    const sessionRow = (project: Project, s: ChatSession, variant: "list" | "inbox" | "done") => {
+      const sessionHarness = sessionAcpHarness(s, selectionHarness(harnesses, s));
+      const sessionModel = sessionHarness?.models.find((model) => model.id === s.model);
+      return (
+        <SidebarSessionRow
+          key={s.id}
+          actions={sidebarActions}
+          project={project}
+          session={s}
+          cardWarmUntil={cardWarmUntil}
+          projectName={sidebarGrouping !== "projects" ? projectLabel(project) : undefined}
+          harnessLogo={sessionHarness?.logo}
+          modelName={modelName(s) ?? (sessionModel ? harnessModelLabel(sessionModel) : s.model)}
+          active={s.id === activeId && mainView === "chat"}
+          unread={unreadSessionIds.has(s.id)}
+          busy={sessionBusy(project, s)}
+          waiting={sessionWaiting(s)}
+          runs={runsBySession.get(s.id) ?? EMPTY_RUNS}
+          variant={variant}
+          revealTitle={titleReveals.get(s.id)}
+        />
+      );
+    };
+    const project = row.project;
+    const s = row.kind === "chat" || row.kind === "inbox" || row.kind === "done" ? row.session : null;
+    return (
+      <div
+        key={sidebarRowKey(row)}
+        data-index={index}
+        onFocusCapture={() => setFocusedSidebarRow(sidebarRowKey(row))}
+        onBlurCapture={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget) && !(event.relatedTarget instanceof Element && event.relatedTarget.closest(`[data-session-hover-card="${sidebarRowKey(row)}"]`))) setFocusedSidebarRow(null);
+        }}
+        className="relative"
+        style={{ height: sidebarRowHeight(row) }}
+      >
+        {row.kind === "project" && project.scratch ? (
+          <div className="group h-9 flex items-end gap-1 rounded-md px-2.25 text-text">
+            <NoProjectGroupHeader
+              collapsed={row.collapsed}
+              busy={row.busy}
+              onToggleCollapsed={() => sidebarActions.current.toggleProjectCollapsed(project)}
+              onNewChat={() => sidebarActions.current.newProjectChat(project)}
+            />
+          </div>
+        ) : row.kind === "project" ? (
+          <div className="group h-9 flex items-end gap-1 rounded-md px-2.25 text-text">
+            <SidebarProjectCard
+              actions={sidebarActions}
+              project={project}
+              chatCount={projectActivity.find((activity) => activity.projectId === project.id)?.totalAgents}
+              collapsed={row.collapsed}
+              busy={row.busy}
+              pinned={pinnedProjects.includes(project.id)}
+            />
+          </div>
+        ) : s ? (
+          <div className={sidebarGrouping === "projects" ? "ms-5.5" : undefined}>
+            {sessionRow(project, s, row.kind === "inbox" ? "inbox" : row.kind === "done" ? "done" : "list")}
+          </div>
+        ) : row.kind === "more" ? (
+          <Button variant="ghost" size="small" className="ms-5.5 font-normal text-subtext" aria-expanded={sidebarGroup(project) in chatLimits} onClick={() => {
+            const group = sidebarGroup(project);
+            setChatLimits((current) => {
+              const next = { ...current };
+              if (group in next) delete next[group];
+              else next[group] = Infinity;
+              return next;
+            });
+          }}>
+            {sidebarGroup(project) in chatLimits ? m.common_show_less() : m.common_show_more()}
+          </Button>
+        ) : row.kind === "status" && (
+          <div className={`flex h-full items-center px-2.25 text-sm text-subtext ${sidebarGrouping === "projects" ? "ms-5.5" : ""}`}>
+            {row.error ? <Button size="small" onClick={row.retry}>{m.app_retry()}</Button>
+              : row.pending ? <Spinner />
+                : row.empty ?? (sessionFilter === "archived" ? m.chat_no_archived_sessions() : m.chat_no_sessions_yet())}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const rail = (
-    <aside style={mobileRail ? undefined : { width: railWidth }} className="session-rail relative shrink-0 flex flex-col bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-2 [&_.rail-body]:pe-1 border-e border-e-border overflow-visible">
+    <aside style={mobileRail ? undefined : { width: railWidth }} className="session-rail relative shrink-0 flex flex-col bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-1 [&_.rail-body]:pe-1 border-e border-e-border overflow-visible">
       {!mobileRail && <div
         className="rail-resizer absolute -end-1 top-0 bottom-0 w-1.5 z-30 cursor-col-resize [&:hover]:bg-resizer-hover [&:active]:bg-resizer-hover"
         onPointerDown={onResizeRail}
       />}
       {railHeader}
-      <nav data-keyboard-list onKeyDown={navigateKeyboardList} className="rail-nav flex flex-col gap-0.5 p-2 shrink-0 [&_[data-tip]::after]:left-[calc(100%_+_6px)] [&_[data-tip]::after]:top-1/2 [&_[data-tip]::after]:translate-x-0 [&_[data-tip]::after]:-translate-y-1/2">
-        <button
-          className="rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start hover:bg-surface"
-          data-onboarding="new-session"
-          data-keyboard-item
-          data-tip={newTaskShortcut}
-          aria-label={m.chat_panel_new_chat()}
-          aria-keyshortcuts="Meta+N Control+N Meta+Shift+Enter Control+Shift+Enter"
-          onClick={startNewTask}
-        >
-          <Plus size={16} />
-          {m.chat_panel_new_chat()}
-        </button>
-        <button
-          data-keyboard-item
-          className={`rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium ${mainView === "skills" ? "active" : ""}`}
-          aria-current={mainView === "skills" ? "page" : undefined}
-          onClick={() => onSelectMainView("skills")}
-        >
-          <Blocks size={16} />
-          {m.chat_panel_customize()}
-        </button>
-        {SETTINGS_NAV.map((item) => {
-          const active = mainView !== "chat" && mainView !== "skills" && item.activeTabs.includes(mainView);
-          const shortcut = item.id === "settings" ? appHotkeys["settings.open"].hotkey : item.id === "compute" ? appHotkeys["compute.open"].hotkey : null;
-          return (
-            <button
-              key={item.id}
-              data-keyboard-item
-              className={`rail-nav-item flex items-center gap-2.5 py-2 px-2.5 text-base text-text rounded-md text-start [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium ${active ? "active" : ""}`}
-              aria-current={active ? "page" : undefined}
-              data-onboarding={item.id === "compute" ? "nav-compute" : undefined}
-              data-tip={shortcut ? formatForDisplay(shortcut) : undefined}
-              aria-label={item.label()}
-              aria-keyshortcuts={item.id === "settings" ? "Meta+, Control+," : item.id === "compute" ? "Meta+Alt+C Control+Alt+C" : undefined}
-              onClick={() => onSelectMainView(item.id)}
-            >
-              {item.icon}
-              {item.label()}
-            </button>
-          );
-        })}
-      </nav>
-      <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pe-3.5 pb-0 ps-4.5">
+      <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pe-2 pb-0 ps-3.25">
         <div className="rail-section-label p-0 text-sm font-medium text-subtext">
-          {sidebarGrouping === "projects" ? m.projects_home_projects() : m.chat_all_sessions()}
+          {sidebarGrouping === "projects" ? m.projects_home_projects() : sidebarGrouping === "list" ? m.chat_all_sessions() : m.sidebar_inbox()}
         </div>
         <div className="rail-section-actions flex items-center gap-1">
-          {onNewProject && <Tooltip interactive content={m.projects_home_new_project()} className="rounded-sm">
+          {sidebarGrouping === "list" && <Tooltip interactive content={m.chat_panel_new_chat()} className="rounded-sm">
+            <IconButton size="small" className="text-subtext" aria-label={m.chat_panel_new_chat()} onClick={startNewTask}>
+              <Plus size={16} aria-hidden="true" />
+            </IconButton>
+          </Tooltip>}
+          {sidebarGrouping === "inbox" ? latestProject && <Tooltip interactive content={m.chat_panel_new_chat()} className="rounded-sm">
+            <IconButton size="small" className="text-subtext" aria-label={`${m.chat_panel_new_chat()} · ${latestProject.name}`} onClick={() => sidebarActions.current.newProjectChat(latestProject)}>
+              <SquarePen size={16} className="text-subtext" />
+            </IconButton>
+          </Tooltip> : onNewProject && <Tooltip interactive content={m.projects_home_new_project()} className="rounded-sm">
             <IconButton size="small" className="text-subtext" aria-label={m.projects_home_new_project()} onClick={onNewProject}>
               <FolderPlus size={16} className="text-subtext" />
             </IconButton>
@@ -6969,14 +8826,13 @@ export function ChatPanel({
           }} />
         </div>
       </div>
-      <div className="relative flex-1 min-h-0">
-      <div ref={setRailBody} tabIndex={-1} className={`rail-body h-full overflow-x-hidden ${sidebarScrollable ? "overflow-y-auto" : "overflow-y-hidden"}`}
+      <div className="relative flex-1 min-h-0"
         onKeyDown={(event) => {
           if (event.defaultPrevented || event.nativeEvent.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
           const target = event.target;
-          if (!(target instanceof HTMLElement) || (target !== event.currentTarget && !target.hasAttribute("data-sidebar-keyboard-row"))) return;
+          if (!(target instanceof HTMLElement) || (target !== railBodyRef.current && !target.hasAttribute("data-sidebar-keyboard-row"))) return;
           const rows = sidebarScrollable ? sidebarRows : defaultRows;
-          const indexes = rows.flatMap((row, index) => row.kind === "project" || row.kind === "chat" ? [index] : []);
+          const indexes = rows.flatMap((row, index) => row.kind === "project" || row.kind === "chat" || row.kind === "inbox" || row.kind === "section" || row.kind === "done" ? [index] : []);
           if (indexes.length === 0) return;
           const rowIndex = Number(target.closest("[data-index]")?.getAttribute("data-index") ?? -1);
           const position = indexes.indexOf(rowIndex);
@@ -6999,116 +8855,28 @@ export function ChatPanel({
           if (index === rowIndex) return;
           pendingSidebarFocus.current = index;
           setFocusedSidebarRow(sidebarRowKey(rows[index]));
-          if (sidebarScrollable) sidebarVirtualizer.scrollToIndex(index, { align: "auto" });
+          const body = railBodyRef.current;
+          if (sidebarScrollable && body && rows[index].kind !== "section") {
+            // Keep the row clear of the headers pinned over the rail's foot.
+            const covered = Number.parseFloat(body.style.getPropertyValue("--rail-pinned")) || 0;
+            const top = railTops[index];
+            const bottom = top + sidebarRowHeight(rows[index]);
+            if (top < body.scrollTop) body.scrollTop = top;
+            else if (bottom > body.scrollTop + body.clientHeight - covered) body.scrollTop = bottom - body.clientHeight + covered;
+          }
         }}>
+      <div ref={setRailBody} tabIndex={-1}
+        className={`rail-body h-full overflow-x-hidden ${sidebarScrollable ? "overflow-y-auto" : "overflow-y-hidden"} data-pinned:mask-b-from-[calc(100%-var(--rail-pinned)-0.75rem)] data-pinned:mask-b-to-[calc(100%-var(--rail-pinned)+0.25rem)]`}>
         <div className="relative" style={{ height: (sidebarScrollable ? sidebarVirtualizer.getTotalSize() : defaultRowsHeight) + (showProjectMore ? 38 : 0) + (sidebarExpandedAll ? 46 : 0) }}>
-          {(sidebarScrollable
-            ? sidebarVirtualItems.map((item) => ({ row: sidebarRows[item.index], top: item.start, index: item.index }))
-            : defaultRows.map((row, index) => ({ row, top: 0, index }))
-          ).map(({ row, top, index }) => {
-            const project = row.project;
-            const s = row.kind === "chat" ? row.session : null;
-            const sessionHarness = s ? sessionAcpHarness(s, harnesses.find((h) => h.id === s.harness)) : undefined;
-            const sessionModel = sessionHarness?.models.find((model) => model.id === s?.model);
-            return (
-              <div
-                key={sidebarRowKey(row)}
-                data-index={index}
-                onFocusCapture={() => setFocusedSidebarRow(sidebarRowKey(row))}
-                onBlurCapture={(event) => {
-                  if (!event.currentTarget.contains(event.relatedTarget) && !(event.relatedTarget instanceof Element && event.relatedTarget.closest(`[data-session-hover-card="${sidebarRowKey(row)}"]`))) setFocusedSidebarRow(null);
-                }}
-                className={sidebarScrollable ? "absolute top-0 start-0 w-full" : "relative"}
-                style={{ height: sidebarRowHeight(row), top: sidebarScrollable ? top : undefined }}
-              >
-                {row.kind === "project" ? (
-                  <div className="group h-9 flex items-end gap-1 rounded-md px-2.5 text-text">
-                    <ProjectInfoCard
-                      project={project}
-                      chatCount={projectActivity.find((activity) => activity.projectId === project.id)?.totalAgents}
-                      collapsed={row.collapsed}
-                      busy={row.busy}
-                      onToggleCollapsed={() => {
-                        const next = collapsedProjects.includes(project.id) ? collapsedProjects.filter((id) => id !== project.id) : [...collapsedProjects, project.id];
-                        setCollapsedProjects(next);
-                        try { localStorage.setItem("sidebar-collapsed-projects", JSON.stringify(next)); } catch {}
-                      }}
-                      pinned={pinnedProjects.includes(project.id)}
-                      onPin={() => {
-                        const next = pinnedProjects.includes(project.id) ? pinnedProjects.filter((id) => id !== project.id) : [...pinnedProjects, project.id];
-                        setPinnedProjects(next);
-                        try { localStorage.setItem("sidebar-pinned-projects", JSON.stringify(next)); } catch {}
-                      }}
-                      onRemoved={() => { if (project.id === projectId) void navigate({ to: "/projects" }); }}
-                      onNewChat={() => {
-                        if (project.id === projectId) startProjectTask();
-                        else void navigate({ to: "/projects/$projectId/tasks/new", params: { projectId: project.id } });
-                      }}
-                    />
-                  </div>
-                ) : s ? (
-                  <div className={sidebarGrouping === "projects" ? "ms-5.5" : undefined}>
-                    <SessionRow
-                      key={s.id}
-                      session={s}
-                      cardWarmUntil={cardWarmUntil}
-                      projectName={sidebarGrouping === "list" ? project.name : undefined}
-                      harnessLogo={sessionHarness?.logo}
-                      modelName={sessionModel ? harnessModelLabel(sessionModel) : s.model}
-                      active={s.id === activeId && mainView === "chat"}
-                      unread={unreadSessionIds.has(s.id)}
-                      busy={sessionBusy(project, s)}
-                      waiting={sessionWaiting(s)}
-                      experimentRunning={activeRuns.some((item) => item.sessionId === s.id)}
-                      revealTitle={titleReveals.get(s.id)}
-                      onOpenExperiment={(targetProjectId, experimentId) => {
-                        void navigate({ href: taskLocation(targetProjectId, targetProjectId === s.projectId ? s.id : null, { kind: "experiment", experimentId, view: "overview" }) });
-                      }}
-                      onOpen={() => {
-                        onActiveSessionChange(s.id, { projectId: project.id });
-                        if (project.id === DEMO_PROJECT_ID) {
-                          markDemoSessionRead(s.id);
-                          const experiment = DEMO_EXPERIMENT_LABELS[s.id];
-                          if (experiment) {
-                            captureUiEvent({
-                              name: "demo_experiment_started",
-                              kind: "curated",
-                              experiment,
-                            });
-                            captureUiEvent({
-                              name: "first_action",
-                              surface: "demo",
-                              action: "open_experiment",
-                            });
-                          }
-                        }
-                      }}
-                      onRename={(title) => rename(s, title)}
-                      onSetArchived={(archived) => setArchived(s, archived)}
-                      onDelete={() => void removeSession(s)}
-                    />
-                  </div>
-                ) : row.kind === "more" ? (
-                  <Button variant="ghost" size="small" className="ms-5.5 font-normal text-subtext" aria-expanded={project.id in chatLimits} onClick={() => {
-                    setChatLimits((current) => {
-                      const next = { ...current };
-                      if (project.id in next) delete next[project.id];
-                      else next[project.id] = Infinity;
-                      return next;
-                    });
-                  }}>
-                    {project.id in chatLimits ? m.common_show_less() : m.common_show_more()}
-                  </Button>
-                ) : row.kind === "status" && (
-                  <div className={`flex h-full items-center px-2.5 text-sm text-subtext ${sidebarGrouping === "projects" ? "ms-5.5" : ""}`}>
-                    {row.error ? <Button size="small" onClick={row.retry}>{m.app_retry()}</Button>
-                      : row.pending ? <Spinner />
-                        : sessionFilter === "archived" ? m.chat_no_archived_sessions() : m.chat_no_sessions_yet()}
-                  </div>
-                )}
+          {sidebarScrollable
+            ? <>
+              {sidebarVirtualItems.map((item) => placeRailRow(sidebarRows[item.index], item.start, item.index))}
+              {/* Clipped, so leaving rows don't hold the list at its old height. */}
+              <div className="pointer-events-none absolute inset-0 overflow-hidden">
+                {[...railGhosts.current].map(([key, ghost]) => placeRailRow(ghost.row, ghost.top, -1, key))}
               </div>
-            );
-          })}
+            </>
+            : defaultRows.map((row, index) => renderRailRow({ row, top: 0, index }))}
           {(showProjectMore || sidebarExpandedAll) && (
             <div className="absolute start-0 flex h-9.5 w-full items-center pt-1" style={{ top: sidebarScrollable ? sidebarVirtualizer.getTotalSize() : defaultRowsHeight }}>
               <Button variant="ghost" size="small" className="text-subtext" aria-expanded={sidebarExpandedAll} onClick={() => {
@@ -7126,19 +8894,22 @@ export function ChatPanel({
           )}
         </div>
       </div>
-      {sidebarScrollable && <>
-        {(sidebarVirtualizer.scrollOffset ?? 0) > 0 && <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 top-0 z-5 h-3 bg-linear-to-b from-background to-transparent" />}
-        <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 z-5 h-3 bg-linear-to-t from-background to-transparent" />
-      </>}
+      {sidebarScrollable && (
+        <div ref={railPins} className="pointer-events-none absolute inset-x-0 bottom-0 ps-1 pe-1">
+          {sidebarRows.flatMap((row, index) => row.kind === "section" ? [
+            <div key={sidebarRowKey(row)} data-pin={row.section} data-done-area={row.section === "done" ? "" : undefined} className="pointer-events-auto invisible">{renderRailRow({ row, top: railTops[index], index })}</div>,
+          ] : [])}
+        </div>
+      )}
       </div>
-      <div className="flex shrink-0 items-center gap-1 border-t border-border px-1 py-1"><AccountChip onDetails={() => onSelectMainView("openresearch")} /><WorkspaceConnection runtime={runtime} /></div>
+      <StatusStrip runtime={runtime} onDetails={openRuntimeDetails} settingsOpen={mainView !== "chat" && mainView !== "project"} onSettings={openSettings} />
     </aside>
   );
 
   const headerClass = `chat-header flex items-center gap-2 py-0 px-4 bg-background shrink-0 h-12 mac-titlebar:h-titlebar relative z-4 w-full max-w-readable my-0 mx-auto [&::after]:content-[''] [&::after]:absolute [&::after]:top-full [&::after]:start-0 [&::after]:end-0 [&::after]:h-6 [&::after]:bg-[linear-gradient(to_bottom,_var(--base),_transparent)] [&::after]:pointer-events-none`;
   const displayedRail = mobileRail ? (
     <Dialog.Root open={railOpen} onOpenChange={(open) => { if (!open) onCloseMobileRail?.(); }}>
-      <Dialog.Portal>
+      <Dialog.Portal container={portalContainer}>
         <Dialog.Backdrop className="fixed inset-0 z-70 bg-modal-backdrop" />
         <Dialog.Popup aria-modal="true" aria-label={m.chat_panel_show_sidebar()} className="mobile-rail-dialog fixed inset-y-0 start-0 z-80 outline-none">{rail}</Dialog.Popup>
       </Dialog.Portal>
@@ -7154,7 +8925,8 @@ export function ChatPanel({
       <>
         {displayedRail}
         <section inert={contentInert} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
-          {(!railOpen || mobileRail) && <div className="mac-titlebar-spacer flex h-12 mac-titlebar:h-titlebar shrink-0 items-center">{railReopen}</div>}
+          {mainView === "project" && (!railOpen || mobileRail) && <div className="mac-titlebar-spacer flex h-12 mac-titlebar:h-titlebar shrink-0 items-center">{railReopen}</div>}
+          {mainView !== "project" && <SettingsHeader active={mainView} onSelect={onSelectMainView} leading={railReopen} />}
           {/* Keyed per view so no tab inherits the chat thread's or another tab's scroll offset. */}
           <div key={mainView} className="settings-view-scroll flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
             {contentError ? <div role="alert" className="p-6 text-subtext">{contentError}<Button onClick={onRetryContent}>{m.app_retry()}</Button></div>
@@ -7168,7 +8940,7 @@ export function ChatPanel({
   return (
     <>
       {displayedRail}
-      <section inert={contentInert} data-side-chat={embedded || undefined} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
+      <section inert={contentInert} data-side-chat={embedded || undefined} className="chat-pane relative flex-1 min-w-0 flex flex-col bg-background min-h-0">
         {/* Header — session title on the left, end-pane view switchers on the
           right, fading into the chat below (sessions live in the rail). */}
         <div className={railOpen && !mobileRail || embedded ? "contents" : "chat-heading-row grid shrink-0 grid-cols-[2.625rem_minmax(0,1fr)_2.625rem] mac-titlebar:grid-cols-titlebar-chat items-center"}>
@@ -7185,9 +8957,16 @@ export function ChatPanel({
                   />
                 </PaperTitle>
               ) : busy ? <Spinner /> : null}
-              <span className="min-w-0 truncate rounded-md border border-border bg-surface px-2.5 py-0.5 text-sm font-normal text-subtext" title={projectName}>
-                {projectName}
-              </span>
+              {activeSession.pendingProject ? <PendingProjectMove session={activeSession} />
+                : currentProject?.scratch && !embedded ? (
+                  <Button size="small" className="shrink-0 font-normal" onClick={() => createProject(currentProject, activeSession)}>
+                    <FolderPlus size={14} />{m.create_project_button()}
+                  </Button>
+                ) : <>
+                  <span className="min-w-0 truncate rounded-md border border-border bg-surface px-2.5 py-0.5 text-sm font-normal text-subtext" title={projectName}>
+                    {projectName}
+                  </span>
+                </>}
             </>}
           </div>
           {embedded && activeSession && (
@@ -7195,9 +8974,16 @@ export function ChatPanel({
               <Trash2 size={16} />
             </IconButton>
           )}
+          {embedded && <IconButton aria-label={m.chat_search_title()} data-tip={findRequest === null ? m.chat_search_title() : undefined} aria-expanded={findRequest !== null} aria-keyshortcuts="Control+f Meta+f" onClick={openFind}><Search size={16} /></IconButton>}
           </div>
         </div>
 
+        <span role="status" className="sr-only">{firstTurnStarting ? statusLine : null}</span>
+        {findRequest !== null && <div className="relative z-30 shrink-0 px-4">
+          <ChatSearch key={sessionsOptions.queryKey[1]} projectId={projectId} sessionId={activeId} projects={sidebarProjects} assistantLabel={assistantLabel} focusRequest={findRequest} embedded={embedded}
+            onOpen={onOpenSearchHit} onClose={closeFind} branchReturn={branchReturn?.sessionId === activeId && !busy ? restoreSearchBranch : undefined}
+            pendingMessageId={busy && focusedMessage?.sessionId === activeId && !messages.some((message) => message.id === focusedMessage.messageId) ? focusedMessage.messageId : undefined} />
+        </div>}
         {contentError ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 p-5 text-subtext" role="alert">
             <p>{contentError}</p><Button onClick={onRetryContent}>{m.app_retry()}</Button>
@@ -7207,7 +8993,7 @@ export function ChatPanel({
             <p>{historyError.message}</p>
             <Button onClick={() => void historyQuery.refetch()}>{m.app_retry()}</Button>
           </div>
-        ) : contentLoading || historyLoading ? (
+        ) : (contentLoading || historyLoading) && !launching ? (
           <div className="chat-loading flex-1 min-h-0 overflow-hidden [scrollbar-gutter:stable_both-edges]" role="status" aria-label={m.chat_panel_loading_conversation()} aria-busy="true">
             <div aria-hidden="true" className="mx-auto flex h-full w-full max-w-readable flex-col gap-6 px-4 pb-8 pt-4 motion-safe:animate-pulse">
               <div className="ms-auto h-14 w-3/5 shrink-0 rounded-lg bg-panel" />
@@ -7226,12 +9012,12 @@ export function ChatPanel({
             </div>
           </div>
         ) : !threadMounted && (activeSession?.sideParentSessionId || sideParentSessionId) ? (
-          <div className="chat-empty flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-subtext">
+          <div className="chat-empty min-h-0 flex flex-1 flex-col items-center justify-center-safe gap-3 overflow-y-auto px-8 before:h-5 before:shrink-0 after:h-5 after:shrink-0 text-center text-subtext">
             <MessagesSquare size={22} />
             <p className="m-0 text-balance">{m.side_chat_empty()}</p>
           </div>
         ) : !threadMounted ? (
-          <div className="chat-empty flex-1 flex flex-col items-center justify-center text-text p-8 text-center [&_h2]:m-0 [&_h2]:text-5xl [&_h2]:font-medium [&_h2]:tracking-tight [&_h2]:text-text">
+          <div className="chat-empty min-h-0 flex-1 flex flex-col items-center justify-center-safe overflow-y-auto text-text px-8 before:h-8 before:shrink-0 after:h-8 after:shrink-0 text-center [&_h2]:m-0 [&_h2]:text-5xl [&_h2]:font-medium [&_h2]:tracking-tight [&_h2]:text-text">
             <div className="chat-empty-mark w-10.5 h-10.5 mb-5.5 [&_svg]:block [&_svg]:w-full [&_svg]:h-full">
               <BrandMark />
             </div>
@@ -7271,7 +9057,7 @@ export function ChatPanel({
                       action: "starter_click",
                     });
                     // Don't auto-send past an unavailable agent or a non-empty composer.
-                    const composerEmpty = !draft.trim() && attachments.length === 0 && annotations.length === 0;
+                    const composerEmpty = !draft.trim() && annotations.length === 0;
                     if (edit || !activeHarness?.agentReady || !composerEmpty) applyStarterPrompt(item.prompt);
                     else void send({ starter: item.prompt });
                   };
@@ -7306,7 +9092,7 @@ export function ChatPanel({
           </div>
         ) : (
           <div
-            className="chat-thread flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]"
+            className="chat-thread flex-1 min-h-0 overflow-y-auto [overflow-anchor:none] [scrollbar-gutter:stable_both-edges]"
             ref={threadRef}
             tabIndex={0}
             role="region"
@@ -7316,17 +9102,20 @@ export function ChatPanel({
               transcriptSelection.dismiss();
             }}
           >
+            {/* Clips the launch rise at the composer, since a transform still extends the scroll range. */}
+            <div className="min-h-full overflow-y-clip">
             <div className="chat-thread-inner max-w-readable my-0 mx-auto pt-4 px-4 pb-8 flex flex-col gap-4" ref={threadInnerRef}>
               <ChatImageScope projectId={projectId} sessionId={activeId}>
+                <ChatLinksContext value={chatLinks}>
                 <Transcript
-                  key={activeId}
+                  key={`${sessionsOptions.queryKey[1]}:${activeId}`}
                   scrollRef={threadRef}
                   scrollToEndRef={scrollToEndRef}
                   stickToBottom={stickToBottom}
                   onPinToBottom={pinTranscriptToBottom}
-                  messages={messages}
-                  allMessages={allMessages}
-                  canFork={canFork}
+                  messages={launchMessages ?? messages}
+                  allMessages={launchMessages ?? allMessages}
+                  canFork={canFork && !launching}
                   onFork={forkTurn}
                   onSelectFork={selectBranch}
                   busy={busy}
@@ -7341,17 +9130,52 @@ export function ChatPanel({
                   onOpenSubagent={openSubagent}
                   recoveringTurnId={recoveringTurnId}
                   onRecover={recoverFailedTurn}
+                  failure={failureActions}
                   skills={transcriptSkills}
+                  delegates={delegates}
+                  onOpenDelegate={onOpenDelegate}
+                  project={currentProject}
+                  session={activeSession}
+                  focusedMessageId={focusedMessage?.sessionId === activeId ? focusedMessage.messageId : null}
+                  focusedPartId={focusedMessage?.spawnPartId ?? focusedMessage?.partId}
+                  focusNonce={focusedMessage?.nonce}
+                  searchQuery={!focusedMessage?.spawnPartId && searchedPart?.prompt?.kind !== "plan" ? focusedMessage?.query : undefined}
+                  programmaticScroll={programmaticScroll}
+                  highlightName={embedded ? "side-chat-search" : "chat-search"}
+                  assistantLabel={assistantLabel}
+                  onLeaveFeed={leaveTranscriptFeed}
                 />
+                </ChatLinksContext>
               </ChatImageScope>
               {busy && awaitingInput && (
                 <div className="flex items-center gap-2 text-subtext text-sm pt-0.5 px-0 pb-2 italic">{m.chat_panel_waiting_for_your_input()}</div>
               )}
-              {busy && !awaitingInput && !hasPendingTailTool && !hasStreamingText && (
-                <div className="text-base pt-0.5 px-1 pb-2">
-                  <span className="tool-running-shimmer">{m.chat_thinking()}</span>
+              {statusLine && (
+                <div ref={statusLineRef} className="text-base pt-0.5 px-1 pb-2">
+                  <span className="tool-running-shimmer">{statusLine}</span>
                 </div>
               )}
+              {/* Below everything the turn shows until its agent reads them; each then moves to where it did. */}
+              {unreadSteers.length > 0 && (
+                <div className="msg-steer-pending flex flex-col gap-4">
+                  {unreadSteers.map((item) => item.orx ? (
+                    <ChatLinksContext key={item.id} value={chatLinks}>
+                      <AgentMessageCard
+                        part={{ id: item.id, type: "steer", text: item.text, orx: item.orx }}
+                        runExperimentName={runExperimentName}
+                        onOpenFile={openFileInSession}
+                        onOpenRun={onOpenRun}
+                      />
+                    </ChatLinksContext>
+                  ) : (
+                    <div key={item.id} dir="auto" role="note" aria-label={m.chat_panel_you_mid_task()} className={`ms-auto w-fit max-w-[88%] ${USER_MESSAGE_BUBBLE_CLASS_NAME}`}>
+                      {item.text}
+                    </div>
+                  ))}
+                  <span role="status" className="tool-running-shimmer -mt-3 ms-auto px-1 text-xs">{m.chat_steering()}</span>
+                </div>
+              )}
+            </div>
             </div>
           </div>
         )}
@@ -7374,15 +9198,9 @@ export function ChatPanel({
           </Button>
         )}
 
-        {pendingQuestions.length > 0 && (
-          <div inert={contentLoading || Boolean(contentError) || historyLoading || connection !== null} className="mx-auto mb-2 flex max-h-96 w-full max-w-readable shrink-0 flex-col gap-2 overflow-y-auto px-3">
-            {pendingQuestions.map((part) => <PromptCard key={`${activeId}-${part.id}`} part={part} onRespond={respond} />)}
-          </div>
-        )}
-
         {/* Docked while a plan awaits a decision, so the approval controls never
           scroll away. Actions mirror the (now compact) inline card's wire. */}
-        <div inert={contentLoading || Boolean(contentError) || historyLoading} className="composer px-3 pb-3 shrink-0 relative z-4 bg-background w-full max-w-readable my-0 mx-auto [&_textarea]:border-0 [&_textarea]:bg-none [&_textarea]:bg-transparent [&_textarea]:resize-none [&_textarea]:pt-2.5 [&_textarea]:px-3 [&_textarea]:pb-1 [&_textarea]:text-base [&_textarea]:field-sizing-content [&_textarea]:min-h-18 [&_textarea]:max-h-45">
+        <div inert={contentLoading || Boolean(contentError) || historyLoading} className={`composer flex flex-col px-3 pb-3 ${questions.part ? "min-h-0" : "shrink-0"} relative z-4 bg-background w-full max-w-readable my-0 mx-auto`}>
           {threadMounted && (
             <Tooltip interactive content={m.chat_scroll_to_bottom()} className={`absolute bottom-full left-1/2 z-5 mb-6 -translate-x-1/2 transition-opacity duration-150 ease-standard ${transcriptAtBottom ? "pointer-events-none opacity-0" : "opacity-100"}`}>
               <IconButton
@@ -7405,6 +9223,7 @@ export function ChatPanel({
             onOpenRun={onOpenRun}
             onOpenExperiment={onOpenExperiment}
           />
+          {!busy && <BackgroundTaskBanner background={activeSession?.background} />}
           {/* Inside the composer so the composer's popovers (mode/model pickers,
             z 50 within this stacking context) layer above the strip — as a
             sibling, the composer's own z-index: 4 capped them below it. */}
@@ -7426,9 +9245,7 @@ export function ChatPanel({
           {pendingPlan && !(revisingPlan && pendingPlan.promptId === revisingPlan.promptId) && (
             <PlanStrip
               synthesized={pendingPlan.synthesized}
-              agentLabel={
-                activeSession ? harnessLabel(activeSession.harness, activeSession.harnessName) : m.chat_the_agent()
-              }
+              agentLabel={assistantLabel}
               showResumeModes={activeSession?.harness === "claude-code"}
               onView={(intent) => openPlan?.(pendingPlan.plan, pendingPlan.promptId, intent)}
               onApprove={(resumeMode) =>
@@ -7473,18 +9290,16 @@ export function ChatPanel({
                   {q.dispatchState === "blocked" ? (
                     <>
                       <button
-                        onClick={() => void retryQueued(q.id)}
+                        onClick={() => retryQueued(q.id)}
                         aria-label={m.a11y_retry_queued_message({ text: q.text })}
-                        disabled={retryingQueuedId !== null}
-                        className="shrink-0 px-1.5 py-0.5 border border-border rounded-sm text-sm text-text bg-background cursor-pointer disabled:opacity-50 disabled:cursor-default [&:hover:not(:disabled)]:border-border-hover-strong"
+                        className="shrink-0 px-1.5 py-0.5 border border-border rounded-sm text-sm text-text bg-background cursor-pointer [&:hover]:border-border-hover-strong"
                       >
-                        {retryingQueuedId === q.id ? m.retrying() : m.app_retry()}
+                        {m.app_retry()}
                       </button>
                       <button
                         onClick={() => cancelQueued(q.id)}
                         aria-label={m.a11y_remove_queued_message({ text: q.text })}
-                        disabled={retryingQueuedId !== null}
-                        className="shrink-0 px-1.5 py-0.5 border-0 text-sm text-muted bg-transparent cursor-pointer disabled:opacity-50 disabled:cursor-default [&:hover:not(:disabled)]:text-text"
+                        className="shrink-0 px-1.5 py-0.5 border-0 text-sm text-muted bg-transparent cursor-pointer [&:hover]:text-text"
                       >
                         {m.chat_panel_remove()}
                       </button>
@@ -7532,270 +9347,316 @@ export function ChatPanel({
               </Tooltip>
             </div>
           )}
-          {!embedded && !activeId && onNewProject && (
+          {!embedded && !activeId && !launching && onNewProject && (
             <ComposerProjectPicker
               projects={sidebarProjects}
               activity={projectActivity}
               projectId={projectId}
               projectName={projectName}
               onNewProject={onNewProject}
+              onNoProject={() => void startScratchChat()}
               onSelect={(id) => {
                 if (id !== projectId) void navigate({ to: "/projects/$projectId/tasks/new", params: { projectId: id } });
               }}
             />
           )}
           <RemoteConnectionStrip />
-          <div inert={connection !== null} className={`composer-box relative flex flex-col border ${bashMode ? "border-accent-amber" : "border-border"} rounded-lg bg-background shadow-control-subtle${connection ? " opacity-60" : ""}`} data-onboarding="composer">
-            {unconfirmedSend !== null && (
-              <div id={unconfirmedSendId} role="alert" className="flex items-start gap-2 pt-2 px-3 text-sm text-text">
-                <span className="flex-1" dir="auto">{m.chat_send_unconfirmed({ error: ltr(unconfirmedSend) })}</span>
-                <button type="button" className="underline cursor-pointer" onClick={() => {
-                  composerLiveRef.current = { ...composerLiveRef.current, unconfirmedSend: null };
-                  setUnconfirmedSend(null);
-                  composerRef.current?.focus();
-                }}>
-                  {m.chat_panel_dismiss_demo_hint()}
-                </button>
-              </div>
-            )}
-            {activeHarness && !activeHarness.agentReady && (
-              <div className="composer-harness-warning py-2 px-3 text-subtext text-sm leading-normal border-b border-b-border-variant [&_strong]:text-accent-amber [&_strong]:font-medium [&_code]:font-mono [&_code]:text-text">
-                {activeHarness.catalogPending ? (
-                  <span>{activeHarness.name} — {m.onboarding_checking()}</span>
-                ) : (
-                  <>
-                    <strong>{activeHarness.name} {m.chat_panel_is_unavailable()}</strong>{" "}
-                    {activeHarness.agentNote
-                      ? renderNote(activeHarness.agentNote, onRunSetup && {
-                        canRun: (command) => setupPath(command) !== undefined,
-                        onRun: (command) => {
-                          const path = setupPath(command);
-                          if (path) onRunSetup(command, path);
-                        },
-                      })
-                      : m.chat_recheck_setup()}
-                  </>
-                )}
-              </div>
-            )}
-            {skillMenuOpen && (
-              <SkillMenu
-                skills={skillMatches}
-                activeIndex={activeSkillIdx}
-                onPick={pickSkill}
-                onHover={setSkillIdx}
-              />
-            )}
-            {mentionMenuOpen && (
-              <FileMentionMenu
-                matches={mentionMatches}
-                activeIndex={activeMentionIdx}
-                onPick={pickFileMention}
-                onHover={setMentionIdx}
-              />
-            )}
-            {annotations.length > 0 && (
-              <ComposerAnnotations
-                annotations={annotations}
-                onClear={() => {
-                  setAnnotations([]);
-                  window.requestAnimationFrame(() => composerRef.current?.focus());
-                }}
-                onRemove={(id) => {
-                  const remaining = annotations.filter((annotation) => annotation.id !== id);
-                  setAnnotations(remaining);
-                  if (remaining.length === 0) {
-                    window.requestAnimationFrame(() => composerRef.current?.focus());
-                  }
-                }}
-              />
-            )}
-            {attachments.length > 0 && (
-              <div className="composer-attachments flex flex-wrap gap-1.5 pt-2 px-3 pb-0">
-                {attachments.map((a, i) => {
-                  const remove = () =>
-                    setAttachments((cur) => cur.filter((_, j) => j !== i));
-                  return a.mediaType === "application/pdf" ? (
-                    <div key={i} className="attachment-file [&_button]:absolute [&_button]:-top-[5px] [&_button]:-right-[5px] [&_button]:inline-flex [&_button]:items-center [&_button]:justify-center [&_button]:w-4 [&_button]:h-4 [&_button]:p-0 [&_button]:border [&_button]:border-border [&_button]:rounded-full [&_button]:bg-surface [&_button]:text-text [&_button]:cursor-pointer [&_button:hover]:bg-text [&_button:hover]:text-background relative inline-flex items-center gap-2 max-w-55 py-2 px-2.5 border border-border rounded-sm text-text bg-surface [&_svg]:shrink-0 [&_svg]:text-muted" title={a.name}>
-                      <FileText size={22} />
-                      <span className="attachment-file-name overflow-hidden text-ellipsis whitespace-nowrap text-sm">{a.name ?? "document.pdf"}</span>
-                      <button title={m.chat_panel_remove_file()} aria-label={m.chat_panel_remove_file()} onClick={remove}>
-                        <X size={12} />
-                      </button>
+          <div inert={connection !== null} className={`composer-frame flex flex-col min-h-0 rounded-xl bg-surface${connection ? " opacity-60" : ""}`} data-onboarding="composer">
+            <div className={`composer-box relative flex flex-col min-h-0 rounded-xl border ${bashMode && !asking ? "border-accent-amber" : "border-border"} bg-background shadow-control-subtle`}>
+              {unconfirmedSend !== null && (
+                <div id={unconfirmedSendId} role="alert" className="flex items-start gap-2 pt-2 px-3 text-sm text-text">
+                  <span className="flex-1" dir="auto">{m.chat_send_unconfirmed({ error: ltr(unconfirmedSend) })}</span>
+                  <button type="button" className="underline cursor-pointer" onClick={() => {
+                    composerLiveRef.current = { ...composerLiveRef.current, unconfirmedSend: null };
+                    setUnconfirmedSend(null);
+                    composerRef.current?.focus();
+                  }}>
+                    {m.chat_panel_dismiss_demo_hint()}
+                  </button>
+                </div>
+              )}
+              {activeHarness && (composerSignIn || !activeHarness.agentReady) && (
+                <div className={`composer-harness-warning text-subtext text-sm leading-normal border-b border-b-border-variant [&_strong]:text-accent-amber [&_strong]:font-medium [&_code]:font-mono [&_code]:text-text ${composerSignIn ? "p-1.5 ps-3" : "py-2 px-3"}`}>
+                  {composerSignIn ? (
+                    <div className="flex items-center gap-3">
+                      <span className="flex-1" role="status">{m.chat_failure_signed_out({ name: autoDir(agentName ?? activeHarness.name) })}</span>
+                      <Button type="button" size="small" variant="primary" className="shrink-0" onClick={composerSignIn} disabled={busy || recoveringTurnId !== null} aria-haspopup="dialog">
+                        {m.harness_setup_login()}
+                      </Button>
                     </div>
+                  ) : activeHarness.catalogPending ? (
+                    <span>{activeHarness.name} — {m.onboarding_checking()}</span>
                   ) : (
-                    <div key={i} className="attachment-thumb relative [&_img]:w-13 [&_img]:h-13 [&_img]:object-cover [&_img]:border [&_img]:border-border [&_img]:rounded-sm [&_img]:block [&_button]:absolute [&_button]:-top-[5px] [&_button]:-right-[5px] [&_button]:inline-flex [&_button]:items-center [&_button]:justify-center [&_button]:w-4 [&_button]:h-4 [&_button]:p-0 [&_button]:border [&_button]:border-border [&_button]:rounded-full [&_button]:bg-surface [&_button]:text-text [&_button]:cursor-pointer [&_button:hover]:bg-text [&_button:hover]:text-background">
-                      <img src={a.dataUrl} alt={m.chat_pasted_image()} />
-                      <button title={m.chat_panel_remove_image()} aria-label={m.chat_panel_remove_image()} onClick={remove}>
-                        <X size={12} />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-            {(imageInputError ?? attachError) && (
-              <div className="composer-attach-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
-                {imageInputError ?? attachError}
-              </div>
-            )}
-            {settingsError && (
-              <div className="composer-settings-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
-                {settingsError}
-              </div>
-            )}
-            <div className={`composer-input relative flex overflow-hidden [&_textarea]:flex-1 ${bashMode ? "[&_textarea]:font-mono [&_textarea]:text-sm" : ""}`}>
-              <textarea
-                dir="auto"
-                {...{ writingsuggestions: "false" }}
-                ref={composerRef}
-                aria-describedby={[demoHintVisible && demoHintId, unconfirmedSend !== null && unconfirmedSendId].filter(Boolean).join(" ") || undefined}
-                // Native prose stays visible; the aligned mirror paints only skill tokens.
-                className="relative z-1 min-w-0 overflow-x-hidden bg-transparent"
-                value={draft}
-                placeholder={
-                  steering && activeHarness
-                    ? m.chat_steer_placeholder({ harness: ltr(activeHarness.name), shortcut: ltr(queueChord) })
-                    : composerSelection
-                      ? activeHarness?.agentReady
-                        ? m.chat_message_harness({ harness: ltr(harnessLabel(composerSelection.harness, activeHarness?.name)) })
-                        : m.chat_harness_unavailable({ harness: ltr(harnessLabel(composerSelection.harness, activeHarness?.name)) })
-                      : m.chat_ask_agent_placeholder()
-                }
-                rows={2}
-                onPaste={onComposerPaste}
-                onDragOver={(e) => {
-                  if (e.dataTransfer.types.includes("Files")) e.preventDefault();
-                }}
-                onDrop={(e) => {
-                  if (e.dataTransfer.files.length === 0) return;
-                  e.preventDefault();
-                  addFiles(Array.from(e.dataTransfer.files));
-                }}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  const cursor = e.target.selectionStart;
-                  setComposerCursor(cursor);
-                  // Composer commands run rather than send: each fires the moment
-                  // its space lands, but not mid-IME-composition,
-                  // where the text can transiently look complete.
-                  const completedCommand =
-                    cursor > 0 && /\s/.test(v[cursor - 1]) && !composingRef.current && bashCommand(v) === null
-                      ? slashCommandContext(v, cursor - 1)
-                      : null;
-                  const completedName = completedCommand && resolveComposerCommand(completedCommand.query);
-                  const restOfDraft = completedCommand
-                    ? (v.slice(0, completedCommand.start) + v.slice(completedCommand.end)).trim()
-                    : "";
-                  if (
-                    completedCommand && completedName
-                    && (completedName === "plan" || completedName === "goal" || (!takesArgument(completedName) && !restOfDraft))
-                    && commands.some((command) => command.name === completedName)
-                  ) {
-                    activateComposerCommand(completedName, v, completedCommand);
-                    return;
+                    <>
+                      <strong>{activeHarness.name} {m.chat_panel_is_unavailable()}</strong>{" "}
+                      {activeHarness.agentNote
+                        ? renderNote(activeHarness.agentNote, onRunSetup && {
+                          canRun: (command) => setupPath(command) !== undefined,
+                          onRun: (command) => {
+                            const path = setupPath(command);
+                            if (path) onRunSetup(command, path);
+                          },
+                        })
+                        : m.chat_recheck_setup()}
+                    </>
+                  )}
+                </div>
+              )}
+              {skillMenuOpen && !asking && (
+                <SkillMenu
+                  skills={skillMatches}
+                  activeIndex={activeSkillIdx}
+                  onPick={pickSkill}
+                  onHover={setSkillIdx}
+                />
+              )}
+              {mentionMenuOpen && !asking && (
+                <MentionMenu
+                  matches={mentionMatches}
+                  activeIndex={activeMentionIdx}
+                  onPick={pickMention}
+                  onHover={setMentionIdx}
+                />
+              )}
+              {annotations.length > 0 && !asking && (
+                <ComposerAnnotations
+                  annotations={annotations}
+                  onClear={() => {
+                    setAnnotations([]);
+                    window.requestAnimationFrame(() => composerRef.current?.focus());
+                  }}
+                  onRemove={(id) => {
+                    const remaining = annotations.filter((annotation) => annotation.id !== id);
+                    setAnnotations(remaining);
+                    if (remaining.length === 0) {
+                      window.requestAnimationFrame(() => composerRef.current?.focus());
+                    }
+                  }}
+                />
+              )}
+              {(imageInputError ?? attachError) && (
+                <div className="composer-attach-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
+                  {imageInputError ?? attachError}
+                </div>
+              )}
+              {settingsError && (
+                <div className="composer-settings-error pt-1.5 px-3 pb-0 text-sm text-accent-red" role="alert">
+                  {settingsError}
+                </div>
+              )}
+              {questions.part && (
+                <QuestionDock
+                  key={questions.part.id}
+                  part={questions.part}
+                  index={questions.index}
+                  total={questions.total}
+                  picked={questions.answer.picked}
+                  disabled={questions.busy}
+                  hotkeys={mainView === "chat" && !contentInert && !contentLoading && !contentError && !historyLoading && connection === null
+                    && (embedded ? searchRegion === "right" : searchRegion !== "right")}
+                  searchTarget={focusedMessage?.partId === questions.part.id}
+                  onPick={questions.pick}
+                />
+              )}
+              {/* The answer lines up with the question's text above it. */}
+              <div className={`composer-input flex min-w-0 items-end ${asking ? "relative [--composer-pad-x:1rem]" : ""}`}>
+                <ComposerEditor
+                  ref={composerRef}
+                  value={questions.part ? questions.answer.note : draft}
+                  describedBy={[demoHintVisible && demoHintId, unconfirmedSend !== null && unconfirmedSendId].filter(Boolean).join(" ") || undefined}
+                  placeholder={
+                    asking
+                      ? questions.answer.picked.length > 0
+                        ? m.chat_question_add_note()
+                        : questions.part?.prompt?.options?.length
+                          ? m.chat_question_custom_response()
+                          : m.chat_question_your_answer()
+                      : steering && activeHarness
+                      ? m.chat_steer_placeholder({ harness: ltr(activeHarness.name), shortcut: ltr(queueChord) })
+                      : composerSelection
+                        ? activeHarness?.agentReady
+                          ? m.chat_message_harness({ harness: ltr(harnessLabel(composerSelection.harness, activeHarness?.name)) })
+                          : composerSignIn
+                            ? m.add_agent_sign_in_title({ name: autoDir(agentName ?? activeHarness?.name ?? "") })
+                            : m.chat_harness_unavailable({ harness: ltr(harnessLabel(composerSelection.harness, activeHarness?.name)) })
+                        : m.chat_ask_agent_placeholder()
                   }
-                  setDraft(v);
-                  setSkillMenuDismissed(false);
-                }}
-                onSelect={(e) => setComposerCursor(e.currentTarget.selectionStart)}
-                onCompositionStart={() => {
-                  composingRef.current = true;
-                }}
-                onCompositionEnd={() => {
-                  composingRef.current = false;
-                }}
-                onKeyDown={(e) => {
-                  // WebKit can end composition before the confirming keydown (keyCode 229).
-                  if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
-                    e.stopPropagation();
-                    return;
-                  }
-                  if (skillMenuOpen) {
-                    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                      e.preventDefault();
-                      const delta = e.key === "ArrowDown" ? 1 : -1;
-                      if (activeSkillIdx >= 0) {
-                        const index = selectableSkillIndices.indexOf(activeSkillIdx);
-                        setSkillIdx(selectableSkillIndices[(index + delta + selectableSkillIndices.length) % selectableSkillIndices.length]);
-                      }
+                  plain={bashMode && !asking}
+                  readOnly={questions.busy}
+                  chipSource={chipSource}
+                  projectId={projectId}
+                  draftKey={questions.part ? `question:${questions.part.id}` : stashKey}
+                  resizeKey={embedded ? "orx:composer-height:side" : "orx:composer-height"}
+                  onFiles={asking ? () => {} : addFiles}
+                  onPaste={asking ? () => {} : onComposerPaste}
+                  onChange={(v, cursor, typed) => {
+                    if (asking) {
+                      if (v !== questions.answer.note) questions.setNote(v);
                       return;
                     }
-                    if ((e.key === "Tab" || e.key === "Enter") && activeSkillIdx >= 0) {
-                      e.preventDefault();
-                      pickSkill(skillMatches[activeSkillIdx]);
-                      return;
-                    }
-                    if (e.key === "Escape") {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      setSkillMenuDismissed(true);
-                      return;
-                    }
-                  }
-                  if (mentionMenuOpen) {
-                    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                      e.preventDefault();
-                      const delta = e.key === "ArrowDown" ? 1 : -1;
-                      setMentionIdx(
-                        (activeMentionIdx + delta + mentionMatches.length) % mentionMatches.length,
-                      );
-                      return;
-                    }
-                    // A bare trailing `@` still sends on Enter; `@` is common in prose.
+                    setComposerCursor(cursor);
+                    if (v === draft) return;
+                    // Composer commands run rather than send: each fires the moment
+                    // its space lands, but not mid-IME-composition, where the text
+                    // can transiently look complete.
+                    const completedCommand =
+                      typed && cursor > 0 && /\s/.test(v[cursor - 1]) && bashCommand(v) === null
+                        ? slashCommandContext(v, cursor - 1)
+                        : null;
+                    const completedName = completedCommand && resolveComposerCommand(completedCommand.query);
+                    const restOfDraft = completedCommand
+                      ? (v.slice(0, completedCommand.start) + v.slice(completedCommand.end)).trim()
+                      : "";
                     if (
-                      e.key === "Tab"
-                      || (mentionQuery !== "" && matchesKeyboardEvent(e.nativeEvent, "Enter"))
+                      completedCommand && completedName
+                      && (completedName === "plan" || completedName === "goal" || (!takesArgument(completedName) && !restOfDraft))
+                      && commands.some((command) => command.name === completedName)
                     ) {
-                      e.preventDefault();
-                      pickFileMention(mentionMatches[activeMentionIdx]);
+                      activateComposerCommand(completedName, v, completedCommand);
                       return;
                     }
-                    if (e.key === "Escape") {
-                      e.stopPropagation();
-                      e.preventDefault();
-                      setSkillMenuDismissed(true);
-                      return;
+                    setDraft(v);
+                    setSkillMenuDismissed(false);
+                  }}
+                  onKeyDown={(e) => {
+                    if (asking) return;
+                    if (skillMenuOpen) {
+                      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                        e.preventDefault();
+                        const delta = e.key === "ArrowDown" ? 1 : -1;
+                        if (activeSkillIdx >= 0) {
+                          const index = selectableSkillIndices.indexOf(activeSkillIdx);
+                          setSkillIdx(selectableSkillIndices[(index + delta + selectableSkillIndices.length) % selectableSkillIndices.length]);
+                        }
+                        return;
+                      }
+                      if ((e.key === "Tab" || e.key === "Enter") && activeSkillIdx >= 0) {
+                        e.preventDefault();
+                        pickSkill(skillMatches[activeSkillIdx]);
+                        return;
+                      }
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setSkillMenuDismissed(true);
+                        return;
+                      }
                     }
-                  }
-                  // Backspace just behind a chip deletes the whole command.
-                  if (e.key === "Backspace" && deleteCommandBehindCaret(e.currentTarget)) {
-                    e.preventDefault();
-                    return;
-                  }
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    if (bashMode) {
-                      void runShell();
-                      return;
+                    if (mentionMenuOpen) {
+                      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                        e.preventDefault();
+                        const delta = e.key === "ArrowDown" ? 1 : -1;
+                        setMentionIdx(
+                          (activeMentionIdx + delta + mentionMatches.length) % mentionMatches.length,
+                        );
+                        return;
+                      }
+                      // A bare trailing `@` still sends on Enter; `@` is common in prose.
+                      if (
+                        e.key === "Tab"
+                        || (mentionQuery !== "" && matchesKeyboardEvent(e, "Enter"))
+                      ) {
+                        e.preventDefault();
+                        pickMention(mentionMatches[activeMentionIdx]);
+                        return;
+                      }
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        setSkillMenuDismissed(true);
+                        return;
+                      }
                     }
-                    void send({ queue: matchesKeyboardEvent(e.nativeEvent, "Mod+Enter") });
-                  }
-                }}
-              />
-              {/* After the textarea: its ref must be attached before the mirror
-              * measures it. */}
-              <ComposerSkillChips
-                text={draft}
-                editingTokenEnd={slashContext?.end}
-                isCommand={knownCommand}
-                skills={commands}
-                projectId={projectId}
-                textareaRef={composerRef}
-              />
+                  }}
+                  onSubmit={(e) => {
+                    if (asking) questions.next();
+                    else if (bashMode) void runShell();
+                    else void send({ queue: matchesKeyboardEvent(e, "Mod+Enter") });
+                  }}
+                />
+                <div className="flex shrink-0 items-center gap-1 p-1.5">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="application/pdf,image/png,image/jpeg,image/gif,image/webp"
+                    multiple
+                    hidden
+                    onChange={(e) => {
+                      addFiles(Array.from(e.target.files ?? []));
+                      e.target.value = ""; // let the same file be re-picked
+                    }}
+                  />
+                  {!asking && (
+                    <Tooltip interactive content={m.chat_panel_attach_a_pdf_or_image()}>
+                      <IconButton
+                        type="button"
+                        className="composer-attach"
+                        aria-label={m.chat_panel_attach_a_pdf_or_image()}
+                        onClick={() => fileInputRef.current?.click()}
+                      >
+                        <Paperclip size={16} />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                  {asking ? (
+                    <>
+                      <Tooltip interactive content={m.chat_question_skip()}>
+                        <IconButton type="button" variant="filled" aria-label={m.chat_question_skip()} disabled={questions.busy} onClick={questions.skip}>
+                          <X size={16} />
+                        </IconButton>
+                      </Tooltip>
+                      {/* Stays put on the first question: Skip must not slide under a second click. */}
+                      {questions.total > 1 && (
+                        <Tooltip interactive content={m.chat_question_back()}>
+                          <IconButton type="button" variant="filled" aria-label={m.chat_question_back()} disabled={questions.busy || questions.index === 0} onClick={questions.back}>
+                            <ChevronLeft size={16} className="rtl:rotate-180" />
+                          </IconButton>
+                        </Tooltip>
+                      )}
+                      <Button type="button" variant="primary" className="min-w-20" disabled={questions.busy || !questions.answered} onClick={questions.next}>
+                        {questions.last ? m.chat_panel_submit() : m.chat_question_next()}
+                      </Button>
+                    </>
+                  ) : busy ? (
+                    <Tooltip interactive content={m.chat_panel_stop()}>
+                      <IconButton className="send-btn" variant="filled" aria-label={m.chat_panel_stop()} onClick={stop}>
+                        <X size={16} />
+                      </IconButton>
+                    </Tooltip>
+                  ) : (
+                    <Tooltip interactive content={bashMode ? m.chat_panel_run() : m.chat_panel_send()}>
+                      <IconButton
+                        className={`send-btn ${demoHintVisible && activeHarness?.agentReady ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
+                        variant="primary"
+                        aria-label={bashMode ? m.chat_panel_run() : m.chat_panel_send()}
+                        onClick={() => void (bashMode ? runShell() : send())}
+                        disabled={
+                          bashMode
+                            ? switchingAgent || !shellCommand || (!activeId && !activeHarness?.agentReady)
+                            : switchingAgent || !canRun ||
+                            (!draft.trim() && annotations.length === 0)
+                        }
+                      >
+                        <CornerDownLeft size={16} />
+                      </IconButton>
+                    </Tooltip>
+                  )}
+                </div>
+              </div>
             </div>
-            <div className="composer-actions flex min-w-0 justify-end items-center gap-2 pt-1.5 px-2 pb-2">
+            <div className="composer-actions flex min-w-0 items-center gap-1 px-1.5 py-1">
               <div className="option-picker relative inline-flex shrink-0" ref={dataSources.ref}>
                 <Tooltip interactive content={m.chat_panel_data_sources()}>
                   <IconButton
                     type="button"
-                    className="composer-bare"
+                    size="small"
+                    className={`composer-bare ${BAR_BUTTON}`}
                     aria-label={m.chat_panel_data_sources()}
                     aria-haspopup="dialog"
                     aria-expanded={dataSources.open}
                     onClick={() => dataSources.setOpen((open) => !open)}
                   >
-                    <ToggleRight size={16} />
+                    <LibraryBig size={16} />
                   </IconButton>
                 </Tooltip>
                 {dataSources.open && (
@@ -7805,42 +9666,33 @@ export function ChatPanel({
                   </div>
                 )}
               </div>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="application/pdf,image/png,image/jpeg,image/gif,image/webp"
-                multiple
-                hidden
-                onChange={(e) => {
-                  addFiles(Array.from(e.target.files ?? []));
-                  e.target.value = ""; // let the same file be re-picked
-                }}
-              />
-              <Tooltip interactive content={m.chat_panel_attach_a_pdf_or_image()}>
-                <IconButton
-                  type="button"
-                  className="composer-attach"
-                  aria-label={m.chat_panel_attach_a_pdf_or_image()}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  <Paperclip size={16} />
-                </IconButton>
-              </Tooltip>
-              <LibraryPicker composerRef={composerRef} onAdd={(papers) => {
-                const references = papers.map((paper) => `${paper.title}\n${paper.url}`).join("\n\n");
-                const prefix = draft.trim() ? `${draft.trimEnd()}\n\n` : "";
-                const next = `${prefix}${references}\n\n`;
-                setDraft(next);
-                window.requestAnimationFrame(() => {
+              <LibraryPicker
+                className={`composer-bare ${BAR_BUTTON}`}
+                onAdd={(papers) => window.requestAnimationFrame(() => {
                   composerRef.current?.focus();
-                  composerRef.current?.setSelectionRange(next.length, next.length);
-                  setComposerCursor(next.length);
-                });
-              }} />
+                  composerRef.current?.insertToken(papers.map(paperToken).join(" "));
+                })}
+              />
+              {steeringDelegate && activeSession && (
+                <Tooltip interactive content={m.chat_notify_parent()}>
+                  <IconButton
+                    type="button"
+                    size="small"
+                    className={BAR_BUTTON}
+                    aria-label={m.chat_notify_parent()}
+                    aria-pressed
+                    active
+                    onClick={() => stopNotifyingParent(activeSession)}
+                  >
+                    <Bell size={16} />
+                  </IconButton>
+                </Tooltip>
+              )}
               {(sessionGoal || goalArmed) && (
                 <Tooltip interactive content={goalArmed ? m.goal_command_description() : m.chat_panel_clear_goal({ goal: autoDir(sessionGoal) })}>
                   <Button
                     type="button"
+                    size="small"
                     variant="purple"
                     active
                     className="group max-w-60"
@@ -7862,6 +9714,7 @@ export function ChatPanel({
                 <Tooltip interactive content={m.chat_panel_exit_plan_mode()}>
                   <Button
                     type="button"
+                    size="small"
                     variant="amber"
                     active
                     className="group"
@@ -7880,9 +9733,10 @@ export function ChatPanel({
                 <Tooltip interactive content={m.chat_panel_exit_bash_mode()}>
                   <Button
                     type="button"
+                    size="small"
                     variant="ghost"
                     active
-                    className="group"
+                    className={`group ${BAR_BUTTON}`}
                     aria-label={m.chat_panel_exit_bash_mode()}
                     onClick={exitBashMode}
                   >
@@ -7895,17 +9749,14 @@ export function ChatPanel({
                 </Tooltip>
               )}
               <div className="min-w-0 flex-1" />
-              {/* The model picker reflects the open session (harness locked once it
-                exists); the global default only applies before the first
-                message. */}
-              <div className="flex min-w-0 items-center">
+              <div className="flex min-w-0 items-center gap-0.5">
                 <ModelPicker
                   sessionHarness={openSession?.harness.startsWith("acp:") ? activeHarness : undefined}
                   value={composerSelection}
                   onSelect={selectModel}
                   onStartHarness={startHarness}
-                  onOpenSettings={() => onSelectMainView("harnesses")}
-                  permissionChoices={activeHarness?.agentReady ? (opts?.permissionModes ?? []) : []}
+                  onOpenSettings={() => onSelectMainView("agents")}
+                  permissionChoices={activeHarness?.agentReady ? withAutoReviewer(opts?.permissionModes ?? [], activeHarness, uiState?.opencodeReviewModel, composerSelection?.model) : []}
                   defaultPermissionId={opts?.defaultPermissionMode ?? null}
                   onSelectPermission={setPermissionMode}
                   reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
@@ -7913,49 +9764,38 @@ export function ChatPanel({
                   onSelectReasoning={setReasoningLevel}
                   autonomy={openSession?.autonomy ?? sideDraftAutonomy ?? preferredAutonomy}
                   onSelectAutonomy={setAutonomy}
-                  lockHarness={!!openSession || !!sideParentSessionId}
+                  disabled={switchingAgent}
+                  lockHarness={busy || switchingAgent || (!openSession && !!sideParentSessionId)}
                   openRequest={modelPickerRequest}
+                  canNudge={!embedded && !contentInert}
                   nativeOptions={openSession?.harness.startsWith("acp:") ? acpOptions.filter((option) => option.category !== "model") : []}
                   onSelectNativeOption={(optionId, value) => {
                     if (!openSession) return;
-                    void setChatConfiguration(openSession.id, optionId, value).catch((error: unknown) => showAlert(error instanceof Error ? error.message : String(error), "error"));
+                    mutSetChatConfiguration.run(workspace, openSession, optionId, value);
                   }}
                 />
-                <ContextMeter usage={openSession?.contextUsage} />
+                <UsageMenu
+                  usage={openSession?.contextUsage}
+                  busy={busy}
+                  harness={composerSelection?.harness}
+                  profile={composerSelection?.profile}
+                  sessionId={openSession?.id ?? null}
+                  remote={runtime.kind === "ssh"}
+                  onCompact={activeHarness?.supportsCompaction && openSession ? () => void compactSession() : undefined}
+                />
               </div>
-              {busy ? (
-                <Tooltip interactive content={m.chat_panel_stop()}>
-                  <IconButton className="send-btn" variant="stop" aria-label={m.chat_panel_stop()} onClick={stop}>
-                    <X size={16} />
-                  </IconButton>
-                </Tooltip>
-              ) : (
-                <Tooltip interactive content={bashMode ? m.chat_panel_run() : m.chat_panel_send()}>
-                  <IconButton
-                    className={`send-btn ${demoHintVisible && activeHarness?.agentReady ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
-                    variant="primary"
-                    aria-label={bashMode ? m.chat_panel_run() : m.chat_panel_send()}
-                    onClick={() => void (bashMode ? runShell() : send())}
-                    disabled={
-                      bashMode
-                        ? !shellCommand || (!activeId && !activeHarness?.agentReady)
-                        : !activeHarness?.agentReady ||
-                        (!draft.trim() && attachments.length === 0 && annotations.length === 0)
-                    }
-                  >
-                    <CornerDownLeft size={16} />
-                  </IconButton>
-                </Tooltip>
-              )}
             </div>
           </div>
         </div>
       </section>
       <EscapeScope enabled={dataSources.open} onEscape={() => dataSources.setOpen(false)} />
-      <EscapeScope enabled={skillMenuOpen || mentionMenuOpen} onEscape={() => setSkillMenuDismissed(true)} />
+      <EscapeScope enabled={!asking && (skillMenuOpen || mentionMenuOpen)} onEscape={() => setSkillMenuDismissed(true)} />
     </>
   );
 }
+
+/** Bar controls sit on the surface tint, where the default surface hover vanishes. */
+const BAR_BUTTON = "[&:hover:not(:disabled)]:bg-hover-muted [&.active]:bg-hover-muted";
 
 const COMPOSER_HINT_CLASS =
   "flex items-center gap-2.5 mb-2.5 py-2 ps-3.5 pe-2 rounded-lg border border-border bg-surface text-text text-sm leading-normal";

@@ -13,8 +13,7 @@ impl Sandbox {
     }
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_orx"));
-        cmd.env("HOME", &self.0)
-            .env("USERPROFILE", &self.0)
+        crate::home::isolate_home(&mut cmd, &self.0)
             .env("XDG_CONFIG_HOME", self.0.join("config"))
             .env("ORX_DATA_DIR", self.data_dir())
             .env("ORX_NO_UPDATE_CHECK", "1")
@@ -23,6 +22,8 @@ impl Sandbox {
             .env_remove("MODAL_TOKEN_ID")
             .env_remove("MODAL_TOKEN_SECRET")
             .arg("--no-telemetry");
+        #[cfg(unix)]
+        cmd.env("PATH", orx_test_support::agentless_path(&self.0));
         cmd
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -65,6 +66,8 @@ impl Sandbox {
 }
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        orx_test_support::stop_server(&self.data_dir());
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -199,4 +202,154 @@ fn missing_unknown_and_removed_flags() {
 
     let flags = sandbox.run(&["logs", run_id, "--full"]);
     assert!(!flags.status.success());
+}
+
+#[test]
+fn large_kept_log_previews_tail_and_identifies_both_ranges_and_missing_middle() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let sandbox = Sandbox::new();
+    let run_id = "run-large-kept";
+    sandbox.seed_run(run_id);
+    let head = sandbox.write_log(run_id, b"SETUP_SENTINEL");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&head)
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    let tail = head.with_file_name(format!("{run_id}.tail.log"));
+    let mut file = std::fs::File::create(&tail).unwrap();
+    file.set_len(256 << 20).unwrap();
+    let result = b"TRAINING_COMPLETE_SENTINEL\n";
+    file.seek(SeekFrom::End(-(result.len() as i64))).unwrap();
+    file.write_all(result).unwrap();
+    let total: u64 = 3 << 30;
+    let ranges = serde_json::json!([
+        {"offset":0,"len":64 << 20,"file":head,"ident":"1-2","eof":false},
+        {"offset":total - (256 << 20),"len":256 << 20,"file":tail,"ident":"1-2","eof":true}
+    ]);
+    std::fs::write(
+        head.with_file_name(format!("{run_id}.ranges.json")),
+        ranges.to_string(),
+    )
+    .unwrap();
+    let output = sandbox.run(&["logs", run_id]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = lossy_stdout(&output);
+    for expected in [
+        "Original log: 3221225472 bytes.",
+        "Kept bytes 0..67108864:",
+        "Kept bytes 2952790016..3221225472:",
+        head.to_str().unwrap(),
+        tail.to_str().unwrap(),
+        "The middle of the log is not on this computer.",
+        "TRAINING_COMPLETE_SENTINEL",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}");
+    }
+    assert!(!stdout.contains("SETUP_SENTINEL"));
+    assert!(!stdout.contains("full log file"));
+}
+
+#[test]
+fn a_closed_stdout_ends_short_commands_quietly() {
+    let sandbox = Sandbox::new();
+    let run_id = "run-closed-stdout";
+    sandbox.seed_run(run_id);
+    sandbox.write_log(run_id, b"line\n");
+    for args in [&["logs", run_id][..], &["projects"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = sandbox
+            .command()
+            .args(args)
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(output.status.signal(), Some(libc::SIGPIPE), "{args:?}");
+        }
+        #[cfg(windows)]
+        assert!(output.status.success(), "{args:?}: {}", output.status);
+    }
+}
+
+#[test]
+fn read_only_commands_work_on_a_read_only_store() {
+    let sandbox = Sandbox::new();
+    let run_id = "run-read-only-store";
+    sandbox.seed_run(run_id);
+    sandbox.write_log(run_id, b"READ_ONLY_SENTINEL\n");
+    let listed = sandbox.run(&["runs", "proj-1"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    for name in ["orx.db", "orx.db-wal", "orx.db-shm"] {
+        let path = sandbox.data_dir().join(name);
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+    }
+    for args in [
+        &["runs", "proj-1"][..],
+        &["projects"],
+        &["project", "view", "proj-1"],
+        &["exp", "status", "exp-1"],
+        &["logs", run_id],
+    ] {
+        let output = sandbox.run(args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(lossy_stdout(&sandbox.run(&["runs", "proj-1"])).contains(run_id));
+    assert!(lossy_stdout(&sandbox.run(&["logs", run_id])).contains("READ_ONLY_SENTINEL"));
+
+    // Nothing listens on the port, so each wait fails only once it has read the store.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port().to_string();
+    drop(closed);
+    for target in [&["exp-1"][..], &["--project", "proj-1"]] {
+        let output = sandbox
+            .command()
+            .env("ORX_UP_PORT", &port)
+            .env("ORX_UP_AUTH_TOKEN", "token")
+            .args(["exp", "wait", "--timeout", "60"])
+            .args(target)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("127.0.0.1:{port}")),
+            "{target:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_unusable_config_dir_is_named_in_the_error() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.0.join("config").join("openresearch");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "").unwrap();
+    let output = sandbox.run(&["projects"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(config.to_str().unwrap()), "{stderr}");
 }

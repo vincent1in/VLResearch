@@ -396,6 +396,8 @@ mod tests {
                     parent_id: None,
                     base_native_session_id: None,
                     result_native_session_id: None,
+                    result_native_message_id: None,
+                    native_harness: None,
                 })
                 .unwrap();
         }
@@ -441,6 +443,8 @@ mod tests {
             active_leaf_id: None,
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            profile_id: None,
+            native_fork_at: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -547,6 +551,7 @@ mod tests {
                 name: "LM Studio".into(),
                 base_url: "http://127.0.0.1:1234/v1".into(),
                 api_key: String::new(),
+                icon: None,
                 models: BTreeMap::from([("qwen/qwen3-8b".to_string(), 32_768)]),
             },
         )]);

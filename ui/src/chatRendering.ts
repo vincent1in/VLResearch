@@ -70,6 +70,8 @@ export function questionReplies(messages: ChatMessage[]): QuestionReplies {
   const questionById = new Map<string, string>();
   const prompts = new Set<string>();
   const pending = new Map<string, { id: string; answer: string; question: string }>();
+  // A held card an agent answered is followed by that chat's steered answer.
+  const answeredBy = new Map<string, string>();
   const originalQuestions = new Map<string, string>();
   for (const part of messages.flatMap((message) => message.parts)) {
     const questions = part.type === "tool" && part.state?.input?.questions;
@@ -99,9 +101,14 @@ export function questionReplies(messages: ChatMessage[]): QuestionReplies {
       if (prompt?.kind === "question" && prompt.question) {
         questionById.set(part.id, originalQuestions.get(prompt.question) ?? prompt.question);
       }
-      if (part.type === "prompt" && prompt?.kind === "question" && prompt.resolved && !prompt.nativeId && prompt.question) {
+      if (part.type === "prompt" && prompt?.resolved && prompt.nativeId && prompt.answeredBy) {
+        answeredBy.set(prompt.answeredBy, part.id);
+      } else if (part.type === "prompt" && prompt?.kind === "question" && prompt.resolved && !prompt.nativeId && prompt.question) {
         const answer = [(prompt.answers ?? []).join(", "), prompt.note].filter(Boolean).join("\n\n");
         if (answer) pending.set(`In response to: ${prompt.question}\n\n${answer}`, { id: part.id, answer, question: prompt.question });
+      } else if (part.type === "steer" && part.orx?.from && answeredBy.has(part.orx.from)) {
+        prompts.add(answeredBy.get(part.orx.from)!);
+        answeredBy.delete(part.orx.from);
       } else if (part.type === "steer" && part.text) {
         matchReply(part.id, part.text);
       }
@@ -125,7 +132,7 @@ export function partIsVisible(part: ChatPart, activePermissionId?: string | null
   }
   // Hidden reasoning must not displace a visible tool tail during brief thinking bursts.
   if (part.type === "reasoning") return false;
-  if (part.type === "text") return Boolean(part.text);
+  if (part.type === "text") return Boolean(part.text) || Boolean(part.orx);
   return true;
 }
 
@@ -195,12 +202,8 @@ export function unreadAfterBusyChange(
   return next;
 }
 
-export function splitTurnParts(parts: ChatPart[], streaming: boolean): { work: ChatPart[]; answer: ChatPart[] } {
-  // Keep unanswered prompts in the visible conversation.
-  if (parts.some((part) => part.type === "prompt" && !part.prompt?.resolved)) {
-    return { work: [], answer: parts };
-  }
-  let finalIndex = parts.findIndex((part) => part.type === "text" && part.phase === "final_answer");
+function finalAnswerIndex(parts: ChatPart[], streaming: boolean): number {
+  let finalIndex = parts.findIndex((part) => part.type === "text" && part.phase === "final_answer" && (streaming || partIsVisible(part)));
   if (finalIndex < 0 && !streaming && !parts.some((part) => part.phase)) {
     // Older transcripts have no phase: only the trailing text can be the answer.
     for (let index = parts.length - 1; index >= 0; index--) {
@@ -210,6 +213,15 @@ export function splitTurnParts(parts: ChatPart[], streaming: boolean): { work: C
       if (part.text) finalIndex = index;
     }
   }
+  return finalIndex;
+}
+
+export function splitTurnParts(parts: ChatPart[], streaming: boolean): { work: ChatPart[]; answer: ChatPart[] } {
+  // Keep unanswered prompts in the visible conversation.
+  if (parts.some((part) => part.type === "prompt" && !part.prompt?.resolved)) {
+    return { work: [], answer: parts };
+  }
+  const finalIndex = finalAnswerIndex(parts, streaming);
   return finalIndex < 0 || (!streaming && !parts.slice(finalIndex).some((part) => partIsVisible(part))) || !parts.slice(0, finalIndex).some((part) => partIsVisible(part))
     ? { work: [], answer: parts }
     : { work: parts.slice(0, finalIndex), answer: parts.slice(finalIndex) };
@@ -219,7 +231,11 @@ export function groupResponseMessages(messages: ChatMessage[], previousGroups: C
   const groups: ChatMessage[][] = [];
   for (const message of messages) {
     const previous = groups.at(-1);
-    if (message.role === "assistant" && previous?.[0].role === "assistant" && message.parts[0]?.id !== LOCAL_ERROR_PART_ID) {
+    const providerChanged = message.parts.some((part) => part.tool === "provider_switch")
+      || previous?.[0].parts.some((part) => part.tool === "provider_switch");
+    if (message.role === "assistant" && previous?.[0].role === "assistant" && !providerChanged
+      && message.parts[0]?.id !== LOCAL_ERROR_PART_ID
+      && finalAnswerIndex(previous[previous.length - 1].parts, false) < 0) {
       previous.push(message);
     } else {
       groups.push([message]);
@@ -234,8 +250,16 @@ export function groupResponseMessages(messages: ChatMessage[], previousGroups: C
 
 export function splitResponseParts(messages: ChatMessage[], streaming: boolean, replies?: QuestionReplies) {
   const questions = messages.flatMap((message) => message.parts.filter((part) => part.prompt?.kind === "question"));
-  const turns = messages.map((original, index) => {
+  // A standalone approval would otherwise displace the answer and collapse the activity above it.
+  const approvals: ChatPart[] = [];
+  const responseMessages = messages.flatMap((original) => {
+    let hasApproval = false;
     const parts = original.parts.filter((part) => {
+      if (part.type === "prompt" && part.prompt?.kind === "permission") {
+        hasApproval = true;
+        if (partIsVisible(part)) approvals.push(part);
+        return false;
+      }
       if (part.type !== "tool" || !["question", "askuserquestion", "request_user_input", "request_user_input_async"].includes(part.tool?.toLowerCase() ?? "")) return true;
       const asked = part.state?.input?.questions;
       if (!Array.isArray(asked) || asked.length === 0) return true;
@@ -246,12 +270,14 @@ export function splitResponseParts(messages: ChatMessage[], streaming: boolean, 
       });
       return !represented || (part.state?.status === "error" && part.state.error !== "The user dismissed this question");
     });
-    const message = { ...original, parts };
-    const active = streaming && index === messages.length - 1;
+    return hasApproval && parts.length === 0 ? [] : [{ ...original, parts }];
+  });
+  const turns = responseMessages.map((message, index) => {
+    const active = streaming && index === responseMessages.length - 1;
     const split = splitTurnParts(message.parts, active);
     // A continuation's commentary belongs to activity until it has an answer.
     // A message the user wrote into it stays visible with what follows.
-    if (messages.length > 1 && active && !message.parts.some((part) =>
+    if (responseMessages.length > 1 && active && !message.parts.some((part) =>
       (part.type === "text" && part.phase === "final_answer" && Boolean(part.text))
       || (part.type === "prompt" && !part.prompt?.resolved))) {
       const steer = message.parts.findIndex((part) => part.type === "steer");
@@ -270,7 +296,14 @@ export function splitResponseParts(messages: ChatMessage[], streaming: boolean, 
     && part.prompt?.kind === "question" && part.prompt.resolved
     && ((part.prompt.answers?.length ?? 0) > 0 || Boolean(part.prompt.note) || part.prompt.approved === false));
   return {
-    answer: [...work.flatMap((turn) => turn.parts.filter(answeredQuestion)), ...(current?.answer ?? [])],
+    // In the order asked: a question answered after `current` follows it.
+    answer: [
+      ...turns.flatMap((turn, index) => [
+        ...work[index].parts.filter(answeredQuestion),
+        ...(turn === current ? turn.answer : []),
+      ]),
+      ...approvals,
+    ],
     answerMessageId: current?.message.id,
     work: work.map((turn) => ({
       ...turn,
@@ -326,19 +359,26 @@ export function transcriptFileName(title: string): string {
   return `${slug || "chat"}.md`;
 }
 
+const isModelAccessLimit = (error: string) =>
+  /^(?:(?:ActionRequiredError:\s*)?Named models unavailable\b|ZCode turn failed:\s*1113\b)/i.test(error.trim());
+
+// Older Claude transcripts stored the synthetic quota notice as text and errors.
+const isClaudeQuotaNotice = (text: string) =>
+  (/^(?:claude: )?you(?:'ve| have) reached your .+ limit\./i.test(text.trim()) && text.includes("claude.ai/settings/usage"))
+  || /^(?:claude: )?you(?:'ve| have) hit your session limit · resets /i.test(text.trim());
+
 export function isModelAccessLimitPart(part: ChatPart): boolean {
-  return part.type === "tool" && part.tool === "error"
-    && /^(?:(?:ActionRequiredError:\s*)?Named models unavailable\b|ZCode turn failed:\s*1113\b)/i.test(part.state?.error?.trim() ?? "");
+  return part.type === "tool" && part.tool === "error" && isModelAccessLimit(part.state?.error ?? "");
+}
+
+/** Whether a turn's failure means the account ran out of usage or model access. */
+export function isUsageLimitError(errorKind: unknown, error: string): boolean {
+  return errorKind === "claude_usage_limit" || isModelAccessLimit(error) || isClaudeQuotaNotice(error)
+    || /usageLimitExceeded|rateLimitExceeded|insufficient_quota|(?:usage|rate|session) limit|(?:exceeded|exhausted) (?:your |the |current )*quota|insufficient (?:credits|balance)|(?:credit|quota)[ _-](?:exhausted|exceeded)/i.test(error);
 }
 
 export function isUsageLimitPart(part: ChatPart): boolean {
-  if (isModelAccessLimitPart(part)) return true;
+  if (part.type === "tool" && part.tool === "error") return isUsageLimitError(part.state?.input?.errorKind, part.state?.error ?? "");
   if (part.state?.input?.errorKind === "claude_usage_limit") return true;
-  const text = part.type === "text" ? part.text : part.tool === "error" ? part.state?.error : null;
-  if (part.type === "tool" && part.tool === "error" && text
-    && /usageLimitExceeded|rateLimitExceeded|insufficient_quota|(?:usage|rate|session) limit|(?:exceeded|exhausted) (?:your |the |current )*quota|insufficient (?:credits|balance)|(?:credit|quota)[ _-](?:exhausted|exceeded)/i.test(text)) return true;
-  // Older Claude transcripts stored the synthetic quota notice as text and errors.
-  return Boolean(text && ((/^(?:claude: )?you(?:'ve| have) reached your .+ limit\./i.test(text.trim())
-    && text.includes("claude.ai/settings/usage"))
-    || /^(?:claude: )?you(?:'ve| have) hit your session limit · resets /i.test(text.trim())));
+  return part.type === "text" && Boolean(part.text && isClaudeQuotaNotice(part.text));
 }
