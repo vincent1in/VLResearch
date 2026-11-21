@@ -48,7 +48,7 @@ Find them all with `git grep -n 'VLResearch:'`.
 | `src/compute.rs` | `submit` (the run engine) checks the scoping gate (given the launching chat, to find the run's optimization) before any compute is spent, and the locked paths and scope against the commit it staged; then records the run's optimization and probe runs |
 | `src/plane/local_plane.rs` | `launch` passes a probe request on to the gate, which runs in the `orx up` process for launches from chat |
 | `src/commands/exp.rs` | `orx exp wait` timeout under Claude Code; a timed-out wait in a chat tells the agent to end its turn |
-| `src/invocation.rs` | The line printed after a launch mentions the automatic wake-up |
+| `src/invocation.rs` | Outside a chat's own launch, the line printed after a launch mentions the automatic wake-up; a chat's launch keeps upstream's line |
 | `src/local/harness/claude.rs` | Claude Code `api_retry` events become retry rows |
 | `src/store.rs` | `flavor_conn()` accessor |
 | `.github/workflows/release-on-bump.yml`, `release-canary.yml` | Run only in alphaXiv/OpenResearch |
