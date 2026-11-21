@@ -2,7 +2,7 @@
 # label<TAB>path<TAB>count
 piped installer	src/commands/up_remote.rs	1
 piped installer	src/local/bash.rs	1
-piped installer	src/local/demo.rs	1
+piped installer	src/local/demo.rs	2
 piped installer	src/local/harness/antigravity.rs	2
 piped installer	src/local/harness/cursor.rs	1
 piped installer	src/updates.rs	2
