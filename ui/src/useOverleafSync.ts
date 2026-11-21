@@ -1,3 +1,4 @@
+import { useWorkspace } from "./workspace";
 // The Overleaf side of a .tex tab: which Overleaf project this paper belongs to,
 // and keeping the two copies in step. Split out of FileViewer for the same
 // reason useLatexCompile was — the component already carries three file
@@ -14,31 +15,10 @@
 // for conflicts, and for whenever the live channel is down.
 
 import { useQuery } from "@tanstack/react-query";
-import {
-  isCurrentScope,
-  queryClient,
-} from "./queries/client";
-
-import { getOverleafStateQuery, getOverleafStatusQuery } from "./queries/files";
 
 import { useCallback, useMemo, useEffect, useRef, useState } from "react";
-import {
-  importOverleafSession,
-  linkOverleaf,
-  overleafUploadUrl,
-  saveOverleafSession,
-  saveOverleafToken,
-  startOverleafLive,
-  stopOverleafLive,
-  syncOverleaf,
-  unlinkOverleaf,
-  type OverleafLink,
-  type OverleafLiveStatus,
-  type OverleafResolution,
-  type OverleafState,
-  type OverleafSyncResult,
-} from "./api";
-import { onOverleafEvent } from "./events";
+import { type OverleafLink, type OverleafLiveStatus, type OverleafResolution, type OverleafSyncResult } from "./api";
+import { mutImportOverleafSession, mutLinkOverleaf, mutSaveOverleafSession, mutSaveOverleafToken, mutSyncOverleaf, mutUnlinkOverleaf } from "./queries/overleaf";
 
 /** How often a linked paper asks whether Overleaf has moved. The question is
  * one request that transfers nothing; a clone follows only when it has. */
@@ -117,6 +97,12 @@ export function useOverleafSync({
   /** A sync wrote these files; the viewer reloads when its own is among them. */
   onPulled: (paths: string[]) => void;
 }): OverleafSync {
+  const workspace = useWorkspace();
+  const { getOverleafStateQuery, getOverleafStatusQuery } = workspace.queries;
+  const { queryClient } = workspace;
+  const { startOverleafLive, stopOverleafLive, overleafUploadUrl } = workspace.api;
+  const { onOverleafEvent } = workspace.events;
+
   const options = useMemo(() => getOverleafStateQuery(projectId, filePath, { sessionId }), [projectId, filePath, sessionId]);
   const stateQuery = useQuery({ ...options, enabled, subscribed: enabled });
   const hasToken = stateQuery.data?.hasToken ?? false;
@@ -130,20 +116,6 @@ export function useOverleafSync({
   const [error, setError] = useState<string | null>(null);
   const [staleOnDisk, setStaleOnDisk] = useState(false);
 
-  // The cookie is machine-wide, so it rides the same cached state the token
-  // does rather than a copy of its own.
-  const setSession = useCallback(
-    (hasSession: boolean) => {
-      if (isCurrentScope(options.queryKey)) {
-        queryClient.setQueryData(options.queryKey, (state) => state && { ...state, hasSession });
-      }
-    },
-    [options],
-  );
-
-  const apply = useCallback((state: OverleafState) => {
-    if (isCurrentScope(options.queryKey)) queryClient.setQueryData(options.queryKey, state);
-  }, [options]);
   useEffect(() => {
     setLast(null);
     setLiveAttempt(0);
@@ -180,7 +152,7 @@ export function useOverleafSync({
       syncingRef.current = true;
       setSyncing(true);
       setError(null);
-      syncOverleaf(projectId, filePath, { sessionId, resolve })
+      mutSyncOverleaf.runAsHeadlessPromise(workspace, projectId, filePath, sessionId ?? null, resolve ?? null, {})
         .then((result) => {
           failedRef.current = false;
           setLast(result);
@@ -349,22 +321,19 @@ export function useOverleafSync({
     reloaded: () => setStaleOnDisk(false),
     uploadUrl: overleafUploadUrl(projectId, filePath, { sessionId }),
     saveToken: async (token: string) => {
-      const result = await saveOverleafToken(token);
+      await mutSaveOverleafToken.runAsHeadlessPromise(workspace, token, {});
       syncedMarker.current = null;
       failedRef.current = false;
       setError(null);
-      if (isCurrentScope(options.queryKey)) queryClient.setQueryData(options.queryKey, (state) => state && { ...state, hasToken: result.hasToken });
     },
     saveSession: async (session: string) => {
-      const result = await saveOverleafSession(session, { host: link?.host });
-      setSession(result.hasSession);
+      await mutSaveOverleafSession.runAsHeadlessPromise(workspace, session, link?.host ?? null, {});
       // A new cookie is the answer to a refused channel; ask again with it.
       retryRef.current = true;
       setLiveAttempt((n) => n + 1);
     },
     importSession: async () => {
-      const result = await importOverleafSession({ host: link?.host });
-      setSession(result.hasSession);
+      const result = await mutImportOverleafSession.runAsHeadlessPromise(workspace, link?.host ?? null, {});
       retryRef.current = true;
       setLiveAttempt((n) => n + 1);
       return result.source;
@@ -376,11 +345,11 @@ export function useOverleafSync({
       setLive(null);
       agreed.current = false;
       syncedMarker.current = null;
-      apply(await linkOverleaf(projectId, filePath, { project, sessionId }));
+      await mutLinkOverleaf.runAsHeadlessPromise(workspace, projectId, filePath, project, sessionId ?? null, {});
       onManualAction?.();
     },
     unlink: async () => {
-      apply(await unlinkOverleaf(projectId, filePath, { sessionId }));
+      await mutUnlinkOverleaf.runAsHeadlessPromise(workspace, projectId, filePath, sessionId ?? null, {});
       syncedMarker.current = null;
       failedRef.current = false;
       setLast(null);

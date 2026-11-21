@@ -1,0 +1,135 @@
+import { useLayoutEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Folder, MessageCircleDashed, Search } from "lucide-react";
+import type { Project, ProjectIcon } from "../api";
+import { m } from "../paraglide/messages.js";
+import { useWorkspace } from "../workspace";
+import { AgentIconTile, IconPicker, IconPickerButton, TILE_SIZES, type Logo } from "./AgentIcon";
+import { Button, Input, Spinner, Tooltip } from "./ui";
+
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp|svg|ico)$/i;
+const LIKELY_ICON = /(^|[/_.-])(logo|icon|favicon|brand|mark|avatar)/i;
+const PROJECT_TABS = ["icons", "emoji", "image", "repo"] as const;
+
+/** Two letters for a name: the first of its first two words, else its first two. */
+export function projectInitials(name: string) {
+  const words = name.replace(/(\p{Ll})(\p{Lu})/gu, "$1 $2").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const letters = words.length > 1 ? words.slice(0, 2).map((word) => [...word][0]) : [...(words[0] ?? "?")].slice(0, 2);
+  return letters.join("").toUpperCase();
+}
+
+const initialsMark = (name: string): Logo => (size) => <Initials text={projectInitials(name)} size={size} />;
+
+/** Initials at the tile's type size, shrunk to keep a margin when wide letters ("MW") would crowd it. */
+function Initials({ text, size }: { text: string; size: number }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const [scale, setScale] = useState(1);
+  useLayoutEffect(() => {
+    const span = ref.current;
+    const room = span?.parentElement?.clientWidth;
+    if (!span?.offsetWidth || !room) return;
+    const natural = span.offsetWidth * size * 0.8 / parseFloat(span.style.fontSize);
+    setScale(Math.min(1, room * 0.8 / natural));
+  }, [text, size]);
+  return <span ref={ref} className="whitespace-nowrap font-bold leading-none" style={{ fontSize: size * 0.8 * scale }}>{text}</span>;
+}
+
+export function ProjectIconTile({ project, size = "xs" }: {
+  project: Project;
+  size?: "sm" | "xs" | "md" | "lg";
+}) {
+  const { projectFileUrl } = useWorkspace().api;
+  const { icon } = project;
+  // Until it has an icon of its own, a project nobody named wears an empty chat bubble; its tile says so on hover.
+  if (project.unnamed && !icon) return (
+    <Tooltip content={m.projects_home_new_project()} className={`inline-flex shrink-0 items-center justify-center text-muted ${TILE_SIZES[size].box}`}>
+      <MessageCircleDashed size={TILE_SIZES[size].mark + 2} aria-hidden="true" />
+    </Tooltip>
+  );
+  if (!icon) return (
+    <span aria-hidden="true" className={`inline-flex shrink-0 items-center justify-center ${TILE_SIZES[size].box}`}>
+      <Folder size={TILE_SIZES[size].mark + 5} />
+    </span>
+  );
+  return (
+    <AgentIconTile
+      icon={icon}
+      brand={initialsMark(project.name)}
+      size={size}
+      fill
+      fileUrl={(path) => projectFileUrl(project.id, path)}
+    />
+  );
+}
+
+/** The project's tile opening the icon picker; `name` is the one being typed, so the initials follow it. */
+export function ProjectIconButton({ project, name, onChange, disabled, compact }: {
+  project: Project;
+  name: string;
+  onChange: (icon: ProjectIcon | null) => void;
+  disabled?: boolean;
+  compact?: boolean;
+}) {
+  const { projectFileUrl } = useWorkspace().api;
+  const shown = { ...project, name };
+  const { icon } = project;
+  return (
+    <IconPickerButton tile={<ProjectIconTile project={shown} size={compact ? "xs" : "lg"} />} disabled={disabled} compact={compact}>
+      <IconPicker
+        value={icon}
+        brand={initialsMark(name)}
+        brandLabel={m.icon_project_initials()}
+        tabs={PROJECT_TABS}
+        fileUrl={(path) => projectFileUrl(project.id, path)}
+        repo={(pick) => <RepoImages projectId={project.id} selected={icon && "file" in icon ? icon.file : null} onPick={pick} />}
+        onChange={onChange}
+        onReset={() => onChange(null)}
+      />
+    </IconPickerButton>
+  );
+}
+
+const CELL = "grid h-8.5 place-items-center rounded-lg border border-transparent outline-none hover:bg-hover-muted focus-visible:outline-2 focus-visible:outline-focus aria-checked:border-border aria-checked:bg-hover-muted";
+
+/** The images in the project's checkout, logos and icons first. */
+function RepoImages({ projectId, selected, onPick }: { projectId: string; selected: string | null; onPick: (file: string) => void }) {
+  const { api: { projectFileUrl }, queries: { getCodeTreeQuery } } = useWorkspace();
+  const tree = useQuery(getCodeTreeQuery(projectId));
+  const [query, setQuery] = useState("");
+
+  const search = query.trim().toLowerCase();
+  const images = (tree.data?.entries ?? [])
+    .filter((path) => IMAGE_FILE.test(path) && (!search || path.toLowerCase().includes(search)))
+    .sort((left, right) => Number(LIKELY_ICON.test(right)) - Number(LIKELY_ICON.test(left)) || left.length - right.length);
+  const shown = images.slice(0, 80);
+
+  return (
+    <div className="grid gap-2">
+      <label className="relative block">
+        <span className="sr-only">{m.icon_repo_search()}</span>
+        <Search size={14} className="pointer-events-none absolute start-2.5 top-1/2 -translate-y-1/2 text-muted" aria-hidden="true" />
+        <Input type="search" autoComplete="off" spellCheck={false} placeholder={m.icon_repo_search()} value={query} onChange={(event) => setQuery(event.target.value)} className="ps-8 [&::-webkit-search-cancel-button]:hidden" />
+      </label>
+      <div className="h-48 overflow-y-auto pe-1">
+        {tree.isPending ? (
+          <div role="status" className="grid h-full place-items-center"><Spinner /></div>
+        ) : tree.isError ? (
+          <div role="alert" className="grid justify-items-center gap-2 py-8 text-center text-sm text-subtext">
+            {m.icon_repo_error()}
+            <Button size="small" onClick={() => void tree.refetch()}>{m.app_retry()}</Button>
+          </div>
+        ) : shown.length === 0 ? (
+          <p role="status" className="m-0 py-8 text-center text-sm text-subtext">{search ? m.icon_repo_no_match({ query: query.trim() }) : m.icon_repo_none()}</p>
+        ) : (
+          <div role="radiogroup" aria-label={m.icon_tab_repo()} className="grid grid-cols-[repeat(auto-fill,minmax(2rem,1fr))] gap-1">
+            {shown.map((path) => (
+              <button key={path} type="button" role="radio" aria-checked={path === selected} aria-label={path} title={path} className={CELL} onClick={() => onPick(path)}>
+                <img alt="" draggable={false} loading="lazy" className="size-6 object-contain" src={projectFileUrl(projectId, path)} />
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

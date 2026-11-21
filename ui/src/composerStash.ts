@@ -2,10 +2,57 @@ import type { ChatTextAnnotation, TurnOptions } from "./api";
 
 /** Per-chat stash for unsent composer content (draft, attachments, annotations). */
 export interface ComposerAttachment {
+  /** Unique across composers; the draft cites it as `[Image #id]`, `[PDF #id]` or `[File #id]`. */
+  id: number;
   dataUrl: string;
   mediaType: string;
   name?: string;
   size: number;
+}
+
+let lastAttachmentId = 0;
+
+export function nextAttachmentId(): number {
+  return ++lastAttachmentId;
+}
+
+/** The image types agents read as pictures; any other file attaches as a file. */
+export const isPictureType = (mediaType: string) => /^image\/(png|jpeg|gif|webp)$/.test(mediaType);
+
+/** A saved attachment's file name, by the extensions the server gives pictures. */
+export const PICTURE_FILE = /\.(png|jpg|gif|webp)$/i;
+
+export function attachmentToken(attachment: Pick<ComposerAttachment, "id" | "mediaType">): string {
+  const kind = attachment.mediaType === "application/pdf" ? "PDF" : isPictureType(attachment.mediaType) ? "Image" : "File";
+  return `[${kind} #${attachment.id}]`;
+}
+
+export const ATTACHMENT_KINDS = "Image|PDF|File";
+
+export const ATTACHMENT_TOKEN = new RegExp(String.raw`\[(?:${ATTACHMENT_KINDS}) #(\d+)\]`, "g");
+
+/** A message as its bubble shows it beside the attachments: each token goes, with one space beside it. */
+export function withoutAttachmentTokens(text: string): string {
+  const token = ATTACHMENT_TOKEN.source;
+  // Lines the tokens leave empty at the start go, but the first kept line keeps its indentation.
+  return text.replace(new RegExp(`${token} ?| ?${token}`, "g"), "").replace(/^(?:[ \t]*\n)+/, "").trimEnd();
+}
+
+/** The attachments a draft cites, in order of first mention, with each token
+ * renumbered from 1 so the text and the attachment list agree. Uncited
+ * attachments were deleted from the text and are dropped. */
+export function citedAttachments(
+  draft: string,
+  attachments: ComposerAttachment[],
+): { text: string; attachments: ComposerAttachment[] } {
+  const cited: ComposerAttachment[] = [];
+  const text = draft.replace(ATTACHMENT_TOKEN, (token, id: string) => {
+    const attachment = attachments.find((candidate) => candidate.id === Number(id));
+    if (!attachment) return token;
+    if (!cited.includes(attachment)) cited.push(attachment);
+    return attachmentToken({ ...attachment, id: cited.indexOf(attachment) + 1 });
+  });
+  return { text, attachments: cited };
 }
 
 export interface ComposerAnnotation extends ChatTextAnnotation {
@@ -44,17 +91,39 @@ export function composerStashContent(
   };
 }
 
-const composerSeeds = new Map<string, string>();
-
-/** A prompt for a new project's first chat, offered until the project has a chat. */
-export function seedComposer(projectId: string, prompt: string): void {
-  composerSeeds.set(projectId, prompt);
+/** A failed send's content returned to a composer that may have moved on: the failed draft leads. */
+export function mergeFailedComposer(current: ComposerStash, failed: ComposerStash): ComposerStash {
+  const annotations = [...current.annotations];
+  for (const annotation of failed.annotations) {
+    if (annotations.some((item) => item.id === annotation.id && item.text === annotation.text)) continue;
+    let id = annotation.id;
+    while (annotations.some((item) => item.id === id)) id += ":recovered";
+    annotations.unshift(id === annotation.id ? annotation : { ...annotation, id });
+  }
+  return {
+    draft: [failed.draft, current.draft].filter(Boolean).join("\n\n"),
+    attachments: [...failed.attachments.filter((item) => !current.attachments.includes(item)), ...current.attachments],
+    annotations,
+    unconfirmedSend: current.unconfirmedSend ?? failed.unconfirmedSend,
+    pendingClientTurn: current.pendingClientTurn ?? failed.pendingClientTurn,
+  };
 }
 
-export function composerSeed(projectId: string): string | null {
-  return composerSeeds.get(projectId) ?? null;
-}
-
-export function forgetComposerSeed(projectId: string): void {
-  composerSeeds.delete(projectId);
+export function createComposerState() {
+  const composerSeeds = new Map<string, string>();
+  return {
+    composerStashes: new Map<string, ComposerStash>(),
+    mountedComposers: new Map<string, (failed: ComposerStash) => void>(),
+    /** A seed is text only, so the attachments it cites stay behind and their tokens go. */
+    seedComposer(projectId: string, prompt: string) {
+      const text = prompt.replace(ATTACHMENT_TOKEN, "");
+      if (text.trim()) composerSeeds.set(projectId, text);
+    },
+    composerSeed(projectId: string) {
+      return composerSeeds.get(projectId) ?? null;
+    },
+    forgetComposerSeed(projectId: string) {
+      composerSeeds.delete(projectId);
+    },
+  };
 }

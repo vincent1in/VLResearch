@@ -3,10 +3,14 @@ import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
 import { FlaskConical, CircleStop, FolderTree, Terminal } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { fmtNumber, runDisplayStatus, timeAgo, type Experiment, type Run } from "../api";
+import { fmtNumber, type Experiment, type Run } from "../api";
+import { runActive, runDisplay, runStoppable } from "../runDisplay";
 import { StatusBadge } from "./StatusBadge";
+import { RunTiming } from "./RunTiming";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { IconButton, Tooltip } from "./ui";
+import { confirmStop } from "./run/confirmStop";
+import { useWorkspace } from "../workspace";
 import { ArchiveMenu, type ArchiveActions } from "./ArchiveMenu";
 import { Rail, type HistoryOrder, type Placed } from "./ExperimentLineage";
 import { buildHistoryNodes, laneCount, layoutChronological, layoutLineage } from "./experimentLineageModel";
@@ -40,8 +44,7 @@ export function ExperimentsTable({
   onDelete: (id: string) => void;
   onCancel: (runId: string) => Promise<void>;
 }) {
-  const [pendingCancellation, setPendingCancellation] = useState<ReadonlySet<string>>(new Set());
-  const [cancelError, setCancelError] = useState<string | null>(null);
+  const { dialogs } = useWorkspace();
   const listRef = useRef<HTMLDivElement>(null);
   const [placed, setPlaced] = useState<Placed[]>([]);
   const rows = useMemo(() => {
@@ -89,28 +92,8 @@ export function ExperimentsTable({
     );
   }
 
-  async function requestCancel(runId: string) {
-    setCancelError(null);
-    setPendingCancellation((current) => new Set(current).add(runId));
-    try {
-      await onCancel(runId);
-    } catch (cause) {
-      setPendingCancellation((current) => {
-        const next = new Set(current);
-        next.delete(runId);
-        return next;
-      });
-      setCancelError(cause instanceof Error ? cause.message : String(cause));
-    }
-  }
-
   return (
     <div className="experiments-table-wrap absolute inset-0 overflow-auto bg-background @container">
-      {cancelError && (
-        <div className="experiments-table-error py-2 px-3 text-accent-red text-sm border-b border-b-border" role="alert">
-          {m.experiments_table_stop_failed()} {cancelError}
-        </div>
-      )}
       <div ref={listRef} data-keyboard-list className="experiments-table relative w-full text-sm bg-background" role="list" aria-label={m.experiments_table_experiments()}>
         {showLineage && <Rail placed={placed} height={lastPlaced ? lastPlaced.top + lastPlaced.height : 0} path={NO_HIGHLIGHT} selectedId={null} />}
         {rows.map((row) => {
@@ -118,26 +101,15 @@ export function ExperimentsTable({
           const experiment = row.node.experiment;
           const experimentRuns = runsByExperiment.get(experiment.id) ?? [];
           const latestRun = experimentRuns[0] ?? null;
-          const liveRun = experimentRuns.find(
-            (run) => run.status === "running" || run.status === "starting",
-          );
+          const liveRun = experimentRuns.find((run) => runActive(run.status));
           const logsRun = liveRun ?? latestRun;
-          const cancelling = Boolean(
-            liveRun && (liveRun.cancelRequested || pendingCancellation.has(liveRun.id)),
-          );
-          const status = liveRun
-            ? cancelling
-              ? "cancelling"
-              : runDisplayStatus(liveRun)
-            : latestRun
-              ? runDisplayStatus(latestRun)
-              : "idle";
+          const display = logsRun ? runDisplay(logsRun) : { status: "idle" };
 
           return (
             <div
               key={experiment.id}
               style={{ paddingLeft: showLineage ? railWidth + 12 : 20 }}
-              className="experiment-table-group grid min-h-11 grid-cols-[minmax(0,_1fr)_4.5rem_4rem_4rem_auto] [grid-template-areas:'name_status_attempts_latest_actions'] items-center gap-x-3 gap-y-1 py-2 pe-3 border-b border-b-divider-subtle bg-background cursor-pointer [&:hover]:bg-surface [&:last-child]:border-b-0 [@container(max-width:640px)]:grid-cols-[auto_auto_minmax(0,_1fr)_auto] [@container(max-width:640px)]:[grid-template-areas:'name_name_name_name'_'status_attempts_latest_actions'] [@container(max-width:640px)]:gap-x-3"
+              className="experiment-table-group grid min-h-11 grid-cols-[minmax(0,_1fr)_9.5rem_4rem_11.5rem_7.75rem] [grid-template-areas:'name_status_attempts_latest_actions'] items-center gap-x-3 gap-y-1 py-2 pe-3 border-b border-b-divider-subtle bg-background cursor-pointer [&:hover]:bg-surface [&:last-child]:border-b-0 @max-3xl:grid-cols-[minmax(0,_1fr)_auto] @max-3xl:[grid-template-areas:'name_actions'_'meta_meta']"
               role="listitem"
               onClick={() => onOpen(experiment, "preview")}
               onDoubleClick={() => onOpen(experiment, "keepOpen")}
@@ -160,14 +132,17 @@ export function ExperimentsTable({
                 </button>
                 {experiment.archived && <span className="text-muted text-xs">{m.tree_archived()}</span>}
               </div>
-              <div className="experiment-table-status [grid-area:status] min-w-0">
-                <StatusBadge status={status} />
-              </div>
-              <div className="experiment-run-summary [grid-area:attempts] flex items-center gap-2 whitespace-nowrap text-sm text-subtext">
-                <span>{experimentRuns.length === 1 ? m.experiments_one_run() : m.experiments_run_count({ count: fmtNumber(experimentRuns.length) })}</span>
-              </div>
-              <div className="experiment-table-latest [grid-area:latest] whitespace-nowrap text-xs tabular-nums text-subtext">
-                {latestRun ? timeAgo(latestRun.createdAt) : "–"}
+              {/* Columns when wide; one full-width line under the title when narrow, clear of the actions. */}
+              <div className="experiment-table-meta contents @max-3xl:flex @max-3xl:[grid-area:meta] @max-3xl:min-w-0 @max-3xl:items-center @max-3xl:gap-x-3">
+                <div className="experiment-table-status [grid-area:status] min-w-0">
+                  <StatusBadge {...display} className="max-w-full" />
+                </div>
+                <div className="experiment-run-summary [grid-area:attempts] flex items-center gap-2 whitespace-nowrap text-sm text-subtext">
+                  <span>{experimentRuns.length === 1 ? m.experiments_one_run() : m.experiments_run_count({ count: fmtNumber(experimentRuns.length) })}</span>
+                </div>
+                <div className="experiment-table-latest [grid-area:latest] min-w-0 text-xs text-subtext">
+                  {latestRun ? <RunTiming run={latestRun} className="grid grid-cols-[minmax(max-content,_6rem)_minmax(0,_1fr)] @max-lg:grid-cols-1" /> : "–"}
+                </div>
               </div>
               <div
                 className="experiment-table-actions [grid-area:actions] flex items-center justify-end gap-1"
@@ -200,14 +175,14 @@ export function ExperimentsTable({
                     <FolderTree size={16} />
                   </IconButton>
                 </Tooltip>
-                {liveRun && (
-                  <Tooltip interactive content={cancelling ? m.experiments_stop_requested() : m.experiments_stop_run()}>
+                {liveRun && runStoppable(liveRun) && (
+                  <Tooltip interactive content={m.experiments_stop_run()}>
                     <IconButton
                       size="small"
-                      variant="stop"
-                      disabled={cancelling}
-                      aria-label={cancelling ? m.common_stopping() : m.common_stop()}
-                      onClick={() => void requestCancel(liveRun.id)}
+                      variant="filled"
+                      aria-label={m.common_stop()}
+                      aria-haspopup="dialog"
+                      onClick={() => confirmStop(dialogs, experiment.title || experiment.slug, () => onCancel(liveRun.id))}
                     >
                       <CircleStop size={16} />
                     </IconButton>

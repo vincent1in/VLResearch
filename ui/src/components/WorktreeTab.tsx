@@ -1,15 +1,11 @@
-import { showConfirmDialog } from "../dialog";
+import { useWorkspace } from "../workspace";
+
 import { FolderOpen } from "lucide-react";
 import { WorkspaceEmptyState } from "./WorkspaceEmptyState";
 import { isImmutableQuery } from "../queries/invalidation";
+import { mutManageProjectFile } from "../queries/files";
 import { useQuery } from "@tanstack/react-query";
-import { listChatSessionsQuery } from "../queries/chat";
-import {
-  workspaceKey,
-  queryClient,
-} from "../queries/client";
 
-import { getCodeTreeQuery, getSessionWorktreeQuery } from "../queries/files";
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
 // The pinned Files home for the active chat session's private worktree — what
@@ -29,12 +25,7 @@ import { ltr } from "../i18n";
 // CodeTab's staleness handling.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  githubBranchUrl,
-  manageProjectFile,
-  revealFileInManager,
-  type Project,
-} from "../api";
+import { githubBranchUrl, type FileAction, type Project } from "../api";
 
 import { CodeBrowserHeader, type CodeBrowserView } from "./CodeBrowserHeader";
 import { buildTree, TreeLevel } from "./codeTree";
@@ -82,6 +73,13 @@ export function WorktreeTab({
   ) => void;
   canRenameFile: (path: string) => boolean;
 }) {
+  const { showConfirmDialog } = useWorkspace().dialogs;
+
+  const { listChatSessionsQuery, getSessionWorktreeQuery, getCodeTreeQuery } = useWorkspace().queries;
+  const workspace = useWorkspace();
+  const { queryClient, workspaceKey } = workspace;
+  const { revealFileInManager } = workspace.api;
+
   const projectId = project.id;
   const sessions = useQuery(listChatSessionsQuery(projectId));
   const busy = sessions.data?.some((session) => session.id === sessionId && session.busy) ?? false;
@@ -130,16 +128,7 @@ export function WorktreeTab({
       ? onOpenFile(path, sessionId, undefined, intent)
       : onOpenFile(path, undefined, project.baselineBranch, intent);
   const canManageFiles = tree?.root === "worktree";
-  const manage = async (path: string, action: Parameters<typeof manageProjectFile>[2]) => {
-    try {
-      await manageProjectFile(projectId, path, action, {
-        sessionId,
-      });
-      load();
-    } catch (error) {
-      showAlert(error instanceof Error ? error.message : String(error), "error");
-    }
-  };
+  const manage = (path: string, action: FileAction) => mutManageProjectFile.run(workspace, projectId, sessionId, path, action);
   const copyPath = (path: string) => {
     const root = tree?.path ?? project.repoPath;
     copyFilePath(root, path);
@@ -221,7 +210,7 @@ export function WorktreeTab({
                 }}
                 onRename={(path, name) => {
                   setRenamingPath(null);
-                  void manage(path, { action: "rename", newName: name });
+                  manage(path, { action: "rename", newName: name });
                 }}
                 onCancelRename={() => setRenamingPath(null)}
               />
@@ -240,7 +229,7 @@ export function WorktreeTab({
             ? () => setRenamingPath(contextMenu.path)
             : undefined}
           onDuplicate={canManageFiles
-            ? () => void manage(contextMenu.path, { action: "duplicate" })
+            ? () => manage(contextMenu.path, { action: "duplicate" })
             : undefined}
           onCopyPath={() => copyPath(contextMenu.path)}
           onDelete={canManageFiles
@@ -251,8 +240,7 @@ export function WorktreeTab({
                 destructive: true,
                 confirmLabel: m.chat_panel_delete(),
                 onConfirm: async () => {
-                  await manageProjectFile(projectId, contextMenu.path, { action: "delete" }, { sessionId });
-                  load();
+                  await mutManageProjectFile.runAsHeadlessPromise(workspace, projectId, sessionId, contextMenu.path, { action: "delete" }, {});
                 },
                 onCancel: "close",
               });

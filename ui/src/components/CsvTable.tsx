@@ -15,7 +15,9 @@ import {
 } from "@tanstack/react-table";
 import { ArrowDown, ArrowUp, Search } from "lucide-react";
 import { useDeferredValue, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { FILE_PREVIEW_BYTES } from "../api";
 import { detectDelimiter, parseCsv } from "../csv";
+import { fmtBytes } from "../i18n";
 import { m } from "../paraglide/messages.js";
 import type { FileScrollPosition } from "./FileViewer";
 import { Input } from "./ui";
@@ -116,6 +118,7 @@ export function CsvTable({
   const scrollRef = useRef<HTMLDivElement>(null);
   const initialScroll = useRef(scrollPosition);
   const virtualizer = useVirtualizer({
+    useFlushSync: false,
     count: rows.length,
     getScrollElement: () => scrollRef.current,
     getItemKey: (index) => rows[index].id,
@@ -168,7 +171,7 @@ export function CsvTable({
       </div>
       {truncated && (
         <div className="file-view-note shrink-0 border-b border-b-border-variant py-2 px-4 text-sm text-muted">
-          {m.file_viewer_file_truncated_showing_the_first_512_kb()}
+          {m.file_viewer_file_truncated({ size: fmtBytes(FILE_PREVIEW_BYTES) })}
         </div>
       )}
       <div

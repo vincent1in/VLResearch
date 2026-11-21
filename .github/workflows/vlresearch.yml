@@ -16,9 +16,10 @@ jobs:
     name: secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Fetch upstream release tags
         run: git fetch --quiet --tags https://github.com/alphaXiv/OpenResearch.git
@@ -30,7 +31,9 @@ jobs:
     name: egress audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: No new network call sites outside the egress gate
         run: python3 flavor/scripts/egress_audit.py

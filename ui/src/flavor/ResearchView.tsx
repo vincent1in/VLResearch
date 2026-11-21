@@ -4,12 +4,11 @@
 // score), its idea queue by title and its brief with its budget, then the
 // project's findings ledger. The user starts optimizations here (the setup
 // form) and confirms their briefs here; the agent and `orx` write the rest.
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardList, FlaskConical, Lightbulb, Lock, MessageSquare, MessagesSquare, Play, Plus, Settings2, Target, TriangleAlert } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
-import { sendChatMessage } from "../api";
 import { Button, IconButton, Tooltip } from "../components/ui";
-import { workspaceKey } from "../queries/client";
+import { useWorkspace, type Workspace } from "../workspace";
 import { ResearchSetup, refreshResearch } from "./ResearchSetup";
 import {
   CONFIRMED_MESSAGE,
@@ -54,26 +53,28 @@ const POLL_MS = 30_000;
 /** Rows a list shows before "Show all". */
 const LIST_LIMIT = 6;
 
-async function fetchJson<T>(url: string, parse: (value: unknown) => T, signal: AbortSignal): Promise<T> {
-  const response = await fetch(url, { signal });
+async function fetchJson<T>(request: Workspace["request"], url: string, parse: (value: unknown) => T, signal: AbortSignal): Promise<T> {
+  const response = await request(url, { signal });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return parse(await response.json());
 }
 
 function useProjectData<T>(projectId: string, family: string, path: string, parse: (value: unknown) => T) {
+  const { workspaceKey, request } = useWorkspace();
   return useQuery({
     queryKey: workspaceKey(family, projectId),
-    queryFn: ({ signal }) => fetchJson(`/api/vlresearch/projects/${encodeURIComponent(projectId)}/${path}`, parse, signal),
+    queryFn: ({ signal }) => fetchJson(request, `/api/vlresearch/projects/${encodeURIComponent(projectId)}/${path}`, parse, signal),
     refetchInterval: POLL_MS,
     retry: false,
   });
 }
 
 function useOptimizationData<T>(optimizationId: string | null, family: string, path: string, parse: (value: unknown) => T) {
+  const { workspaceKey, request } = useWorkspace();
   return useQuery({
     queryKey: workspaceKey(family, optimizationId),
     queryFn: ({ signal }) =>
-      fetchJson(`/api/vlresearch/optimizations/${encodeURIComponent(optimizationId ?? "")}/${path}`, parse, signal),
+      fetchJson(request, `/api/vlresearch/optimizations/${encodeURIComponent(optimizationId ?? "")}/${path}`, parse, signal),
     enabled: optimizationId !== null,
     refetchInterval: POLL_MS,
     retry: false,
@@ -513,19 +514,19 @@ const BUDGET_TONE = { normal: "bg-accent-blue", warn: "bg-accent-amber", alert: 
 
 /** The user confirms the brief; the chat that runs the optimization is told. */
 function useConfirmBrief(optimizationId: string) {
-  const queryClient = useQueryClient();
+  const workspace = useWorkspace();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const confirm = async () => {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch(`/api/vlresearch/optimizations/${encodeURIComponent(optimizationId)}/brief/confirm`, { method: "POST" });
+      const response = await workspace.request(`/api/vlresearch/optimizations/${encodeURIComponent(optimizationId)}/brief/confirm`, { method: "POST" });
       if (!response.ok) throw new Error((await response.text()) || `HTTP ${response.status}`);
       const confirmed = parseBrief(await response.json());
       const chat = confirmed.brief?.chatSessionId;
-      if (chat) await sendChatMessage(chat, CONFIRMED_MESSAGE);
-      await refreshResearch(queryClient);
+      if (chat) await workspace.api.sendChatMessage(chat, CONFIRMED_MESSAGE);
+      await refreshResearch(workspace);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {

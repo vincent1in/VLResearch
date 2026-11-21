@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronDown, ChevronRight, Clock, FlaskConical, ListChecks, TriangleAlert, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { ChatMessage } from "../api";
-import { workspaceKey } from "../queries/client";
+import { useWorkspace, type Workspace } from "../workspace";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { checklistCounts, currentItem, latestChecklist, type ChecklistItem } from "./checklist";
 import {
@@ -21,8 +21,8 @@ import {
 const LIVE_POLL_MS = 5_000;
 const IDLE_POLL_MS = 30_000;
 
-async function fetchSessionProgress(sessionId: string, signal: AbortSignal): Promise<SessionProgress> {
-  const response = await fetch(`/api/vlresearch/sessions/${encodeURIComponent(sessionId)}/progress`, { signal });
+async function fetchSessionProgress(request: Workspace["request"], sessionId: string, signal: AbortSignal): Promise<SessionProgress> {
+  const response = await request(`/api/vlresearch/sessions/${encodeURIComponent(sessionId)}/progress`, { signal });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return parseSessionProgress(await response.json());
 }
@@ -68,9 +68,10 @@ export function ProgressStrip({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const { workspaceKey, request } = useWorkspace();
   const progress = useQuery({
     queryKey: workspaceKey("vlresearchProgress", sessionId),
-    queryFn: ({ signal }) => fetchSessionProgress(sessionId, signal),
+    queryFn: ({ signal }) => fetchSessionProgress(request, sessionId, signal),
     refetchInterval: (query) => (hasLiveWork(busy, query.state.data) ? LIVE_POLL_MS : IDLE_POLL_MS),
     retry: false,
   });

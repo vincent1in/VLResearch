@@ -1,12 +1,11 @@
+import { useWorkspace } from "../workspace";
+import { mutCancelRun } from "../queries/projects";
+import { confirmStop } from "./run/confirmStop";
 import { m } from "../paraglide/messages.js";
 import { ChartLine, ChevronDown, CircleStop, ExternalLink, ScrollText } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
-  cancelRun,
-  runDisplayStatus,
-  runMonitoringError,
   timeAgo,
-  trackioRunUrl,
   type Experiment,
   type Project,
   type Run,
@@ -14,12 +13,14 @@ import {
 import { ExperimentOverview } from "./ExperimentOverview";
 import type { CodeView } from "./CodeTab";
 import { LogTerminal } from "./LogTerminal";
+import type { LogSeek } from "../logWindow";
+import { RunContactNotice } from "./RunContactNotice";
 import { StatusBadge } from "./StatusBadge";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { useResolvedTheme } from "../theme";
 import { Button, ButtonLink, MenuItem } from "./ui";
 import { buildHistoryNodes } from "./experimentLineageModel";
-import { useTrackioRuns } from "../queries/settings";
+import { runActive, runDisplay, runStoppable } from "../runDisplay";
 
 export type ExperimentView = "overview" | "terminal" | "trackio";
 
@@ -37,6 +38,8 @@ export function DetailDrawer({
   onOpenView,
   onOpenCode,
   onOpenExperiment,
+  logSeek = null,
+  onLogSeekTaken,
 }: {
   experiment: Experiment;
   experiments: Experiment[];
@@ -50,6 +53,9 @@ export function DetailDrawer({
   onOpenView: (view: ExperimentView, runId: string | undefined, intent: TabOpenIntent) => void;
   onOpenCode: (view: CodeView, intent: TabOpenIntent) => void;
   onOpenExperiment: (id: string, intent: TabOpenIntent) => void;
+  /** Where the user asked a run's log to open; the log of that run takes it. */
+  logSeek?: (LogSeek & { runId: string }) | null;
+  onLogSeekTaken?: (seek: LogSeek) => void;
 }) {
   const expRuns = runs
     .filter((r) => r.experimentId === experiment.id)
@@ -65,6 +71,8 @@ export function DetailDrawer({
         parentExperiment={parentExperiment}
         project={project}
         runs={expRuns}
+        selectedRunId={selectedRunId}
+        onOpenRun={(runId, intent) => onOpenView("overview", runId, intent)}
         onOpenLogs={(runId, intent) => onOpenView("terminal", runId, intent)}
         onOpenTrackio={(runId, intent) => onOpenView("trackio", runId, intent)}
         onOpenCode={(intent) => onOpenCode("files", intent)}
@@ -81,6 +89,8 @@ export function DetailDrawer({
       selectedRunId={selectedRunId}
       onSelectRun={onSelectRun}
       onOpenView={onOpenView}
+      logSeek={logSeek}
+      onLogSeekTaken={onLogSeekTaken}
    />
   );
 }
@@ -97,6 +107,8 @@ function TerminalView({
   selectedRunId,
   onSelectRun,
   onOpenView,
+  logSeek,
+  onLogSeekTaken,
 }: {
   experiment: Experiment;
   expRuns: Run[];
@@ -104,17 +116,19 @@ function TerminalView({
   selectedRunId: string | null;
   onSelectRun: (id: string | null) => void;
   onOpenView: (view: ExperimentView, runId: string | undefined, intent: TabOpenIntent) => void;
+  logSeek: (LogSeek & { runId: string }) | null;
+  onLogSeekTaken?: (seek: LogSeek) => void;
 }) {
-  const [error, setError] = useState<string | null>(null);
-  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
+  const { useTrackioRuns } = useWorkspace().queries;
+  const workspace = useWorkspace();
+  const { trackioRunUrl } = workspace.api;
   const [historyOpen, setHistoryOpen] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
 
   const selectedRun = selectedRunId
     ? expRuns.find((run) => run.id === selectedRunId) ?? null
     : expRuns[0] ?? null;
-  const monitoringError = selectedRun ? runMonitoringError(selectedRun) : null;
-  const live = selectedRun?.status === "running" || selectedRun?.status === "starting";
+  const live = selectedRun ? runActive(selectedRun.status) : false;
   const theme = useResolvedTheme();
   const trackioQuery = useTrackioRuns(experiment.projectId, live);
   const trackio = trackioQuery.data;
@@ -122,9 +136,7 @@ function TerminalView({
   const trackioEmbedUrl = view === "trackio" && selectedRun
     ? trackioRunUrl(trackio, selectedRun.id, { theme })
     : null;
-  const cancelling = Boolean(
-    selectedRun && live && (selectedRun.cancelRequested || pendingRunId === selectedRun.id),
-  );
+  const display = selectedRun && runDisplay(selectedRun);
   // expRuns is newest-first, so the oldest run is #1. Number a run by its
   // position from the end of the list.
   const runNumber = (id: string) => {
@@ -142,30 +154,17 @@ function TerminalView({
     return () => document.removeEventListener("mousedown", onDown);
   }, [historyOpen]);
 
-  async function stop() {
-    if (!selectedRun) return;
-    setError(null);
-    setPendingRunId(selectedRun.id);
-    try {
-      await cancelRun(selectedRun.id);
-    } catch (err) {
-      setPendingRunId(null);
-      setError(err instanceof Error ? err.message : String(err));
-    }
+  function stop() {
+    if (selectedRun) confirmStop(workspace.dialogs, experiment.title || experiment.slug, () => mutCancelRun.runAsHeadlessPromise(workspace, selectedRun, {}));
   }
 
   return (
     <div className="term-view absolute inset-0 flex flex-col bg-background z-20">
-      <div className="term-bar flex items-center gap-2 h-10 py-0 px-2.5 border-b border-b-border shrink-0 [&_.error]:text-sm [&_.error]:text-accent-red [&_.btn]:inline-flex [&_.btn]:items-center [&_.btn]:gap-1">
+      <div className="term-bar flex items-center gap-2 h-10 py-0 px-2.5 border-b border-b-border shrink-0 [&_.btn]:inline-flex [&_.btn]:items-center [&_.btn]:gap-1">
         <div className="term-title min-w-0 text-sm font-semibold text-text overflow-hidden text-ellipsis whitespace-nowrap" title={experiment.title || experiment.slug}>
           {experiment.title || experiment.slug}
         </div>
         <span className="flex-1" />
-        {error && (
-          <span className="error" role="alert">
-            {error}
-          </span>
-        )}
         {view === "trackio" ? (
           <>
             {trackioUrl && (
@@ -201,13 +200,13 @@ function TerminalView({
             {m.experiment_overview_visualize()}
           </Button>
         )}
-        {live && (
-          <Button size="small" variant="ghost" disabled={cancelling} onClick={() => void stop()}>
+        {selectedRun && runStoppable(selectedRun) && (
+          <Button size="small" variant="ghost" aria-haspopup="dialog" onClick={stop}>
             <CircleStop size={14} />
-            {cancelling ? m.common_cancelling() : m.common_stop()}
+            {m.common_stop()}
           </Button>
         )}
-        {expRuns.length > 0 && selectedRun && (
+        {expRuns.length > 0 && selectedRun && display && (
           <div className="run-history relative shrink-0" ref={historyRef}>
             <Button
               className="h-6 px-2 font-normal"
@@ -216,10 +215,7 @@ function TerminalView({
               onClick={() => setHistoryOpen((v) => !v)}
             >
               <span>{m.detail_drawer_run()} {runNumber(selectedRun.id)}</span>
-              <StatusBadge
-                className="text-sm font-normal"
-                status={cancelling ? "cancelling" : runDisplayStatus(selectedRun)}
-             />
+              <StatusBadge className="text-sm font-normal" {...display} />
               <ChevronDown size={14} className="run-picker-chev text-muted shrink-0" />
             </Button>
             {historyOpen && (
@@ -235,7 +231,7 @@ function TerminalView({
                     }}
                   >
                     <span className="font-medium">{m.detail_drawer_run()} {runNumber(r.id)}</span>
-                    <StatusBadge status={runDisplayStatus(r)} />
+                    <StatusBadge {...runDisplay(r)} />
                     <span className="ms-auto text-xs text-muted">{timeAgo(r.createdAt)}</span>
                   </MenuItem>
                 ))}
@@ -245,13 +241,9 @@ function TerminalView({
         )}
       </div>
 
-      {monitoringError && (
-        <p role="status" className="m-0 shrink-0 border-b border-border-variant px-3 py-2 text-sm text-accent-amber wrap-anywhere">
-          {monitoringError}
-        </p>
-      )}
+      {selectedRun && <RunContactNotice run={selectedRun} className="shrink-0 border-b border-border-variant px-3 py-2" />}
 
-      <div className={`term-fill flex-1 min-h-0 ${view === "trackio" ? "bg-background" : "bg-terminal py-3 px-4"}`}>
+      <div className={`term-fill flex-1 min-h-0 ${view === "trackio" ? "bg-background" : "bg-terminal"}`}>
         {trackioEmbedUrl ? (
           <iframe
             key={trackioEmbedUrl}
@@ -269,7 +261,7 @@ function TerminalView({
         ) : selectedRun ? (
           // Key by run id so switching runs in the history dropdown remounts
           // the terminal with the selected run's output.
-          <LogTerminal key={selectedRun.id} runId={selectedRun.id} />
+          <LogTerminal key={selectedRun.id} run={selectedRun} seek={logSeek?.runId === selectedRun.id ? logSeek : null} onSeekTaken={onLogSeekTaken} />
         ) : (
           <div className="term-empty h-full flex items-center justify-center p-6 text-center text-sm text-muted">{selectedRunId ? m.model_picker_unavailable() : m.detail_drawer_no_runs_yet_ask_the_agent_to_launch()}</div>
         )}

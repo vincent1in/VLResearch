@@ -184,7 +184,7 @@ fn matches_agent(harness: &dyn Harness, name: &str) -> bool {
 /// A path with the home directory shortened to `~`, for prompt readability.
 fn tilde(path: &Path) -> String {
     let s = path.to_string_lossy();
-    match dirs::home_dir() {
+    match crate::config::home_dir() {
         Some(home) => match path.strip_prefix(&home) {
             Ok(rel) => format!("~/{}", rel.display()),
             Err(_) => s.into_owned(),
@@ -279,16 +279,18 @@ mod tests {
         let body = describe_targets(&[claude, cursor]).replace('\\', "/");
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("Claude Code"));
-        assert!(lines[0].contains(".claude/skills/orx/SKILL.md"));
-        assert!(lines[1].contains("Cursor"));
-        let cursor_target = tilde(&cursor.skill_target().unwrap()).replace('\\', "/");
-        assert!(lines[1].contains(&cursor_target));
+        for (line, (name, harness)) in lines
+            .iter()
+            .zip([("Claude Code", claude), ("Cursor", cursor)])
+        {
+            let target = tilde(&harness.skill_target().unwrap()).replace('\\', "/");
+            assert!(line.contains(name) && line.contains(&target), "{line}");
+        }
     }
 
     #[test]
     fn tilde_shortens_home() {
-        let home = dirs::home_dir().unwrap();
+        let home = crate::config::home_dir().unwrap();
         assert_eq!(tilde(&home.join(".claude")), "~/.claude");
         assert_eq!(tilde(std::path::Path::new("/etc/hosts")), "/etc/hosts");
     }
@@ -318,7 +320,7 @@ mod tests {
         let extras = codex.extra_skill_targets();
         assert_eq!(extras.len(), 1, "one legacy prompt");
         assert!(
-            extras[0].0.ends_with(".codex/prompts/orx.md"),
+            extras[0].0.ends_with("prompts/orx.md"),
             "legacy prompt path, got {}",
             extras[0].0.display()
         );
