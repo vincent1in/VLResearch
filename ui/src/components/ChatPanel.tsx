@@ -34,6 +34,7 @@ import { LibraryPicker } from "./LibraryPicker";
 import { ProjectInfoCard } from "./ProjectInfoCard";
 import { PendingProjectMove, ProjectProposalCard, projectLabel, projectProposal, useCreateProject, type ProjectProposal } from "./NoProject";
 import { mutCreateScratchProject } from "../queries/projects";
+import { mutSetChatLitSources } from "../queries/settings";
 import { ProjectIconTile } from "./ProjectIcon";
 import { CARD_FADE_MS, SessionHoverCard } from "./SessionHoverCard";
 import { AgentMessageCard } from "./AgentMessageCard";
@@ -240,7 +241,8 @@ import { FileScopeContext } from "./FileReference";
 import { FILE_CARD_CLASS, FileCardContent } from "./FileTypeIcon";
 import { FigureReveal, PaperShelf, pluralMessage, ReportCard, RunCard, SourceStrip, type ShelfPaper } from "./ResearchCards";
 import { discoveredPapers, linkedPapers, paperKey, type CitedPaper, type PaperMeta } from "../researchActivity";
-import { LitSourcesList } from "./LitSourcesPicker";
+import { ChatLitSources, useChatLitSources } from "./LitSourcesPicker";
+import type { LitSource } from "./LitSourceLogo";
 import { ChatImageScope, Md } from "./Md";
 import { ImageMenu } from "./ImageMenu";
 import { ChatLinksContext, type ChatLinks } from "./ChatLinks";
@@ -4930,8 +4932,10 @@ const Transcript = memo(function Transcript({
     return rows;
   }, [visibleMessages, delegates]);
   const proposalsByRow = useMemo(() => new Map(visibleMessages.flatMap((group, row) => {
-    const proposals = group.flatMap((message) => message.parts.flatMap((part) =>
-      part.type === "tool" ? toolActivity(part).projectProposal ?? [] : []));
+    const proposals = group.flatMap((message) => message.parts.flatMap((part) => {
+      const proposal = part.type === "tool" ? toolActivity(part).projectProposal : undefined;
+      return proposal ? [{ id: part.id, proposal }] : [];
+    }));
     return proposals.length ? [[row, proposals] as const] : [];
   })), [visibleMessages]);
   // forkPositions indexes only non-local ids, so a local bearer would page as 0/1.
@@ -5272,8 +5276,8 @@ const Transcript = memo(function Transcript({
           )}
           {proposalsByRow.has(item.index) && (
             <div className="mt-3 flex flex-col gap-2">
-              {proposalsByRow.get(item.index)?.map((proposal, index) => (
-                <ProjectProposalCard key={index} proposal={proposal} proposedAt={visibleMessages[item.index][0].createdAt} project={project} session={session} />
+              {proposalsByRow.get(item.index)?.map(({ id, proposal }) => (
+                <ProjectProposalCard key={id} id={id} proposal={proposal} proposedAt={visibleMessages[item.index][0].createdAt} project={project} session={session} />
               ))}
             </div>
           )}
@@ -6245,7 +6249,8 @@ export function ChatPanel({
   onActiveSessionChange: (sessionId: string | null, options?: { replace?: boolean; projectId?: string }) => void;
   /** Database-backed selection used to seed new chat sessions. */
   preferredAgent: ModelSelection | null;
-  onStartHarnessDraft?: () => void;
+  /** Opens the main draft to start `agent`, which it starts with over the project's. */
+  onStartHarnessDraft?: (agent: ModelSelection) => void;
   onPreferredAgentChange: (selection: ModelSelection) => Promise<void>;
   preferredAutonomy: Autonomy;
   onPreferredAutonomyChange: (autonomy: Autonomy) => void;
@@ -6561,14 +6566,16 @@ export function ChatPanel({
   const modelName = useModelName();
   const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
   useEffect(() => setSelection(preferredAgent), [preferredAgent]);
+  // A new draft starts from the agent it was given, whatever an open chat was switched to.
+  useEffect(() => { if (activeId === null) setSelection(preferredAgent); }, [activeId]);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
   // session's harness is fixed, so these override only its mutable settings and
   // are applied (and persisted server-side) on the next send. Cleared when the
   // active session changes. Distinct from `selection`, which is the sticky
   // global preference that seeds *new* sessions.
   const [sessionOverride, setSessionOverride] = useState<Partial<ModelSelection>>({});
-  const [sideDraftAutonomy, setSideDraftAutonomy] = useState<Autonomy | null>(null);
-  useEffect(() => setSideDraftAutonomy(null), [sideParentSessionId]);
+  const [draftAutonomy, setDraftAutonomy] = useState<Autonomy | null>(null);
+  useEffect(() => setDraftAutonomy(null), [sideParentSessionId, projectId]);
   const [recoveryOverrides, setRecoveryOverrides] = useState<
     Partial<ModelSelection> & { planMode?: boolean }
   >(EMPTY_RECOVERY_OVERRIDES);
@@ -6639,6 +6646,10 @@ export function ChatPanel({
   const connection = useRemoteConnection();
   const resumeCancelRef = useRef<(() => void) | null>(null);
   const dataSources = usePopover();
+  const [litDraft, setLitDraft] = useState<{ projectId: string; disabled: LitSource[] | null }>({ projectId, disabled: null });
+  const draftLitSources = litDraft.projectId === projectId ? litDraft.disabled : null;
+  const litSources = useChatLitSources(projectId, activeId, sideParentSessionId ?? null, draftLitSources, (disabled) => setLitDraft({ projectId, disabled }));
+  const sourcesLabel = litSources.sources?.differs ? m.lit_sources_changed_label() : m.chat_panel_data_sources();
   const addTranscriptSelection = useCallback((selection: Pick<SelectionAction, "text" | "range">) => {
     setAnnotations((current) => [
       ...current,
@@ -7085,7 +7096,7 @@ export function ChatPanel({
     };
     setSelection(next);
     void onPreferredAgentChange(next).catch(() => {});
-    if (onStartHarnessDraft) onStartHarnessDraft();
+    if (onStartHarnessDraft) onStartHarnessDraft(next);
     else onActiveSessionChangeRef.current(null, { projectId });
   }
   const setPermissionMode = (id: string) => withFullAccess(id === "bypassPermissions", () => applyPermissionMode(id));
@@ -7146,8 +7157,8 @@ export function ChatPanel({
   const setAutonomy = (autonomy: Autonomy) => {
     if (autonomy !== (openSession?.autonomy ?? preferredAutonomy)) invalidatePendingRetry();
     if (!openSession) {
-      if (sideParentSessionId) setSideDraftAutonomy(autonomy);
-      else onPreferredAutonomyChange(autonomy);
+      setDraftAutonomy(autonomy);
+      if (!sideParentSessionId) onPreferredAutonomyChange(autonomy);
       return;
     }
     const mutation = ++settingsMutationSeq.current;
@@ -8242,10 +8253,17 @@ export function ChatPanel({
         permissionMode: selection.permissionMode,
         planMode,
         reasoningLevel: selection.reasoningLevel,
-        autonomy: preferredAutonomy,
+        // Unset, the server takes the project's autonomy, which may not have loaded here yet.
+        autonomy: draftAutonomy ?? undefined,
+        disabledLitSources: draftLitSources ?? undefined,
       }, {});
-    if (sideParentSessionId && sideDraftAutonomy !== null && session.autonomy !== sideDraftAutonomy) {
-      session = await patchSession(session, { autonomy: sideDraftAutonomy });
+    setLitDraft({ projectId, disabled: null });
+    setDraftAutonomy(null);
+    if (sideParentSessionId && draftAutonomy !== null && session.autonomy !== draftAutonomy) {
+      session = await patchSession(session, { autonomy: draftAutonomy });
+    }
+    if (sideParentSessionId && draftLitSources !== null) {
+      await mutSetChatLitSources.runAsHeadlessPromise(workspace, session.id, draftLitSources, {});
     }
     // A chat without a project can land in a scratch project of its own.
     const here = session.projectId === projectId;
@@ -10159,23 +10177,25 @@ export function ChatPanel({
             </div>
             <div className="composer-actions flex min-w-0 items-center gap-1 px-1.5 py-1">
               <div className="option-picker relative inline-flex shrink-0" ref={dataSources.ref}>
-                <Tooltip interactive content={m.chat_panel_data_sources()}>
+                <Tooltip interactive content={sourcesLabel}>
                   <IconButton
                     type="button"
                     size="small"
                     className={`composer-bare ${BAR_BUTTON}`}
-                    aria-label={m.chat_panel_data_sources()}
+                    aria-label={sourcesLabel}
                     aria-haspopup="dialog"
                     aria-expanded={dataSources.open}
                     onClick={() => dataSources.setOpen((open) => !open)}
                   >
-                    <LibraryBig size={16} />
+                    <span className="relative inline-flex">
+                      <LibraryBig size={16} />
+                      {litSources.sources?.differs && <span aria-hidden="true" className="absolute -end-1 -top-1 size-1.5 rounded-full bg-accent-blue" />}
+                    </span>
                   </IconButton>
                 </Tooltip>
                 {dataSources.open && (
                   <div className="composer-sources-menu absolute bottom-[calc(100%_+_8px)] start-0 z-50 flex min-w-55 flex-col gap-1 rounded-lg border border-border bg-background p-2 shadow-dropdown">
-                    <span className="px-1 text-sm font-medium text-muted">{m.chat_panel_data_sources()}</span>
-                    <LitSourcesList />
+                    <ChatLitSources {...litSources} />
                   </div>
                 )}
               </div>
@@ -10275,7 +10295,7 @@ export function ChatPanel({
                   reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
                   defaultReasoningId={reasoning.defaultId}
                   onSelectReasoning={setReasoningLevel}
-                  autonomy={openSession?.autonomy ?? sideDraftAutonomy ?? preferredAutonomy}
+                  autonomy={openSession?.autonomy ?? draftAutonomy ?? preferredAutonomy}
                   onSelectAutonomy={setAutonomy}
                   disabled={switchingAgent}
                   lockHarness={busy || switchingAgent || (!openSession && !!sideParentSessionId)}
