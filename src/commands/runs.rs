@@ -7,8 +7,8 @@ use crate::store::Store;
 
 /// Lists a project's runs as a table, newest first.
 pub async fn run(args: crate::RunsArgs) -> Result<()> {
-    let store = Store::open()?;
-    let plane = resolve_project(store, &args.project_id)?;
+    let store = Store::open_for_reading()?;
+    let plane = resolve_project(store, args.project_id.as_deref())?;
     let listing = plane.list_runs().await?;
 
     let filtered: Vec<_> = match &args.experiment {
@@ -37,7 +37,7 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
         .map(|r| {
             vec![
                 r.id.clone(),
-                r.status.clone(),
+                r.display_status().into(),
                 listing
                     .titles
                     .get(&r.experiment_id)
@@ -47,7 +47,11 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
                     Some(sha) => sha.chars().take(7).collect::<String>(),
                     None => "—".to_string(),
                 },
-                format_duration(r.duration_secs),
+                if r.never_started() {
+                    "—".to_string()
+                } else {
+                    format_duration(r.duration_secs)
+                },
                 r.updated_display.clone(),
             ]
         })
@@ -64,6 +68,35 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
         ],
         &rows,
     );
+
+    let store = Store::open_for_reading()?;
+    for run in &filtered {
+        if let Some(snapshot) = crate::engine::monitor::checkpoint(&store, &run.id)? {
+            let stages: Vec<String> = snapshot
+                .phases
+                .iter()
+                .map(|phase| {
+                    let duration = match (phase.started_at, phase.ended_at) {
+                        (Some(start), Some(end)) if end >= start => {
+                            format_duration((end - start) / 1000)
+                        }
+                        _ => "unknown".to_owned(),
+                    };
+                    format!("{} {duration}", phase.name)
+                })
+                .collect();
+            if !stages.is_empty() {
+                println!("{}  stages: {}", run.id, stages.join(", "));
+            }
+        }
+
+        for detail in [run.waiting_detail(), run.contact_detail()]
+            .into_iter()
+            .flatten()
+        {
+            println!("{}  {detail}", run.id);
+        }
+    }
 
     if !failures.is_empty() {
         println!();

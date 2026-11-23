@@ -1,9 +1,11 @@
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
-import { lazy, Suspense, useContext, useEffect, useState } from "react";
+import { lazy, Suspense, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { FilePresentation } from "../api";
-import { MediaDownloadButton, MediaToolbarSlot } from "./mediaToolbar";
+import { ImageMenu } from "./ImageMenu";
+import { MediaCopyButton, MediaDownloadButton, MediaToolbarSlot } from "./mediaToolbar";
+import { MediaUnavailable, mediaUnavailable } from "./MediaUnavailable";
 import { Spinner } from "./ui";
 
 // PDF.js is large, so it loads with the first PDF rather than the dashboard. A
@@ -31,10 +33,10 @@ export function mediaPreviewKind(
   return null;
 }
 
-function DownloadFallback({ url, name }: { url: string; name: string }) {
+function DownloadFallback({ url, name, explain = true }: { url: string; name: string; explain?: boolean }) {
   return (
     <div className="file-view-note py-2.5 px-4 text-sm text-muted">
-      {m.media_preview_this_browser_can_t_preview_this_media_format()}{" "}
+      {explain && <>{m.media_preview_this_browser_can_t_preview_this_media_format()}{" "}</>}
       <a href={url} download={name}>{m.media_preview_download()} {ltr(name)}</a>
     </div>
   );
@@ -54,8 +56,13 @@ export function MediaPreview({
 }) {
   const [failed, setFailed] = useState(false);
   const toolbarSlot = useContext(MediaToolbarSlot);
+  const image = useRef<HTMLImageElement>(null);
 
   useEffect(() => setFailed(false), [kind, url]);
+
+  if ((kind === "video" || kind === "audio") && mediaUnavailable()) return <div>
+    <MediaUnavailable /><DownloadFallback url={url} name={name} explain={false} />
+  </div>;
 
   if (failed) return <DownloadFallback url={url} name={name} />;
 
@@ -63,7 +70,7 @@ export function MediaPreview({
   if (kind === "image") {
     preview = (
       <div className="fpreview-image flex min-h-0 flex-1 items-start justify-center overflow-auto p-6 [&_img]:max-w-full [&_img]:h-auto [&_img]:border [&_img]:border-border [&_img]:rounded-sm">
-        <img src={url} alt={name} onError={() => setFailed(true)} />
+        <ImageMenu src={url} name={name}><img ref={image} src={url} alt={name} onError={() => setFailed(true)} /></ImageMenu>
       </div>
     );
   } else if (kind === "audio") {
@@ -111,7 +118,10 @@ export function MediaPreview({
       {preview}
       {/* PdfPreview renders its own so the button stays after its lazily mounted controls. */}
       {download && kind !== "pdf" && toolbarSlot &&
-        createPortal(<MediaDownloadButton url={url} name={name} />, toolbarSlot)}
+        createPortal(<>
+          {kind === "image" && <MediaCopyButton image={image} />}
+          <MediaDownloadButton url={url} name={name} />
+        </>, toolbarSlot)}
     </div>
   );
 }

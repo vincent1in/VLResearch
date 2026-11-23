@@ -3,11 +3,12 @@
 //!   orx exp status <expId>            inspect status, run command, latest run
 //!   orx exp run    <expId> …          launch a local orx-supervised run
 //!   orx exp cancel <expId>            cancel the in-flight run
-//!   orx exp wake   <expId>            resume this agent when the run succeeds or fails
+//!   orx exp wake   <expId>            send this chat the run's result when it finishes
 //!   orx exp archive <expId> --ancestors|--only|--descendants   hide the chosen scope
 //!   orx exp unarchive <expId> --ancestors|--only|--descendants restore the same nodes
 //!   orx exp move <expId> --parent <expId>|--baseline          re-parent a subtree
 //!   orx exp delete <expId>            permanently delete a leaf node, its runs and branch
+//!   orx exp view set|get|show|check … the view an experiment's runs are drawn with
 //!
 //! Unlike the project-scoped data commands, every verb here takes an
 //! *experiment* id from `orx project view <projectId>`.
@@ -17,9 +18,42 @@ use std::time::{Duration, Instant};
 use crate::error::{anyhow, Result};
 use crate::plane::{resolve_experiment, resolve_project};
 use crate::store::Store;
-use crate::ExpCommand;
+use crate::{ExpCommand, ViewCommand};
 
 pub async fn run(args: crate::ExpArgs) -> Result<()> {
+    if let ExpCommand::Run(run) = &args.command {
+        if run.estimate {
+            return super::exp_estimate::run(&Store::open_for_reading()?, run);
+        }
+    }
+    if let ExpCommand::View { command } = args.command {
+        return view(command).await;
+    }
+    if let ExpCommand::Abandon { run } = &args.command {
+        return crate::plane::local_plane::ApiClient::discover()
+            .await?
+            .abandon(run)
+            .await;
+    }
+    if let ExpCommand::Flag {
+        run,
+        flag,
+        keep,
+        stop,
+        reason,
+        ..
+    } = &args.command
+    {
+        let choice = match (keep, stop) {
+            (true, _) => "keep",
+            (_, true) => "stop",
+            _ => "ask",
+        };
+        return crate::plane::local_plane::ApiClient::discover()
+            .await?
+            .flag(run, flag, choice, reason.as_deref())
+            .await;
+    }
     // `exp wait` opens its store itself: a transiently locked orx.db is
     // retried inside the wait timeout rather than dying at startup.
     if let ExpCommand::Wait {
@@ -31,7 +65,15 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
     {
         return wait(exp_id, project, timeout, interval).await;
     }
-    let mut store = Store::open()?;
+    let mut store = match &args.command {
+        ExpCommand::Status { .. }
+        | ExpCommand::Desc {
+            set: None,
+            stdin: false,
+            ..
+        } => Store::open_for_reading()?,
+        _ => Store::open()?,
+    };
     match args.command {
         ExpCommand::Archive {
             exp_id,
@@ -49,10 +91,15 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
         } => archive(&mut store, &exp_id, ancestors, only, descendants, false),
         ExpCommand::Delete { exp_id } => delete(&store, &exp_id),
         ExpCommand::Move { exp_id, parent, .. } => reparent(&store, &exp_id, parent.as_deref()),
-        ExpCommand::Status { exp_id, scheduler } => {
+        ExpCommand::Status {
+            exp_id,
+            scheduler,
+            run,
+            json,
+        } => {
             crate::local::chat::record_chat_target("experiments", &exp_id);
             resolve_experiment(store, &exp_id)?
-                .experiment_status(scheduler)
+                .experiment_status(scheduler, run.as_deref(), json)
                 .await
         }
         ExpCommand::Desc { exp_id, set, stdin } => {
@@ -67,10 +114,411 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
                 .launch(run_args)
                 .await
         }
-        ExpCommand::Cancel { exp_id } => resolve_experiment(store, &exp_id)?.cancel().await,
+        ExpCommand::Cancel {
+            exp_id,
+            run,
+            reason,
+        } => match exp_id {
+            Some(exp_id) => {
+                resolve_experiment(store, &exp_id)?
+                    .cancel(run.as_deref(), reason.as_deref())
+                    .await
+            }
+            None => {
+                crate::plane::local_plane::ApiClient::discover()
+                    .await?
+                    .cancel(None, run.as_deref(), reason.as_deref())
+                    .await
+            }
+        },
         ExpCommand::Wake { exp_id } => wake(&store, &exp_id),
-        ExpCommand::Wait { .. } => unreachable!("handled above"),
+        ExpCommand::Revise { exp_id, run } => {
+            resolve_experiment(store, &exp_id)?.revise(&run).await
+        }
+        ExpCommand::Wait { .. }
+        | ExpCommand::Abandon { .. }
+        | ExpCommand::Flag { .. }
+        | ExpCommand::View { .. } => {
+            unreachable!("handled above")
+        }
     }
+}
+
+async fn view(command: ViewCommand) -> Result<()> {
+    let read = |kind: &str, file: &std::path::Path, fix: &str| {
+        std::fs::read_to_string(file).map_err(|error| {
+            anyhow!(
+                "{kind} {} could not be read: {error}. Fix that path, then run `{fix}`.",
+                file.display()
+            )
+        })
+    };
+    let json_file = |kind: &str, file: &std::path::Path, fix: &str| -> Result<serde_json::Value> {
+        let text = read(kind, file, fix)?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            anyhow!(
+                "{kind} {} is not JSON: {error}. Fix it, then run `{fix}`.",
+                file.display()
+            )
+        })?;
+        if value.is_null() {
+            return Err(anyhow!(
+                "{kind} {} contains JSON null. Supply a JSON {} and run `{fix}`.",
+                file.display(),
+                if kind == "Pattern" { "list" } else { "object" },
+            ));
+        }
+        Ok(value)
+    };
+    let patterns = |file: &std::path::Path, fix: &str| json_file("Pattern", file, fix);
+    let shown = |file: &Option<std::path::PathBuf>| file.as_ref().map(|f| f.display().to_string());
+    match command {
+        ViewCommand::Set {
+            exp_id,
+            file,
+            stdin,
+            pattern,
+            config,
+        } => {
+            let again = |flag: &str, file: &std::path::Path| {
+                format!("orx exp view set {exp_id} {flag} {}", file.display())
+            };
+            let markup = match &file {
+                Some(file) => Some(read("View", file, &again("--file", file))?),
+                None if stdin => {
+                    use tokio::io::AsyncReadExt;
+                    let mut markup = String::new();
+                    tokio::io::stdin().read_to_string(&mut markup).await?;
+                    Some(markup)
+                }
+                None => None,
+            };
+            let list = pattern
+                .as_deref()
+                .map(|file| patterns(file, &again("--pattern", file)))
+                .transpose()?;
+            let configured = config
+                .as_deref()
+                .map(|file| json_file("Config", file, &again("--config", file)))
+                .transpose()?;
+            let body = serde_json::json!({
+                "markup": markup,
+                "file": shown(&file),
+                "patterns": list,
+                "patternFile": shown(&pattern),
+                "config": configured,
+                "configFile": shown(&config),
+            });
+            let saved = set_view(&exp_id, body).await?;
+            let given = |key: &str| configured.as_ref().is_some_and(|c| c.get(key).is_some());
+            let what: Vec<&str> = [
+                (markup.is_some(), "view"),
+                (list.is_some(), "patterns"),
+                (given("plan"), "plan"),
+                (given("rules"), "rules"),
+                (given("brief"), "brief"),
+                (given("watch"), "watch"),
+            ]
+            .into_iter()
+            .filter_map(|(given, name)| given.then_some(name))
+            .collect();
+            let what = match what.as_slice() {
+                [one] => (*one).to_owned(),
+                [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+                [] => unreachable!("clap requires one of them"),
+            };
+            let first = what[..1].to_uppercase();
+            println!(
+                "\u{2713} {first}{} saved on experiment {exp_id}.",
+                &what[1..],
+            );
+            if given("rules") {
+                println!("Runs launched from now on check these rules; a run already going keeps the rules it was launched with.");
+            }
+            if list.is_some() {
+                println!("The patterns apply to live logs and to finished runs with saved logs. Check a run with `orx exp view check RUN`.");
+            }
+            let pending: Vec<&str> = saved["pending"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            if !pending.is_empty() {
+                println!(
+                    "Not reported yet: {}. Once a run reports, check it with `orx exp view check RUN`.",
+                    pending.join(", ")
+                );
+            }
+            Ok(())
+        }
+        ViewCommand::Get { exp_id, json } => {
+            let store = Store::open_for_reading()?;
+            let described =
+                crate::engine::view::described(&store, &exp_id).map_err(
+                    |refusal| match refusal {
+                        crate::engine::view::Refusal::Missing(message)
+                        | crate::engine::view::Refusal::Invalid(message)
+                        | crate::engine::view::Refusal::Changed(message)
+                        | crate::engine::view::Refusal::Failed(message) => anyhow!("{message}"),
+                    },
+                )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&described)?);
+                return Ok(());
+            }
+            match described["markup"].as_str() {
+                Some(markup) => print!("{markup}"),
+                None => {
+                    println!("No view set for {exp_id}. OpenResearch draws a default from its first signal:\n");
+                    print!("{}", described["derived"].as_str().unwrap_or_default());
+                }
+            }
+            if described["patterns"]
+                .as_array()
+                .is_some_and(|p| !p.is_empty())
+            {
+                println!(
+                    "\nPatterns:\n{}",
+                    serde_json::to_string_pretty(&described["patterns"])?
+                );
+            }
+            let config: serde_json::Map<String, serde_json::Value> =
+                ["plan", "rules", "brief", "watch"]
+                    .into_iter()
+                    .filter(|key| {
+                        described[*key].as_array().is_some_and(|p| !p.is_empty())
+                            || described[*key].is_object()
+                    })
+                    .map(|key| (key.to_owned(), described[key].clone()))
+                    .collect();
+            if !config.is_empty() {
+                println!("\nConfig:\n{}", serde_json::to_string_pretty(&config)?);
+            }
+            Ok(())
+        }
+        ViewCommand::Show { run_id } => {
+            let run_id = match run_id {
+                Some(id) => id,
+                None => {
+                    let chat = crate::local::chat::launching_chat_session().ok_or_else(|| anyhow!(
+                        "Pass a run id: `orx exp view show RUN`. Find run ids with `orx runs <projectId>`."
+                    ))?;
+                    let runs: Vec<_> = Store::open_for_reading()?
+                        .chat_shown_runs()?
+                        .into_iter()
+                        .filter(|shown| shown.session_id == chat)
+                        .collect();
+                    match runs.as_slice() {
+                        [shown] => shown.run.id.clone(),
+                        [] => return Err(anyhow!("No run is shown in this chat. Pass its id with `orx exp view show RUN`.")),
+                        _ => return Err(anyhow!("This chat shows several runs: {}. Choose one with `orx exp view show RUN`.", runs.iter().map(|shown| shown.run.id.as_str()).collect::<Vec<_>>().join(", "))),
+                    }
+                }
+            };
+            let client = crate::plane::local_plane::ApiClient::discover().await?;
+            let path = format!("runs/{}/view/show", urlencoding::encode(&run_id));
+            let report = answer(client.request(reqwest::Method::GET, &path)).await?;
+            let text = report["text"].as_str().ok_or_else(|| anyhow!("Run {run_id}'s view response has no description. Restart `orx up` and retry `orx exp view show {run_id}`."))?;
+            println!("{text}");
+            Ok(())
+        }
+        ViewCommand::Check {
+            run_id,
+            file,
+            pattern,
+            json,
+        } => {
+            let again = |flag: &str, file: &std::path::Path| {
+                format!("orx exp view check {run_id} {flag} {}", file.display())
+            };
+            let markup = file
+                .as_deref()
+                .map(|file| read("View", file, &again("--file", file)))
+                .transpose()?;
+            let list = pattern
+                .as_deref()
+                .map(|file| patterns(file, &again("--pattern", file)))
+                .transpose()?;
+            let body = serde_json::json!({
+                "markup": markup,
+                "file": shown(&file),
+                "patterns": list,
+                "patternFile": shown(&pattern),
+            });
+            let client = crate::plane::local_plane::ApiClient::discover().await?;
+            let path = format!("runs/{}/view/check", urlencoding::encode(&run_id));
+            let report = answer(client.request(reqwest::Method::POST, &path).json(&body)).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            println!("{}", checked(&report));
+            Ok(())
+        }
+    }
+}
+
+/// The body `orx up` answered, or its error in the words it gave.
+async fn answer(request: reqwest::RequestBuilder) -> Result<serde_json::Value> {
+    let response = request.send().await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    if status.is_success() {
+        return Ok(body);
+    }
+    Err(anyhow!(
+        "{}",
+        body["error"]
+            .as_str()
+            .map_or_else(|| format!("orx up answered {status}"), str::to_owned)
+    ))
+}
+
+/// What `orx exp view check` prints: what the run reported, and what the view waits for.
+fn checked(report: &serde_json::Value) -> String {
+    let names = |value: &serde_json::Value| {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let run = report["runId"].as_str().unwrap_or_default();
+    let status = report["status"].as_str().unwrap_or_default();
+    let mut lines = Vec::new();
+    let partial = report["read"]["complete"].as_bool() == Some(false);
+    if let (true, Some(bytes)) = (partial, report["read"]["bytes"].as_u64()) {
+        lines.push(format!(
+            "Log check reached byte {bytes} with incomplete coverage. Results cover only the bytes read."
+        ));
+    }
+    let scope = if partial { " in the checked log" } else { "" };
+    let entries = report["lines"].as_u64().unwrap_or_default();
+    for (index, pattern) in report["patterns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let regex = pattern["regex"].as_str().unwrap_or_default();
+        let matched = pattern["matched"].as_u64().unwrap_or_default();
+        lines.push(match pattern["first"].as_object() {
+            Some(first) => format!(
+                "Pattern {} ({regex}) matched {matched} {}. First match at entry {}: {}",
+                index + 1,
+                if matched == 1 { "entry" } else { "entries" },
+                first["line"],
+                first["text"].as_str().unwrap_or_default()
+            ),
+            None => format!(
+                "Pattern {} ({regex}) matched nothing in {entries} checked {}.",
+                index + 1,
+                if entries == 1 { "entry" } else { "entries" }
+            ),
+        });
+    }
+    let stages: Vec<String> = report["stages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|stage| {
+            let name = stage["name"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .unwrap_or("(unnamed)");
+            match (stage["done"].as_f64(), stage["of"].as_f64()) {
+                (Some(done), Some(of)) => format!("{name} {done} of {of}"),
+                (Some(done), None) => format!("{name} at {done}"),
+                _ => name.to_owned(),
+            }
+        })
+        .collect();
+    if !stages.is_empty() {
+        lines.push(format!("Stages read from the log: {}.", stages.join(", ")));
+    }
+    if !report["disagrees"].is_null() {
+        let text = crate::engine::monitor::disagreement(&report["disagrees"]);
+        lines.push(format!("The plan and the run disagree: {text}."));
+    }
+    let signals = names(&report["seen"]["signals"]);
+    let tables: Vec<String> = report["seen"]["tables"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(table, columns)| format!("{table} ({})", names(columns)))
+        .collect();
+    lines.push(match (signals.is_empty(), tables.is_empty()) {
+        (true, true) if partial => {
+            format!("Run {run} ({status}) had no metrics or tables in the checked log.")
+        }
+        (true, true) => format!("Run {run} ({status}) has reported no metrics or tables yet."),
+        _ => format!(
+            "Run {run} ({status}) reported{scope}: {}{}{}.",
+            if signals.is_empty() {
+                "no metrics"
+            } else {
+                &signals
+            },
+            if tables.is_empty() { "" } else { "; tables: " },
+            tables.join("; ")
+        ),
+    });
+    if report["markup"].is_null() {
+        lines.push(format!(
+            "No view set for experiment {}; its runs are drawn with the default. Check one with `orx exp view check {run} --file PATH`.",
+            report["experimentId"].as_str().unwrap_or_default()
+        ));
+        return lines.join("\n");
+    }
+    let active =
+        !crate::engine::Phase::parse(status).is_some_and(crate::engine::Phase::is_terminal);
+    for block in report["tree"]["blocks"].as_array().into_iter().flatten() {
+        if let Some(glob) = block["media"].as_str() {
+            let last = block["last"].as_u64().unwrap_or_default() as usize;
+            let shown =
+                crate::engine::media::describe(glob, &report["media"][glob], last, active, run);
+            lines.push(format!("media {glob}: {shown}"));
+        }
+    }
+    let pending = names(&report["pending"]);
+    lines.push(if pending.is_empty() {
+        if report["media"].is_object() {
+            "The view is valid.".to_owned()
+        } else {
+            "The view draws only what the run reported.".to_owned()
+        }
+    } else if partial {
+        format!("The view is valid. Missing from the checked log: {pending}.")
+    } else {
+        format!("The view is valid. Not reported yet, so not drawn yet: {pending}.")
+    });
+    lines.join("\n")
+}
+
+/// Saves the view and patterns in `body` through `orx up`, which checks them against the
+/// experiment's runs and draws them with it; a concurrent edit is refused rather than overwritten.
+async fn set_view(exp_id: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    let client = crate::plane::local_plane::ApiClient::discover().await?;
+    let path = format!("experiments/{}/view", urlencoding::encode(exp_id));
+    let current = client.request(reqwest::Method::HEAD, &path).send().await?;
+    if current.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(anyhow!("Experiment {exp_id} not found."));
+    }
+    let current = current.error_for_status()?;
+    let etag = current
+        .headers()
+        .get(reqwest::header::ETAG)
+        .ok_or_else(|| {
+            anyhow!("orx up did not return an ETag for experiment {exp_id}'s run view.")
+        })?;
+    let request = client
+        .request(reqwest::Method::PUT, &path)
+        .header(reqwest::header::IF_MATCH, etag)
+        .json(&body);
+    answer(request).await
 }
 
 fn archive(
@@ -142,33 +590,36 @@ fn wake(store: &Store, exp_id: &str) -> Result<()> {
         .latest_run_for_experiment(exp_id)?
         .ok_or_else(|| anyhow!("Experiment {exp_id} has no runs to wake for."))?;
     if run.status == "cancelled" {
-        store.remove_run_wakeup(&run.id, &session_id)?;
         println!("Run {} was cancelled; no wake-up scheduled.", run.id);
         return Ok(());
     }
-    match store.register_run_wakeup(&run.id, &session_id)? {
-        crate::store::RunWakeupRegistration::Scheduled => {
-            println!("Wake-up scheduled for run {}.", run.id);
-        }
-        crate::store::RunWakeupRegistration::AlreadyPending => {
-            println!("Wake-up already scheduled for run {}.", run.id);
-        }
-        crate::store::RunWakeupRegistration::AlreadyDelivered => {
-            println!("Run {} already delivered its wake-up.", run.id);
-        }
+    let now = crate::store::now_ms();
+    store.subscribe_run(&run.id, &session_id, now)?;
+    if !crate::local::is_terminal(&run.status) {
+        println!("Wake-up scheduled for run {}.", run.id);
+        return Ok(());
+    }
+    let body = store.terminal_notice_body(&run)?;
+    let terminal = crate::store::TERMINAL;
+    if store.insert_run_notice(&run.id, &session_id, terminal, terminal, &body, now)? {
+        println!(
+            "Run {} already finished; its result is queued for this chat.",
+            run.id
+        );
+    } else {
+        println!("Run {} already delivered its result to this chat.", run.id);
     }
     Ok(())
 }
 
-/// `orx exp wait …` — block on run state, for agents driving a research loop.
+/// `orx exp wait …` — block on run state, one server event stream at a time.
 ///
 /// Two modes, picked by argument:
-///   - `<expId>` — level trigger: poll the experiment's latest run until it reaches a terminal state (done/failed/cancelled).
-///   - `--project` — edge trigger: snapshot every run in the project and return when the first run *completes* — i.e. transitions into a terminal state (done/failed/cancelled). This is the "a slot just freed" signal a budget-saturation loop wants; run starts and queued→running transitions are intentionally ignored.
+///   - `<expId>` — level trigger: wait until the experiment's latest run reaches a terminal state (done/failed/cancelled).
+///   - `--project` — edge trigger: snapshot every run in the project and return when the first run *completes* — i.e. transitions into a terminal state (done/failed/cancelled). A cancelled result can still report surviving processes; run starts and queued→running transitions are intentionally ignored.
 ///
-/// Polls every `--interval` seconds (default 5), gives up after `--timeout`
-/// seconds (default 1800) with a non-zero exit so callers can branch on it. The
-/// Polling reads only the local run store.
+/// Gives up after `--timeout` seconds (default 1800) with a non-zero exit so callers can
+/// branch on it.
 async fn wait(
     exp_id: Option<String>,
     project: Option<String>,
@@ -179,7 +630,6 @@ async fn wait(
     // VLResearch: a shorter default under Claude Code; see flavor::wake.
     let deadline = Instant::now()
         + Duration::from_secs(timeout.unwrap_or_else(crate::flavor::wake::default_wait_secs));
-    let (waited_exp, waited_project) = (exp_id.clone(), project.clone());
 
     let result = match (exp_id, project) {
         (Some(_), Some(_)) => Err(anyhow!("Pass either <expId> or --project, not both.")),
@@ -190,7 +640,7 @@ async fn wait(
         (Some(exp_id), None) => {
             let plane = crate::plane::local_plane::retry_on_db_lock(
                 || {
-                    let store = Store::open_with_busy_timeout(
+                    let store = Store::open_for_reading_within(
                         crate::plane::local_plane::busy_timeout_left(deadline),
                     )?;
                     resolve_experiment(store, &exp_id)
@@ -199,30 +649,25 @@ async fn wait(
                 deadline,
             )
             .await?;
-            plane.wait_experiment(interval, deadline).await
+            plane.wait(deadline).await
         }
         (None, Some(project_id)) => {
             let plane = crate::plane::local_plane::retry_on_db_lock(
                 || {
-                    let store = Store::open_with_busy_timeout(
+                    let store = Store::open_for_reading_within(
                         crate::plane::local_plane::busy_timeout_left(deadline),
                     )?;
-                    resolve_project(store, &project_id)
+                    resolve_project(store, Some(&project_id))
                 },
                 interval,
                 deadline,
             )
             .await?;
-            plane.wait_project(interval, deadline).await
+            plane.wait(deadline).await
         }
     };
-    // VLResearch: a timed-out wait in a chat points the agent at its wake-up.
-    crate::flavor::wake::after_wait(
-        result,
-        Instant::now() >= deadline,
-        waited_exp.as_deref(),
-        waited_project.as_deref(),
-    )
+    // VLResearch: a timed-out wait in a chat points the agent at the result message.
+    crate::flavor::wake::after_wait(result, Instant::now() >= deadline)
 }
 
 // --- job-launch helpers shared with the src/local/* backends -----------------
@@ -237,162 +682,55 @@ pub(crate) fn default_hf_image(flavor: &str) -> String {
     }
 }
 
-const SUPERVISOR_LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// The longest `--reason` a stop keeps.
+const MAX_REASON: usize = 2048;
 
-/// Spawn `orx supervise <runId>` fully detached (own process group, stderr to a log),
-/// so it outlives this command and any SSH session that launched it.
-pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
-    let exe = crate::paths::spawnable_exe().map_err(|e| {
-        anyhow!(
-            "Could not locate the orx binary to spawn the supervisor: {}",
-            e
-        )
-    })?;
-    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run.
-    let path = crate::store::log_path(run_id).with_extension("supervisor.log");
-    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= SUPERVISOR_LOG_MAX_BYTES) {
-        // Rename rather than truncate: a still-running supervisor keeps writing to its handle.
-        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+/// Who asked `orx exp cancel` to stop a run, and why if they said: the words recorded on the
+/// run and who stopped it. An agent's chat makes it the agent's stop. Refuses a reason that is
+/// empty or too long.
+pub(crate) fn exp_cancel_stop(
+    chat_session_id: Option<&str>,
+    reason: Option<&str>,
+) -> std::result::Result<(String, crate::store::StopContext), String> {
+    let reason = reason.map(str::trim);
+    if let Some(reason) = reason.filter(|r| r.is_empty() || r.len() > MAX_REASON) {
+        return Err(format!(
+            "--reason must be 1 to {MAX_REASON} bytes of text (got {} bytes).",
+            reason.len()
+        ));
     }
-    let mut child = match supervise_command(&exe, run_id, &path).spawn() {
-        // `/proc/self/exe` can name a path this process cannot exec (OR-334); the `orx` on PATH still runs.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match crate::local::shell_env::find_on_path("orx").filter(|orx| *orx != exe) {
-                Some(orx) => {
-                    let tried = format!("`{}`{}: {error}", exe.display(), current_exe_note(&exe));
-                    let child = supervise_command(&orx, run_id, &path)
-                        .spawn()
-                        .map_err(|e| {
-                            anyhow!(
-                                "{} First tried {tried}.",
-                                supervise_spawn_error(&orx, run_id, e)
-                            )
-                        })?;
-                    let warning = format!(
-                        "warning: could not run {tried}; started the supervisor with `{}`.",
-                        orx.display()
-                    );
-                    eprintln!("{warning}");
-                    // A forwarded launch prints this on `orx up`'s stderr; keep it beside the run too.
-                    if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&path) {
-                        use std::io::Write as _;
-                        let _ = log.write_all(format!("{warning}\n").as_bytes());
-                    }
-                    child
-                }
-                None => return Err(supervise_spawn_error(&exe, run_id, error)),
-            }
-        }
-        result => result.map_err(|e| supervise_spawn_error(&exe, run_id, e))?,
+    let asked = match chat_session_id {
+        Some(id) => format!("Cancel requested by agent session {id} with `orx exp cancel`"),
+        None => "Cancel requested with `orx exp cancel`".into(),
     };
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
-fn supervise_command(
-    exe: &std::path::Path,
-    run_id: &str,
-    log_path: &std::path::Path,
-) -> std::process::Command {
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
-    // A long-lived `orx up` may be running a replaced binary; spawn the new file at its path.
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("supervise")
-        .arg(run_id)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(stderr);
-    // The supervisor re-resolves its directories from its own environment, so
-    // without this a run launched from the macOS app is tracked in a different
-    // store than the app is reading.
-    if let Some(path) = crate::local::shell_env::search_path() {
-        cmd.env("PATH", path);
-    }
-    crate::local::shell_env::export_to(|key, value| {
-        cmd.env(key, value);
-    });
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    // A console-less parent would otherwise give the supervisor a visible console window.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
-    cmd
-}
-
-/// Names the binary that failed and how to attach a supervisor by hand, since
-/// the run stays `starting` without one.
-fn supervise_spawn_error(
-    exe: &std::path::Path,
-    run_id: &str,
-    error: std::io::Error,
-) -> crate::error::Error {
-    let missing = if exe.exists() {
-        ""
-    } else {
-        " (no file at that path)"
+    let words = match reason {
+        Some(reason) => format!("{asked}: {reason}"),
+        None => format!("{asked}."),
     };
-    let current = if crate::paths::spawnable_exe().is_ok_and(|own| own == exe) {
-        current_exe_note(exe)
-    } else {
-        String::new()
+    let by = match chat_session_id {
+        Some(_) => crate::store::StopBy::Agent,
+        None => crate::store::StopBy::User,
     };
-    anyhow!(
-        "Could not spawn `{} supervise {run_id}`{missing}{current}: {error}. A running `orx up` retries \
-         within about 6 minutes; otherwise start `{} supervise {run_id}` in the background.",
-        exe.display(),
-        crate::invocation::orx(),
-    )
+    let stop = crate::store::StopContext {
+        reason: reason.map(str::to_owned),
+        ..crate::store::StopContext::by(by)
+    };
+    Ok((words, stop))
 }
 
-/// The kernel's own name for this binary when it differs from the spawned path, e.g. `… (deleted)`.
-fn current_exe_note(exe: &std::path::Path) -> String {
-    std::env::current_exe()
-        .ok()
-        .filter(|raw| raw != exe)
-        .map(|raw| format!(" (current_exe: {})", raw.display()))
-        .unwrap_or_default()
+/// Records cancel intent for a run a 0.2.x supervisor owns, under the `cancel.lock` it reads
+/// the intent under.
+pub(crate) fn request_legacy_run_cancel(store: &Store, run_id: &str, reason: &str) -> Result<()> {
+    let lock_path =
+        crate::store::log_path(&crate::store::data_dir(), run_id).with_extension("cancel.lock");
+    request_legacy_run_cancel_at(store, run_id, reason, &lock_path)
 }
 
-/// Who asked `orx exp cancel` to stop a run, recorded on the run.
-pub(crate) fn exp_cancel_reason(chat_session_id: Option<&str>) -> String {
-    match chat_session_id {
-        Some(id) => format!("Cancel requested by agent session {id} with `orx exp cancel`."),
-        None => "Cancel requested with `orx exp cancel`.".into(),
-    }
-}
-
-/// Persist cancel intent and ensure an orphaned run gets a fresh supervisor.
-pub(crate) fn request_local_run_cancel(store: &Store, run_id: &str, reason: &str) -> Result<()> {
-    let lock_path = crate::store::log_path(run_id).with_extension("cancel.lock");
-    request_local_run_cancel_with(
-        store,
-        run_id,
-        reason,
-        &lock_path,
-        || {},
-        spawn_detached_supervise,
-    )
-}
-
-fn request_local_run_cancel_with(
+fn request_legacy_run_cancel_at(
     store: &Store,
     run_id: &str,
     reason: &str,
     lock_path: &std::path::Path,
-    before_lock: impl FnOnce(),
-    spawn: impl FnOnce(&str) -> Result<()>,
 ) -> Result<()> {
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -400,41 +738,37 @@ fn request_local_run_cancel_with(
         .write(true)
         .open(lock_path)?;
     let mut cancel_lock = fd_lock::RwLock::new(lock_file);
-    before_lock();
     let _cancel_guard = cancel_lock.write()?;
-    store
-        .get_run(run_id)?
-        .ok_or_else(|| anyhow!("Run {run_id} not found in the local store."))?;
-    let requested = store.request_cancel(run_id, reason)?;
-    if let Err(spawn_err) = spawn(run_id) {
-        if requested {
-            if let Err(rollback_err) = store.withdraw_cancel(run_id) {
-                return Err(anyhow!(
-                    "Could not recover the supervisor: {spawn_err}; could not restore retryable cancel state: {rollback_err}"
-                ));
-            }
-        }
-        return Err(spawn_err);
-    }
+    store.get_run(run_id)?.ok_or_else(|| {
+        anyhow!(
+            "Run {run_id} was not found in the orx store at {}.",
+            store.data_dir().display()
+        )
+    })?;
+    store.request_cancel(run_id, reason)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn wait_validates_both_and_neither_targets_before_opening_the_store() {
+        assert!(
+            super::wait(Some("exp".into()), Some("project".into()), Some(1), None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("either")
+        );
+        assert!(super::wait(None, None, Some(1), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Specify"));
+    }
+
     use super::*;
     use crate::store::StoredRun;
-
-    #[test]
-    fn supervise_spawn_error_names_the_binary_and_the_manual_attach() {
-        let message = supervise_spawn_error(
-            std::path::Path::new("/nonexistent/orx"),
-            "run-1",
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        )
-        .to_string();
-        assert!(message.contains("`/nonexistent/orx supervise run-1` (no file at that path)"));
-        assert!(message.ends_with(" supervise run-1` in the background."));
-    }
 
     fn run_fixture() -> StoredRun {
         StoredRun {
@@ -454,37 +788,6 @@ mod tests {
             cancel_reason: None,
             chat_session_id: None,
         }
-    }
-
-    #[test]
-    fn failed_supervisor_spawn_restores_cancel_retry() {
-        let dir =
-            std::env::temp_dir().join(format!("orx-cancel-spawn-test-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        let run = run_fixture();
-        store.upsert_run(&run).unwrap();
-        let lock_path = dir.join("cancel.lock");
-
-        let result = request_local_run_cancel_with(
-            &store,
-            &run.id,
-            "test",
-            &lock_path,
-            || {},
-            |_| Err(anyhow!("synthetic spawn failure")),
-        );
-        assert!(result.is_err());
-        let stored = store.get_run(&run.id).unwrap().unwrap();
-        assert!(!stored.cancel_requested);
-        // A supervisor that already sent the cancel still ends the run with its requester.
-        store
-            .update_status(&run.id, crate::store::RunStatus::Cancelled, Some(1), None)
-            .unwrap();
-        let cancelled = crate::plane::Run::from(&store.get_run(&run.id).unwrap().unwrap());
-        assert_eq!(cancelled.failure_detail().as_deref(), Some("reason: test"));
-
-        drop(store);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -510,8 +813,7 @@ mod tests {
             ("run-1", "second"),
             ("run-done", "first"),
         ] {
-            request_local_run_cancel_with(&store, run_id, reason, &lock_path, || {}, |_| Ok(()))
-                .unwrap();
+            request_legacy_run_cancel_at(&store, run_id, reason, &lock_path).unwrap();
         }
         // A backend's submit upsert lands after the cancel request.
         store.upsert_run(&starting).unwrap();
@@ -532,74 +834,6 @@ mod tests {
             None
         );
 
-        drop(store);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn concurrent_spawn_failure_preserves_successful_cancel_intent() {
-        let dir = std::env::temp_dir().join(format!(
-            "orx-cancel-concurrency-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let store = Store::open_at(dir.clone()).unwrap();
-        let run = run_fixture();
-        store.upsert_run(&run).unwrap();
-        drop(store);
-        let lock_path = dir.join("cancel.lock");
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
-        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
-
-        let first_dir = dir.clone();
-        let first_lock = lock_path.clone();
-        let first = std::thread::spawn(move || {
-            let store = Store::open_at(first_dir).unwrap();
-            request_local_run_cancel_with(
-                &store,
-                "run-1",
-                "first",
-                &first_lock,
-                || {},
-                |_| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    Err(anyhow!("synthetic spawn failure"))
-                },
-            )
-            .unwrap_err();
-        });
-        entered_rx.recv().unwrap();
-
-        let second_dir = dir.clone();
-        let second_lock = lock_path.clone();
-        let second = std::thread::spawn(move || {
-            let store = Store::open_at(second_dir).unwrap();
-            request_local_run_cancel_with(
-                &store,
-                "run-1",
-                "second",
-                &second_lock,
-                || attempted_tx.send(()).unwrap(),
-                |_| Ok(()),
-            )
-            .unwrap();
-            completed_tx.send(()).unwrap();
-        });
-        attempted_rx.recv().unwrap();
-        let completed_while_locked = completed_rx
-            .recv_timeout(std::time::Duration::from_millis(250))
-            .is_ok();
-        release_tx.send(()).unwrap();
-        first.join().unwrap();
-        second.join().unwrap();
-
-        let store = Store::open_at(dir.clone()).unwrap();
-        assert!(!completed_while_locked);
-        let run = store.get_run("run-1").unwrap().unwrap();
-        assert!(run.cancel_requested);
-        assert_eq!(run.cancel_reason.as_deref(), Some("second"));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -1,18 +1,5 @@
-import { showCustomDialog } from "./dialog";
-import { EscapeScope } from "./components/EscapeScope";
-import { navigateKeyboardList } from "./keyboardNavigation";
 import {
-  setScopedQueryData,
-  deletedSessionIds,
-  isCurrentScope,
-  workspaceScope,
-  queryClient,
-} from "./queries/client";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import type { Viewport } from "@xyflow/react";
-
-import {
-  type SetStateAction,
+  useContext,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -21,12 +8,18 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { WorkspaceDomContext } from "./WorkspaceDom";
+import { useWorkspace } from "./workspace";
 
-import { listChatSessionsQuery, getChatMessagesQuery } from "./queries/chat";
-import { listProjectsQuery, getUiStateQuery, listRunsQuery, listExperimentsQuery } from "./queries/projects";
-import { deleteExperiment, openSideChat, sendChatMessage, setExperimentArchived } from "./api";
-import { getArtifactsQuery } from "./queries/files";
-import { readHarnesses } from "./queries/settings";
+import { EscapeScope } from "./components/EscapeScope";
+import { navigateKeyboardList } from "./keyboardNavigation";
+import { chatSearchRanges } from "./chatSearch";
+
+import { useQuery } from "@tanstack/react-query";
+import { mutCancelRun, mutDeleteExperiment, mutSetExperimentArchived } from "./queries/projects";
+import { mutUpdateUiState } from "./queries/settings";
+import type { Viewport } from "@xyflow/react";
+
 import { useBlocker, useRouter, useRouterState } from "@tanstack/react-router";
 import {
   getTaskWorkspace,
@@ -36,7 +29,7 @@ import {
   type Pane,
   type TaskWorkspace,
 } from "./workspaceState";
-import { getRememberedGlobalWorkspace, globalWorkspaceWriter } from "./workspacePersistence";
+
 import { PANEL_MIN_WIDTH, RAIL_DEFAULT_WIDTH, clampRailWidth, initialPanelWidth, panelMaxWidth, railWidthBesidePanel, sideChatPanelWidth, sidebarFitsWithPanel } from "./panelLayout";
 import {
   type ExpViewDef,
@@ -63,11 +56,7 @@ import {
   paneTab,
   defaultTaskWorkspace,
 } from "./workspaceTabs";
-import {
-  getCachedProjectWorkspace,
-  inheritNewTaskWorkspace,
-  useProjectWorkspace,
-} from "./useProjectWorkspace";
+
 import { m } from "./paraglide/messages.js";
 
 import { useLocale } from "./locale";
@@ -94,13 +83,10 @@ import {
 } from "lucide-react";
 
 import {
-  cancelRun,
   DEMO_MAIN_SESSION_ID,
   DEMO_OVERVIEW_ARTIFACT,
-  captureUiEvent,
   isDemoProjectId,
   type FirstAction,
-  updateUiState,
   type AgentSelection,
   type Autonomy,
   DEFAULT_AUTONOMY,
@@ -108,21 +94,22 @@ import {
   type RuntimeInfo,
   type Run,
   type ChatMessage,
-  type UiState,
+  type ChatSearchHit,
 } from "./api";
 import { WorkspaceTools } from "./components/WorkspaceTools";
 import { ProjectTerminal } from "./components/ProjectTerminal";
 import { SettingsCommandTerminal } from "./components/SshConnectTerminal";
 import { isWindowsDrivePath } from "./markdownTarget";
-import { ChatPanel, findPartById, spawnRowTitle } from "./components/ChatPanel";
+import { projectLabel } from "./components/NoProject";
+import { ChatPanel, findPartById, spawnRowTitle, type FocusedMessage } from "./components/ChatPanel";
 import { OptionPicker, usePopover } from "./components/ModelPicker";
 import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
 import { ArtifactsTab, findArtifactEntry } from "./components/ArtifactsTab";
-import { SkillsTab } from "./components/SkillsTab";
 import { ClosableTab } from "./components/ClosableTab";
 import { TabStrip } from "./components/TabStrip";
+import type { LogSeek } from "./logWindow";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
 import { FileViewer, type FileScrollPosition } from "./components/FileViewer";
 import { confirmFileDiscard, FileBufferSession } from "./fileSync";
@@ -135,18 +122,20 @@ import { ExperimentsTable } from "./components/ExperimentsTable";
 import { ResearchView } from "./flavor/ResearchView"; // VLResearch
 import { archiveActionsByExperiment } from "./components/ArchiveMenu";
 import { type HistoryOrder } from "./components/ExperimentLineage";
-import { Md } from "./components/Md";
+import { ChatImageScope, Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { DemoWelcomeModal } from "./components/Tour";
 import { TreeView } from "./components/TreeView";
-import { onChatEvent, useOrxEvents } from "./events";
+
 import { closeTab, openTab, type TabOpenIntent } from "./tabPreview";
 import { useHotkey, useHotkeys } from "@tanstack/react-hotkeys";
 import { commandRegion, subscribeCommandRegion } from "./keyboardRegion";
 import { appHotkeys, tabJumpHotkeys } from "./hotkeys";
 import { Button, IconButton, MenuItem, SEGMENTED_CLASS_NAME, showAlert, Spinner, Tooltip } from "./components/ui";
 import { CodeTabBody, TabBody } from "./components/layout/TabBody";
-import { RemoteStatus } from "./components/RemoteStatus";
+import { WorkspaceConnection } from "./components/WorkspaceConnection";
+import { delegateModelLabel } from "./delegates";
+import { useModelName } from "./components/pickerAgents";
 
 const EMPTY_STATE_CLASS_NAME = [
   "empty-state absolute inset-0 flex flex-col items-center",
@@ -254,14 +243,6 @@ const FULLSCREEN_SNAP_SLOP = 80;
 // Inward drag needed before snapping back to the last non-fullscreen width.
 const FULLSCREEN_RESTORE_DRAG = 48;
 
-function upsert<T extends { id: string }>(list: T[], item: T): T[] {
-  const i = list.findIndex((x) => x.id === item.id);
-  if (i < 0) return [...list, item];
-  const next = list.slice();
-  next[i] = item;
-  return next;
-}
-
 function useStableStringMap(next: Map<string, string>): Map<string, string> {
   const current = useRef(next);
   const unchanged = current.current.size === next.size
@@ -273,12 +254,45 @@ function useStableStringMap(next: Map<string, string>): Map<string, string> {
 const errorText = (error: unknown) => ltr(error instanceof Error ? error.message : String(error));
 
 export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo; projectId: string; pane?: Pane }) {
-  const updateUiStateMutation = useMutation({ mutationFn: updateUiState });
+  const { id: elementId } = useContext(WorkspaceDomContext);
+  const { onHostConnectRequest, onComputeViewRequest, takeComputeView } = useWorkspace().events;
+
+  const { showCustomDialog, showConfirmDialog } = useWorkspace().dialogs;
+
+  const workspace = useWorkspace();
+  const {
+    captureUiEvent,
+    openSideChat,
+    sendChatMessage,
+    citedMessage,
+  } = workspace.api;
+  const {
+    listChatSessionsQuery,
+    listProjectsQuery,
+    getUiStateQuery,
+    listExperimentsQuery,
+    getProjectSettingsQuery,
+    listRunsQuery,
+    getArtifactsQuery,
+    getChatMessagesQuery,
+    refreshChatMessages,
+    readHarnesses,
+  } = useWorkspace().queries;
+  const {
+    setScopedQueryData,
+    queryClient,
+    workspaceScope,
+    isCurrentScope,
+    deletedSessionIds,
+  } = useWorkspace();
+  const { useProjectWorkspace, inheritNewTaskWorkspace, getCachedProjectWorkspace } = useWorkspace().projects;
+  const { globalWorkspaceWriter, getRememberedGlobalWorkspace } = useWorkspace().persistence;
+  const { onChatEvent } = useWorkspace().events;
 
   const router = useRouter();
   const location = useRouterState({ select: (state) => state.location });
   const destination = parseDestination(location.pathname);
-  const mainView = destination?.kind === "skills" ? "skills" : destination?.kind === "settings" ? destination.section ?? "settings" : "chat";
+  const mainView = destination?.kind === "skills" ? "agents" : destination?.kind === "settings" ? destination.section ?? "settings" : "chat";
   const rememberedSessionRef = useRef<string | null>(null);
   const rememberedProjectRef = useRef(projectId);
   if (rememberedProjectRef.current !== projectId) {
@@ -293,9 +307,13 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const [lineJump, setLineJump] = useState(0);
   // The href and the jump bump can both land before the pane carrying the new
   // line, so keying on them alone spends the request on the previous line.
-  const visitKey = `${location.href}\n${JSON.stringify(pane ?? null)}\n${lineJump}`;
+  const paneKey = JSON.stringify(pane ?? null);
+  const visitKey = `${location.href}\n${paneKey}\n${lineJump}`;
   const lineVisit = useRef({ key: "", value: 0 });
   if (lineVisit.current.key !== visitKey) lineVisit.current = { key: visitKey, value: lineVisit.current.value + 1 };
+  // Counts changes of pane alone: the href can land a render before the pane it carries.
+  const paneVisit = useRef({ key: paneKey, value: 0 });
+  if (paneVisit.current.key !== paneKey) paneVisit.current = { key: paneKey, value: paneVisit.current.value + 1 };
   const rightTab = useMemo<RightTab>(() => {
     const tab = pane ? paneTab(pane) : "experiments";
     return typeof tab === "object" && "path" in tab && tab.line && consumedLine !== lineVisit.current.value
@@ -324,12 +342,12 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const setProjectId = useCallback((id: string | null) => {
     void router.navigate({ href: id ? `/projects/${encodeURIComponent(id)}` : "/projects" });
   }, [router]);
-  const setMainView = useCallback((view: "chat" | "skills" | SettingsTab) => {
+  const setMainView = useCallback((view: "chat" | SettingsTab) => {
     if (!projectId) return;
     if (view === "chat") {
       const id = rememberedSessionRef.current;
       void router.navigate({ href: taskLocation(projectId, id, getTaskWorkspace(workspaceRef.current, id ?? "new")?.active) });
-    } else void router.navigate({ href: `/projects/${encodeURIComponent(projectId)}/${view === "skills" ? "skills" : `settings/${view}`}` });
+    } else void router.navigate({ href: `/projects/${encodeURIComponent(projectId)}/settings/${view}` });
   }, [router, projectId]);
 
   const locale = useLocale();
@@ -337,21 +355,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const projectsOptions = useMemo(() => listProjectsQuery(), [projectId]);
   const projectsQuery = useQuery(projectsOptions);
   const projects = projectsQuery.data ?? null;
-  const setProjects = useCallback((value: SetStateAction<Project[] | null>) => {
-    setScopedQueryData(projectsOptions.queryKey, (current) => {
-      const next = typeof value === "function" ? value(current ?? null) : value;
-      return next ?? undefined;
-    });
-  }, [projectsOptions]);
   const uiStateOptions = useMemo(() => getUiStateQuery(), [projectId]);
   const uiStateQuery = useQuery(uiStateOptions);
   const uiState = uiStateQuery.data ?? null;
-  const setUiState = useCallback((value: SetStateAction<UiState | null>) => {
-    setScopedQueryData(uiStateOptions.queryKey, (current) => {
-      const next = typeof value === "function" ? value(current ?? null) : value;
-      return next ?? undefined;
-    });
-  }, [uiStateOptions]);
   const tourCompletedRef = useRef<boolean | undefined>(undefined);
   tourCompletedRef.current = uiState?.tourCompleted;
   const failedStartupItems = [
@@ -361,28 +367,23 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const startupError = failedStartupItems.length
     ? m.app_startup_load_failed({ items: new Intl.ListFormat(locale).format(failedStartupItems) })
     : null;
-  const persistedPreferredAgent = useRef<AgentSelection | null>(null);
+  const projectSettingsQuery = useQuery(getProjectSettingsQuery(projectId));
+  const projectSettings = projectSettingsQuery.data;
+  // "New chat with…" names the agent its draft starts with, over the project's.
+  const [draftAgent, setDraftAgent] = useState<{ projectId: string; agent: AgentSelection } | null>(null);
+  useEffect(() => { if (activeSessionId) setDraftAgent(null); }, [activeSessionId]);
+  const chosenDraftAgent = draftAgent?.projectId === projectId ? draftAgent.agent : null;
   const experimentsQuery = useQuery(listExperimentsQuery(projectId));
   const experiments = experimentsQuery.data ?? [];
   const experimentDataReady = !experimentsQuery.isPending;
-  const [runDataReady, setRunDataReady] = useState(false);
   const runsQuery = useQuery(listRunsQuery(projectId));
   const runs = runsQuery.data ?? [];
+  const runDataReady = !runsQuery.isPending;
   // Latest runs/experiments, read by the stable openRunLogs/openFileTab so
   // evidence chips resolve ids without re-creating the callbacks on every poll
   // (they feed the memoized transcript, which needs stable props).
   const runsRef = useRef(runs);
   runsRef.current = runs;
-  // A first-seen running row may be a snapshot; only baseline-new ids or observed edges are live.
-  const observedRunsRef = useRef(new Map<string, Run>());
-  const liveRunIdsRef = useRef(new Set<string>());
-  const observedRunsProjectRef = useRef<string | null>(null);
-  const runsBaselineReadyRef = useRef(false);
-  const baselineRunsRef = useRef(new Map<string, Run>());
-  const streamingRunsRef = useRef(new Set<string>());
-  const autoOpenRunsRef = useRef(new Map<string, Run>());
-  const pendingFirstRunningRunsRef = useRef(new Map<string, Run>());
-  const runsVisitRef = useRef(0);
   const experimentsRef = useRef(experiments);
   experimentsRef.current = experiments;
   const artifactsQuery = useQuery(getArtifactsQuery(projectId));
@@ -411,20 +412,14 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [scopedExperiments, showArchivedExperiments],
   );
   const archiveActions = useMemo(() => archiveActionsByExperiment(experiments), [experiments]);
-  const archiveExperiment = useCallback(async (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) => {
-    try {
-      await setExperimentArchived(id, direction, archived);
-      await queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey });
-    } catch (error) {
-      showAlert(error instanceof Error ? error.message : String(error), "error");
-    }
+  const archiveExperiment = useCallback((id: string, direction: Parameters<typeof mutSetExperimentArchived.run>[2], archived: boolean) => {
+    mutSetExperimentArchived.run(workspace, { id, projectId }, direction, archived);
   }, [projectId]);
   const deleteExperimentNode = useCallback(async (id: string) => {
-    await deleteExperiment(id);
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey }),
-      queryClient.invalidateQueries({ queryKey: listRunsQuery(projectId).queryKey }),
-    ]);
+    await mutDeleteExperiment.runAsHeadlessPromise(workspace, { id, projectId }, {});
+  }, [projectId]);
+  const cancelRun = useCallback(async (runId: string) => {
+    await mutCancelRun.runAsHeadlessPromise(workspace, { id: runId, projectId }, {});
   }, [projectId]);
   const restoreArchivedRegion = useCallback((id: string) => {
     void archiveExperiment(id, effectiveScope === "agent" ? "taskRegion" : "region", false);
@@ -439,6 +434,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   // Right-panel tab strip: closable home and working tabs. The same experiment
   // can keep both its overview and terminal open.
   const [tabHistory, setTabHistory] = useState<RightTab[]>([]);
+  // Taken by the opened run's log viewer, and only on the pane its open lands on: any other navigation or open drops it.
+  const [logSeek, setLogSeek] = useState<(LogSeek & { runId: string; visit: number }) | null>(null);
+  const openLogSeek = logSeek?.visit === paneVisit.current.value ? logSeek : null;
+  const takeLogSeek = useCallback((taken: LogSeek) => setLogSeek((current) => current === taken ? null : current), []);
   const [experimentsTabOpen, setExperimentsTabOpen] = useState(false);
   const [filesTabOpen, setFilesTabOpen] = useState(false);
   const [artifactsTabOpen, setArtifactsTabOpen] = useState(false);
@@ -485,6 +484,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const workspaceWide = windowWidth >= WORKSPACE_CARD_MIN_WIDTH;
   const workspaceCardVisible = mainView === "chat" && !panelOpen && workspaceWide;
   const [railOpen, setRailOpen] = useState(true);
+  const mainFind = useState<number | null>(null);
   const [mobileRailOpen, setMobileRailOpen] = useState(false);
   const mobile = windowWidth < 768;
   useEffect(() => { setMobileRailOpen(false); }, [mobile, location.href]);
@@ -500,12 +500,12 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (pendingTabFocus.current && panelOpen && mainView === "chat" && pendingTabFocus.current === rightTabKey(rightTab)) {
       const content = bodyRef.current?.querySelector<HTMLElement>(".right-pane [data-workspace-content]");
       if (content) {
-        content.focus();
+        if (!document.activeElement?.closest("[role=search]")) content.focus();
         pendingTabFocus.current = null;
       }
     }
     if (pendingViewFocus.current && pendingViewFocus.current === mainView) {
-      const view = bodyRef.current?.querySelector<HTMLElement>(".settings-view-scroll h1");
+      const view = bodyRef.current?.querySelector<HTMLElement>(".chat-pane h1");
       if (view) {
         view.focus();
         pendingViewFocus.current = null;
@@ -593,6 +593,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
 
   const openRightTab = useCallback((tab: ContentTab, intent: TabOpenIntent, runId?: string, focus = true) => {
     const key = rightTabKey(tab);
+    setLogSeek(null);
     if (focus) {
       pendingViewFocus.current = null;
       pendingTabFocus.current = key;
@@ -666,7 +667,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       if (focusWasInPanel) pendingTabFocus.current = rightTabKey(fallback);
       setRightTab(fallback);
     } else {
-      if (focusWasInPanel) bodyRef.current?.querySelector<HTMLElement>(".chat-pane .composer-input textarea")?.focus();
+      if (focusWasInPanel) bodyRef.current?.querySelector<HTMLElement>(".chat-pane .composer-input .cm-content")?.focus();
       closePanel();
       setPanelMax(false);
     }
@@ -775,7 +776,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   }, [workspaceReady, destination?.kind, workspaceRef, sessions]);
   useBlocker({
     shouldBlockFn: async ({ next }) => parseDestination(next.pathname)?.projectId !== projectId
-      && [...fileBuffersRef.current.values()].some((buffer) => buffer.needsProtection) && !await confirmFileDiscard(m.file_viewer_discard_unsaved_changes()),
+      && [...fileBuffersRef.current.values()].some((buffer) => buffer.needsProtection) && !await confirmFileDiscard(m.file_viewer_discard_unsaved_changes(), showConfirmDialog),
     enableBeforeUnload: () => [...fileBuffersRef.current.values()].some((buffer) => buffer.needsProtection),
   });
   const lastGlobalLocation = useRef<string | null>(null);
@@ -789,17 +790,21 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const [composerFocusNonce, setComposerFocusNonce] = useState(0);
   const closeDemoWelcome = useCallback(async (choice: "explore_demo" | "create_project" | "dismiss") => {
     const firstClose = tourCompletedRef.current === false;
-    const saved = await updateUiStateMutation.mutateAsync({ tourCompleted: true });
+    await mutUpdateUiState.runAsHeadlessPromise(workspace, { tourCompleted: true }, {});
     if (firstClose) captureUiEvent({ name: "demo_welcome_choice", choice });
-    setUiState((current) => current && { ...current, tourCompleted: saved.tourCompleted });
     if (choice === "explore_demo") setComposerFocusNonce((n) => n + 1);
   }, []);
-  const openNewProject = () => showCustomDialog({
+  /** `importDraft` marks the form opened from a new project's composer, whose unsent text carries over. */
+  const openNewProject = (importDraft?: string) => showCustomDialog({
     component: NewProjectDialog,
     props: {
       preferredAgent: uiState?.preferredAgent ?? null,
       remote: runtime.kind === "ssh",
-      onCreated: onProjectCreated,
+      importing: importDraft !== undefined,
+      onCreated: (project, publicationError) => {
+        if (importDraft?.trim()) workspace.composers.seedComposer(project.id, importDraft);
+        onProjectCreated(project, publicationError);
+      },
     },
     onConfirm: () => {},
     onCancel: "close",
@@ -833,9 +838,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
 
   // The home, error, and loading screens leave projects populated but show no project.
   useEffect(() => {
-    const name = startupError || uiState === null ? null : activeProject?.name;
-    document.title = name ? `${autoDir(name)} — OpenResearch` : "OpenResearch";
-  }, [startupError, uiState, activeProject]);
+    const name = startupError || uiState === null || !activeProject ? null : projectLabel(activeProject);
+    const machine = runtime.kind === "ssh" ? `${autoDir(runtime.session.host)} — ` : "";
+    document.title = name ? `${machine}${autoDir(name)} — OpenResearch` : `${machine}OpenResearch`;
+  }, [startupError, uiState, activeProject, runtime]);
 
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
@@ -854,7 +860,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [projectId],
   );
   useEffect(() => {
-    if (mainView !== "chat" && mainView !== "skills") reportFirstAction("open_settings");
+    if (mainView !== "chat") reportFirstAction("open_settings");
   }, [mainView, reportFirstAction]);
 
   const openExperimentsTab = useCallback((replace = false) => {
@@ -871,7 +877,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   };
   useEffect(() => {
     if (!uiState || preferencesLoaded) return;
-    persistedPreferredAgent.current = uiState.preferredAgent;
     const prefs = getRememberedGlobalWorkspace() ?? uiState.workspace;
     if (prefs) {
       setRailOpen(prefs.railOpen);
@@ -885,41 +890,11 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (sessions && rememberedSessionRef.current && !sessions.includes(rememberedSessionRef.current)) rememberedSessionRef.current = null;
   }, [sessions]);
 
-  const preferredAgentWrite = useRef<Promise<void>>(Promise.resolve());
-  const preferredAgentSaveSeq = useRef(0);
-  const persistPreferredAgent = useCallback((selection: AgentSelection) => {
-    const saveSeq = ++preferredAgentSaveSeq.current;
-    setUiState((current) => current && { ...current, preferredAgent: selection });
-    const write = preferredAgentWrite.current
-      .then(() => updateUiStateMutation.mutateAsync({ preferredAgent: selection }))
-      .then((saved) => {
-        persistedPreferredAgent.current = saved.preferredAgent;
-        if (saveSeq === preferredAgentSaveSeq.current) {
-          setUiState((current) => current && { ...current, preferredAgent: saved.preferredAgent });
-        }
-      })
-      .catch((error: unknown) => {
-        if (saveSeq === preferredAgentSaveSeq.current) {
-          setUiState((current) =>
-            current && { ...current, preferredAgent: persistedPreferredAgent.current },
-          );
-        }
-        throw error;
-      });
-    preferredAgentWrite.current = write.catch(() => {});
-    return write;
+  const persistPreferredAgent = useCallback(async (selection: AgentSelection) => {
+    mutUpdateUiState.run(workspace, { preferredAgent: selection });
   }, []);
-
-  const preferredAutonomyWrite = useRef<Promise<unknown>>(Promise.resolve());
-  const preferredAutonomySaveSeq = useRef(0);
   const persistPreferredAutonomy = useCallback((autonomy: Autonomy) => {
-    const saveSeq = ++preferredAutonomySaveSeq.current;
-    setUiState((current) => current && { ...current, preferredAutonomy: autonomy });
-    preferredAutonomyWrite.current = preferredAutonomyWrite.current
-      .then(() => updateUiStateMutation.mutateAsync({ preferredAutonomy: autonomy }))
-      .catch(() => {
-        if (saveSeq === preferredAutonomySaveSeq.current) void uiStateQuery.refetch();
-      });
+    mutUpdateUiState.run(workspace, { preferredAutonomy: autonomy });
   }, []);
 
   useEffect(() => {
@@ -944,7 +919,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     view: ExperimentView = "overview",
     intent: TabOpenIntent = "preview",
     runId?: string,
-    focus = true,
   ) => {
     reportFirstAction("open_experiment");
     const tab = { id, view };
@@ -952,71 +926,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (view !== "overview" && isDemoProjectId(projectIdRef.current)) {
       setPanelWidth((width) => Math.max(width, sideChatPanelWidth()));
     }
-    openRightTab(tab, intent, runId, focus);
+    openRightTab(tab, intent, runId);
   }, [openRightTab]);
-
-  const openStreamingRun = useCallback((run: Run) => {
-    const navigation = navigationRef.current;
-    if (!navigation.isTask || (navigation.pane &&
-      !(navigation.pane.kind === "home" && navigation.pane.view === "experiments"))) return;
-    openExperimentTab(run.experimentId, "terminal", "preview", run.id, false);
-  }, [openExperimentTab]);
-
-  const loadRunsBaseline = useCallback((baselineProjectId: string) => {
-    runsBaselineReadyRef.current = false;
-    baselineRunsRef.current.clear();
-    pendingFirstRunningRunsRef.current.clear();
-    const runsVisit = ++runsVisitRef.current;
-    queryClient.fetchQuery(listRunsQuery(baselineProjectId))
-      .then((loadedRuns) => {
-        if (
-          projectIdRef.current !== baselineProjectId ||
-          observedRunsProjectRef.current !== baselineProjectId ||
-          runsVisitRef.current !== runsVisit
-        ) return;
-        baselineRunsRef.current = new Map(loadedRuns.map((run) => [run.id, run]));
-        const autoOpenRuns = [...pendingFirstRunningRunsRef.current.values()].filter(
-          (liveRun) => {
-            const baselineRun = baselineRunsRef.current.get(liveRun.id);
-            return (
-              !baselineRun ||
-              (baselineRun.status !== "running" && baselineRun.updatedAt <= liveRun.updatedAt)
-            );
-          },
-        );
-        pendingFirstRunningRunsRef.current.clear();
-        for (const run of loadedRuns) {
-          const observed = observedRunsRef.current.get(run.id);
-          if (!observed || observed.updatedAt < run.updatedAt) {
-            observedRunsRef.current.set(run.id, run);
-          }
-        }
-        runsBaselineReadyRef.current = true;
-        setRunDataReady(true);
-        for (const run of autoOpenRuns) {
-          if (streamingRunsRef.current.has(run.id)) openStreamingRun(run);
-          else autoOpenRunsRef.current.set(run.id, run);
-        }
-      })
-      .catch(() => {
-        if (runsVisitRef.current === runsVisit) {
-          pendingFirstRunningRunsRef.current.clear();
-          setRunDataReady(true);
-        }
-      });
-  }, [openStreamingRun]);
-
-  // Per-project data. Harness agents spawn lazily on the first chat message.
-  useEffect(() => {
-    if (!projectId) return;
-    observedRunsProjectRef.current = projectId;
-    observedRunsRef.current.clear();
-    liveRunIdsRef.current.clear();
-    streamingRunsRef.current.clear();
-    autoOpenRunsRef.current.clear();
-    loadRunsBaseline(projectId);
-    return () => { runsVisitRef.current++; };
-  }, [loadRunsBaseline, projectId]);
 
   const openArtifactsTab = useCallback(() => {
     setArtifactsTabOpen(true);
@@ -1043,62 +954,28 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     else setTerminalStartedFor((current) => (current === terminalKey ? current : null));
   }, [panelOpen, rightTab, terminalKey]);
 
-  // Live store updates.
-  useOrxEvents({
-    onRunLog: (event) => {
-      if (!event.dataBase64 || streamingRunsRef.current.has(event.runId)) return;
-      streamingRunsRef.current.add(event.runId);
-      const run = autoOpenRunsRef.current.get(event.runId);
-      if (!run) return;
-      autoOpenRunsRef.current.delete(event.runId);
-      openStreamingRun(run);
-    },
-    onReconnect: () => {
-      const id = projectIdRef.current;
-      if (!id) return;
-      observedRunsProjectRef.current = id;
-      observedRunsRef.current.clear();
-      liveRunIdsRef.current.clear();
-      streamingRunsRef.current.clear();
-      autoOpenRunsRef.current.clear();
-      loadRunsBaseline(id);
-    },
-    onRun: (run) => {
-      if (
-        run.projectId !== projectIdRef.current ||
-        run.projectId !== observedRunsProjectRef.current
-      ) return;
-      const previous = observedRunsRef.current.get(run.id);
-      const previouslyLive = liveRunIdsRef.current.has(run.id);
-      if (previous && previous.updatedAt > run.updatedAt) return;
-      observedRunsRef.current.set(run.id, run);
-      liveRunIdsRef.current.add(run.id);
-      if (run.status !== "running" || previous?.status === "running") return;
-      const baselineRun = baselineRunsRef.current.get(run.id);
-      const newSinceBaseline =
-        runsBaselineReadyRef.current &&
-        (!baselineRun ||
-          (baselineRun.status !== "running" && baselineRun.updatedAt <= run.updatedAt));
-      if ((previouslyLive && previous) || newSinceBaseline) {
-        if (streamingRunsRef.current.has(run.id)) openStreamingRun(run);
-        else autoOpenRunsRef.current.set(run.id, run);
-      } else if (!runsBaselineReadyRef.current) pendingFirstRunningRunsRef.current.set(run.id, run);
-    },
-  });
-
   // Stable identity: in TreeView's layout-memo deps, so an inline arrow would
   // recompute the graph on every render.
   const showProjectScope = useCallback(() => setScope("project"), []);
+
+  const openRunPage = useCallback((run: Run, intent: TabOpenIntent) => {
+    openExperimentTab(run.experimentId, "overview", intent, run.id);
+  }, [openExperimentTab]);
 
   // A `<run>` evidence chip in chat opens that run's logs — the only evidence
   // channel for a metric. Run ids are globally unique, so resolve the run to its
   // experiment and open the terminal view focused on it.
   const openRunLogs = useCallback(
-    (runId: string, intent: TabOpenIntent = "preview") => {
+    (runId: string, intent: TabOpenIntent = "preview", seek?: LogSeek) => {
       const matches = runsRef.current.filter((run) => run.id === runId || run.id.startsWith(runId));
       const run = matches.length === 1 ? matches[0] : null;
       if (!run) return;
+
+      const from = navigationRef.current.pane;
+      const here = from?.kind === "experiment" && from.experimentId === run.experimentId && from.view === "terminal" && from.runId === run.id;
+      const opens = experimentsRef.current.some((experiment) => experiment.id === run.experimentId);
       openExperimentTab(run.experimentId, "terminal", intent, run.id);
+      if (seek && opens) setLogSeek({ ...seek, runId: run.id, visit: paneVisit.current.value + (here ? 0 : 1) });
     },
     [openExperimentTab],
   );
@@ -1123,6 +1000,22 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     const matches = [...runExperimentNames].filter(([id]) => id.startsWith(runId));
     return matches.length === 1 ? matches[0][1] : "";
   }, [runExperimentNames]);
+
+  // Rebuilt only when a title or harness changes, so transcripts do not re-render on every session update.
+  const modelName = useModelName();
+  const chatSessionsRef = useRef(sessionsQuery.data);
+  chatSessionsRef.current = sessionsQuery.data;
+  const chatInfoKey = (sessionsQuery.data ?? [])
+    .map((session) => `${session.id}\u0000${session.title ?? ""}\u0000${session.model ?? ""}\u0000${session.harness}\u0000${session.profile ?? ""}`)
+    .join("\u0001");
+  const chatInfo = useMemo(() => {
+    void chatInfoKey;
+    const chats = new Map((chatSessionsRef.current ?? []).map((session) => [
+      session.id,
+      { title: session.title?.trim() || delegateModelLabel(session, modelName), harness: session.harness },
+    ]));
+    return (sessionId: string) => chats.get(sessionId);
+  }, [chatInfoKey, modelName]);
 
   const experimentName = useCallback((experimentId: string) => {
     const exact = experimentNames.get(experimentId);
@@ -1273,7 +1166,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     async (tab: FileViewDef) => {
       if (!fileTabs.some((candidate) => sameFileTab(candidate, tab))) return;
       const key = projectId ? fileScrollKey(projectId, activeSessionId, tab) : null;
-      if (key && fileBuffersRef.current.get(key)?.needsProtection && !await confirmFileDiscard(m.file_viewer_discard_unsaved_changes())) return;
+      if (key && fileBuffersRef.current.get(key)?.needsProtection && !await confirmFileDiscard(m.file_viewer_discard_unsaved_changes(), showConfirmDialog)) return;
 
       setFileTabs((prev) => prev.filter((candidate) => !sameFileTab(candidate, tab)));
       if (key) {
@@ -1367,6 +1260,114 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     setSideComposerFocusNonce((nonce) => nonce + 1);
     openSideTab(sessionId);
   }, [openSideTab]);
+
+  // A delegate with its own worktree is a chat of its own, not a side chat.
+  const openDelegate = useCallback((sessionId: string) => {
+    const session = sessionsQuery.data?.find((row) => row.id === sessionId);
+    const sideParentId = session?.sideParentSessionId;
+    if (session && !sideParentId) onActiveSessionChange(sessionId);
+    else if (sideParentId && sideParentId !== activeSessionId) {
+      setSideComposerFocusNonce((nonce) => nonce + 1);
+      setPanelWidth((width) => Math.max(width, sideChatPanelWidth()));
+      void router.navigate({ href: taskLocation(projectId, sideParentId, { kind: "side", sessionId }) });
+    } else focusSideTab(sessionId);
+  }, [sessionsQuery.data, onActiveSessionChange, focusSideTab, projectId, activeSessionId, router]);
+
+  const [requestedFocus, setRequestedFocus] = useState<FocusedMessage | null>(null);
+  const focusedMessage = destination?.projectId === projectId ? requestedFocus : null;
+  const openSearchHit = useCallback((hit: ChatSearchHit, query: string) => {
+    const visible = hit.projectId === projectId && (hit.sessionId === activeSessionId
+      || typeof rightTab === "object" && "kind" in rightTab && rightTab.kind === "side" && rightTab.sessionId === hit.sessionId);
+    if (!visible) {
+      if (hit.projectId === projectId && sessionsQuery.data?.some((session) => session.id === hit.sessionId)) openDelegate(hit.sessionId);
+      else onActiveSessionChange(hit.sessionId, { projectId: hit.projectId });
+    }
+    setRequestedFocus({ sessionId: hit.sessionId, messageId: hit.messageId, nonce: Date.now(), query, partId: hit.partId ?? undefined, spawnPartId: hit.spawnPartId ?? undefined });
+  }, [projectId, activeSessionId, rightTab, sessionsQuery.data, openDelegate, onActiveSessionChange]);
+  const clearSearch = useCallback(() => setRequestedFocus((current) => current?.query ? { ...current, query: undefined } : current), []);
+  useLayoutEffect(() => {
+    if (!focusedMessage?.query || typeof rightTab !== "object" || !("kind" in rightTab)) return;
+    const relevant = rightTab.kind === "subagent" && rightTab.spawnPartId === focusedMessage.spawnPartId
+      || rightTab.kind === "plan" && rightTab.promptId === focusedMessage.partId;
+    const pane = document.querySelector<HTMLElement>(".right-pane");
+    if (!relevant || !pane) return;
+    let frame = 0, anchoredAt: number | undefined;
+    let holdPosition = true;
+    let measuring = true, stable = 0, attempts = 0;
+    let observed: HTMLElement | undefined;
+    let highlight: Highlight | undefined;
+    let content = pane.querySelector<HTMLElement>(".pane-content");
+    if (content) content.style.visibility = "hidden";
+    const finish = () => { measuring = false; if (content) content.style.visibility = ""; };
+    const draw = () => {
+      if (measuring) attempts++;
+      const part = focusedMessage.partId ? pane.querySelector<HTMLElement>(`[data-part-id="${CSS.escape(focusedMessage.partId)}"]`) : null;
+      const root = part ?? (focusedMessage.spawnPartId ? pane.querySelector<HTMLElement>(".subagent-tab-content .msg-assistant") : null);
+      if (!root) {
+        if (measuring && attempts < 12) frame = requestAnimationFrame(draw);
+        else finish();
+        return;
+      }
+      const scroll = root.closest<HTMLElement>(".pane-content");
+      if (root !== observed) {
+        resize.disconnect();
+        resize.observe(root);
+        if (scroll) resize.observe(scroll);
+        observed = root;
+      }
+      const ranges = chatSearchRanges(root, focusedMessage.query ?? "");
+      if ("highlights" in CSS && typeof Highlight !== "undefined") {
+        highlight = new Highlight(...ranges);
+        CSS.highlights.set("side-chat-search", highlight);
+      }
+      if (scroll !== content) {
+        if (content) content.style.visibility = "";
+        content = scroll;
+        if (content && measuring) content.style.visibility = "hidden";
+      }
+      if (holdPosition && ranges[0] && scroll) {
+        const bounds = ranges[0].getBoundingClientRect();
+        const desired = measuring || anchoredAt === undefined
+          ? Math.min(160, scroll.clientHeight / 3)
+          : Math.min(anchoredAt, Math.max(0, scroll.clientHeight - bounds.height));
+        scroll.scrollTop += bounds.top - scroll.getBoundingClientRect().top - desired;
+        const top = ranges[0].getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+        if (measuring) {
+          stable = anchoredAt !== undefined && Math.abs(top - anchoredAt) < 0.5 ? stable + 1 : 0;
+          if (stable >= 2 || attempts >= 12) finish();
+        }
+        anchoredAt = top;
+      }
+      if (measuring) {
+        if (attempts < 12) { cancelAnimationFrame(frame); frame = requestAnimationFrame(draw); }
+        else finish();
+      }
+    };
+    const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(draw); };
+    const resize = new ResizeObserver(draw);
+    const observer = new MutationObserver(schedule);
+    observer.observe(pane, { childList: true, subtree: true, characterData: true });
+    const release = () => { holdPosition = false; finish(); };
+    for (const event of ["wheel", "touchstart", "pointerdown", "keydown"]) pane.addEventListener(event, release, { passive: true });
+    frame = requestAnimationFrame(draw);
+    return () => {
+      cancelAnimationFrame(frame);
+      finish();
+      observer.disconnect();
+      resize.disconnect();
+      for (const event of ["wheel", "touchstart", "pointerdown", "keydown"]) pane.removeEventListener(event, release);
+      if ("highlights" in CSS && CSS.highlights.get("side-chat-search") === highlight) CSS.highlights.delete("side-chat-search");
+    };
+  }, [focusedMessage, rightTab]);
+  const openMessage = useCallback((cited: string) => {
+    const missing = () => showAlert(m.chat_cited_message_missing(), "error");
+    void citedMessage(cited).then(({ projectId: owner, sessionId, messageId }) => {
+      if (owner && owner !== projectId) onActiveSessionChange(sessionId, { projectId: owner });
+      else if (sessionsQuery.data?.some((session) => session.id === sessionId)) openDelegate(sessionId);
+      else return missing();
+      setRequestedFocus({ sessionId, messageId, nonce: Date.now() });
+    }, missing);
+  }, [projectId, sessionsQuery.data, openDelegate, onActiveSessionChange]);
 
   const forgetSideTab = useCallback(
     (tab: SideChatViewDef) => {
@@ -1463,10 +1464,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     // Generation token: a reconnect starts fresh seeds, and a stale in-flight
     // response from an earlier generation must not land after them.
     let seedGen = 0;
-    const seed = () => {
+    const seed = (afterGap = false) => {
       const gen = ++seedGen;
       for (const sid of new Set(subagentTabs.map((t) => t.sessionId))) {
-        queryClient.fetchQuery({ ...getChatMessagesQuery(sid), staleTime: 0 })
+        (afterGap ? refreshChatMessages(sid) : queryClient.fetchQuery({ ...getChatMessagesQuery(sid), staleTime: 0 }))
           .then(({ messages }) => {
             if (live && gen === seedGen)
               apply(messages, subagentTabs.filter((t) => t.sessionId === sid), true);
@@ -1480,7 +1481,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
         // Frames lost during the outage may include the terminal update —
         // refetch, letting the fresh seed overwrite everything.
         liveUpdated.clear();
-        seed();
+        seed(true);
         return;
       }
       if (ev.type !== "message") return;
@@ -1573,11 +1574,21 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
 
   const focusOpenedView = (view: "settings" | "compute") => {
     pendingTabFocus.current = null;
-    const currentView = mainView === view ? bodyRef.current?.querySelector<HTMLElement>(".settings-view-scroll h1") : null;
+    const currentView = mainView === view ? bodyRef.current?.querySelector<HTMLElement>(".chat-pane h1") : null;
     if (currentView) currentView.focus();
     pendingViewFocus.current = currentView ? null : view;
     selectMainView(view);
   };
+  useEffect(() => onHostConnectRequest(() => selectMainView("compute")), [selectMainView]);
+  const focusOpenedViewRef = useRef(focusOpenedView);
+  focusOpenedViewRef.current = focusOpenedView;
+  useEffect(() => {
+    const take = () => {
+      if (takeComputeView()) focusOpenedViewRef.current("compute");
+    };
+    take();
+    return onComputeViewRequest(take);
+  }, [onComputeViewRequest, takeComputeView]);
 
   const focusedRegion = useSyncExternalStore(subscribeCommandRegion, commandRegion);
   useHotkey(appHotkeys["tab.close"], () => {
@@ -1695,8 +1706,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   };
 
   function onProjectCreated(project: Project, publicationError: string | null) {
-    setProjects((cur) => (cur ? upsert(cur, project) : [project]));
-    void router.navigate({ href: `/projects/${encodeURIComponent(project.id)}${publicationError ? "/settings/projects" : ""}` });
+    void router.navigate({ href: `/projects/${encodeURIComponent(project.id)}${publicationError ? "/settings/project" : ""}` });
     if (publicationError) {
       showAlert(publicationError, "error");
     }
@@ -1753,11 +1763,12 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const sideParentSession = sessionsQuery.data?.find((session) => session.id === activeSessionId);
   const sideDraftAgent = useMemo(() => sideParentSession ? {
     harness: sideParentSession.harness,
+    profile: sideParentSession.profile ?? null,
     model: sideParentSession.model,
     serviceTier: sideParentSession.serviceTier,
     permissionMode: sideParentSession.permissionMode === "plan" ? null : sideParentSession.permissionMode,
     reasoningLevel: sideParentSession.reasoningLevel,
-  } : null, [sideParentSession?.harness, sideParentSession?.model,
+  } : null, [sideParentSession?.harness, sideParentSession?.profile, sideParentSession?.model,
     sideParentSession?.serviceTier, sideParentSession?.permissionMode,
     sideParentSession?.reasoningLevel]);
   const requestedCodeTab =
@@ -1929,7 +1940,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
           <p>{startupError}</p>
           <Button variant="primary" onClick={loadInitialState}>{m.app_retry()}</Button>
         </div>
-        {runtime.kind === "ssh" && <RemoteStatus runtime={runtime} corner />}
+        <WorkspaceConnection runtime={runtime} corner />
       </div>
     );
   }
@@ -1944,7 +1955,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
         <div className={EMPTY_STATE_CLASS_NAME}>
           <Spinner />
         </div>
-        {runtime.kind === "ssh" && <RemoteStatus runtime={runtime} corner />}
       </div>
     );
   }
@@ -1982,8 +1992,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       <div ref={bodyRef} className={`app-body workspace-body relative flex flex-1 min-h-0 ${stackPanel ? "flex-col [&>.chat-pane]:overflow-y-auto [&_.chat-empty]:min-h-0 [&_.chat-empty]:overflow-y-auto [&_.chat-empty]:justify-start [&_.chat-empty]:p-0" : ""} ${workspaceCardVisible ? "workspace-card-visible" : ""} ${mainView === "chat" && workspaceReady && !conversationError ? "has-workspace-tools" : ""}`}>
         {projectId && (
           <ChatPanel
+            find={mainFind}
             projectId={projectId}
-            projectName={activeProject.name}
+            projectName={projectLabel(activeProject)}
             contentLoading={conversationLoading}
             contentError={conversationError || null}
             onRetryContent={retryConversation}
@@ -2002,38 +2013,42 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 if (railTemporarilyHidden) closePanel();
               }
             }}
-            onNewProject={() => { setMobileRailOpen(false); openNewProject(); }}
+            onImportProject={(draft) => { setMobileRailOpen(false); openNewProject(draft); }}
             mainView={mainView}
             onSelectMainView={(view) => { setMobileRailOpen(false); selectMainView(view); }}
             onOpenFile={openChatFile}
             onOpenRun={openRunLogs}
+            onOpenRunPage={openRunPage}
             runExperimentName={runExperimentName}
+            chatInfo={chatInfo}
+            onOpenMessage={openMessage}
+            focusedMessage={focusedMessage}
+            onOpenSearchHit={openSearchHit}
+            onClearSearch={clearSearch}
             onOpenExperiment={openExperimentNotes}
             experimentName={experimentName}
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenSideChat={(parentSessionId, question) => void startSideChat(parentSessionId, question)}
+            onOpenDelegate={openDelegate}
             onRunSetup={runtime.kind === "ssh" ? undefined : runSetup}
             composerFocusNonce={composerFocusNonce}
             runtime={runtime}
             activeSessionId={activeSessionId}
             onActiveSessionChange={(...args) => { setMobileRailOpen(false); onActiveSessionChange(...args); }}
-            preferredAgent={uiState.preferredAgent}
+            preferredAgent={chosenDraftAgent ?? (projectSettingsQuery.isSuccess ? projectSettings?.agent ?? uiState.preferredAgent : null)}
             onPreferredAgentChange={persistPreferredAgent}
-            preferredAutonomy={uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
+            onStartHarnessDraft={(agent) => { setDraftAgent({ projectId, agent }); onActiveSessionChange(null, { projectId }); }}
+            preferredAutonomy={projectSettings?.autonomy ?? uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
             onPreferredAutonomyChange={persistPreferredAutonomy}
           >
-            {mainView === "skills" ? (
-              <SkillsTab />
-            ) : mainView !== "chat" ? (
+            {mainView !== "chat" ? (
               <SettingsView
                 remote={runtime.kind === "ssh"}
                 tab={mainView}
                 project={activeProject}
-                onProjectUpdate={(project) => {
-                  setProjects((current) => (current ? upsert(current, project) : [project]));
-                }}
                 onSelectTab={selectMainView}
+                onProjectRemoved={() => setProjectId(null)}
               />
             ) : null}
           </ChatPanel>
@@ -2053,16 +2068,19 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             onChanges={() => focusOpenedTab("files", () => { setFilesView("changes"); openWorktreeTab(); })}
             onFiles={() => focusOpenedTab("files", () => { setFilesView("files"); openWorktreeTab(); })}
             onTerminal={() => focusOpenedTab("terminal", openTerminalTab)}
+            findOpen={mainFind[0] !== null}
+            onFind={() => mainFind[1](Date.now())}
             onArtifacts={() => focusOpenedTab("artifacts", openArtifactsTab)}
             onExperiments={() => focusOpenedTab("experiments", openExperimentsTab)}
             onSideChat={activeSessionId ? () => void startSideChat(activeSessionId, "") : undefined}
             sessions={sessionsQuery.data ?? []}
             onSelectSideChat={focusSideTab}
+            onOpenDelegate={openDelegate}
           />
         )}
         {mainView === "chat" && panelOpen && (
           <aside
-            className={`right-pane relative shrink-0 min-w-0 flex flex-col bg-background [&.max]:fixed [&.max]:inset-0 [&.max]:z-60 [&.max]:border-s-0 overflow-hidden ${stackPanel ? "border-t border-t-border" : "border-s border-s-border"} ${panelMax ? "max" : ""}`}
+            className={`right-pane relative shrink-0 min-w-0 flex flex-col bg-background [&.max]:fixed [&.max]:inset-0 [&.max]:z-40 [&.max]:border-s-0 overflow-hidden ${stackPanel ? "border-t border-t-border" : "border-s border-s-border"} ${panelMax ? "max" : ""}`}
             style={mobile || panelMax ? undefined : stackPanel ? { width: "100%", height: "50%" } : { width: visiblePanelWidth }}
             data-onboarding="experiments"
           >
@@ -2105,7 +2123,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 </Tooltip>
               </div>
             </div>
-            <div data-workspace-content role="region" aria-labelledby="active-workspace-tab" tabIndex={-1} onKeyDown={navigateKeyboardList} className="relative flex min-h-0 flex-1 flex-col focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-50 focus-visible:after:border-2 focus-visible:after:border-focus focus-visible:after:content-['']">
+            <div data-workspace-content role="region" aria-labelledby={elementId("active-workspace-tab")} tabIndex={-1} onKeyDown={navigateKeyboardList} className="relative flex min-h-0 flex-1 flex-col focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-50 focus-visible:after:border-2 focus-visible:after:border-focus focus-visible:after:content-['']">
             {/* The terminal body is the standalone TabBody after this chain. */}
             {rightTab === "terminal" && terminalTabOpen ? null : !workspaceReady || ((pane?.kind === "experiment" || pane?.kind === "code") && !experimentDataReady) || (pane?.kind === "experiment" && pane.runId && !runDataReady) ? (
               <TabBody><Spinner /></TabBody>
@@ -2185,7 +2203,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                         <div className="option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down experiment-scope-menu [&_.model-item]:whitespace-nowrap [&_.model-item:disabled]:text-muted [&_.model-item:disabled]:cursor-default [&_.model-item:disabled:hover]:bg-transparent">
                           <MenuItem
                             aria-pressed={effectiveScope === "agent"}
-                            aria-describedby={!activeSessionId || !allExperimentsAttributed ? "experiment-scope-unavailable" : undefined}
+                            aria-describedby={!activeSessionId || !allExperimentsAttributed ? elementId("experiment-scope-unavailable") : undefined}
                             disabled={!activeSessionId || !allExperimentsAttributed}
                             onClick={() => {
                               setScope("agent");
@@ -2196,7 +2214,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             {effectiveScope === "agent" && <Check size={14} />}
                           </MenuItem>
                           {(!activeSessionId || !allExperimentsAttributed) && (
-                            <p id="experiment-scope-unavailable" className="px-2 pb-1 text-xs text-muted">
+                            <p id={elementId("experiment-scope-unavailable")} className="px-2 pb-1 text-xs text-muted">
                               {!activeSessionId ? m.app_open_task_to_filter() : m.app_filter_unavailable_unattributed()}
                             </p>
                           )}
@@ -2423,8 +2441,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
               <TabBody>
                 {/* The plan markdown is already client-side — render directly,
                   file links resolve against the plan's session worktree. */}
-                <div className="pane-content flex-1 min-h-0 relative plan-tab-content overflow-y-auto bg-background py-4.5 px-6 [&_.md]:max-w-readable">
+                <div className="pane-content flex-1 min-h-0 relative plan-tab-content overflow-y-auto [overflow-anchor:none] bg-background py-4.5 px-6 [&_.md]:max-w-readable">
+                  <ChatImageScope projectId={projectId} sessionId={planTab.sessionId}>
                   <Md
+                    partId={planTab.promptId}
                     text={planContent?.key === `${planTab.sessionId}:${planTab.promptId}` ? planContent.text ?? m.model_picker_unavailable() : planTabs.find((tab) => tab.promptId === planTab.promptId)?.plan || m.artifacts_tab_loading()}
                     onOpenFile={(path, line, exp, ref, intent) =>
                       openFromRightTab(planTab, () =>
@@ -2440,6 +2460,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       )
                     }
                   />
+                  </ChatImageScope>
                 </div>
               </TabBody>
             ) : sideTab && projectId ? (
@@ -2450,7 +2471,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       embedded
                       composerFocusNonce={sideComposerFocusNonce}
                       projectId={projectId}
-                      projectName={activeProject?.name ?? ""}
+                      projectName={activeProject ? projectLabel(activeProject) : ""}
                       railOpen={false}
                       onShowRail={() => setRailOpen(true)}
                       mainView="chat"
@@ -2458,8 +2479,14 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       onOpenFile={(path, sessionId, line, exp, ref, intent) =>
                         openFromRightTab(sideTab, () => openChatFile(path, sessionId, line, exp, ref, intent))
                       }
-                      onOpenRun={(runId, intent) => openFromRightTab(sideTab, () => openRunLogs(runId, intent))}
+                      onOpenRun={(runId, intent, seek) => openFromRightTab(sideTab, () => openRunLogs(runId, intent, seek))}
+                      onOpenRunPage={(run, intent) => openFromRightTab(sideTab, () => openRunPage(run, intent))}
                       runExperimentName={runExperimentName}
+                      chatInfo={chatInfo}
+                      onOpenMessage={openMessage}
+                      focusedMessage={focusedMessage}
+                      onOpenSearchHit={openSearchHit}
+                      onClearSearch={clearSearch}
                       onOpenExperiment={(experimentId, intent) =>
                         openFromRightTab(sideTab, () => openExperimentNotes(experimentId, intent))
                       }
@@ -2474,6 +2501,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       activeSessionId={sideTab.sessionId}
                       sideParentSessionId={sideTab.sessionId === null ? activeSessionId ?? undefined : undefined}
                       onOpenSideChat={(parentSessionId, question) => void startSideChat(parentSessionId, question)}
+                      onOpenDelegate={openDelegate}
                       onActiveSessionChange={(sessionId, options) => {
                         if (sideTab.sessionId === null && sessionId !== null) {
                           const session = queryClient.getQueryData(listChatSessionsQuery(projectId).queryKey)
@@ -2495,7 +2523,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                         if (sessionId === null && deleted) forgetSideTab(sideTab);
                         else onActiveSessionChange(sessionId, options);
                       }}
-                      onStartHarnessDraft={() => onActiveSessionChange(null, { projectId })}
+                      onStartHarnessDraft={(agent) => { setDraftAgent({ projectId, agent }); onActiveSessionChange(null, { projectId }); }}
                       preferredAgent={sideTab.sessionId === null ? sideDraftAgent : uiState.preferredAgent}
                       onPreferredAgentChange={persistPreferredAgent}
                       preferredAutonomy={sideTab.sessionId === null ? sideParentSession?.autonomy ?? DEFAULT_AUTONOMY : uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
@@ -2516,6 +2544,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                 sessionId={subagentTab.sessionId}
                 spawnPartId={subagentTab.spawnPartId}
                 expansionState={getSubagentExpansionState(subagentTab)}
+                searchQuery={focusedMessage?.spawnPartId === subagentTab.spawnPartId ? focusedMessage.query : undefined}
+                searchNonce={focusedMessage?.nonce}
+                searchPartId={focusedMessage?.partId}
                 onOpenFile={(path, line, exp, ref, intent) =>
                   openFromRightTab(subagentTab, () =>
                     openChatFile(path, subagentTab.sessionId, line, exp, ref, intent),
@@ -2578,15 +2609,16 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                     runs={runs}
                     selectedRunId={selectedRunId}
                     onSelectRun={setSelectedRunId}
+                    logSeek={openLogSeek}
+                    onLogSeekTaken={takeLogSeek}
                     parentExperiment={
                       experiments.find(
                         (experiment) => experiment.id === tabExperiment.parentExperimentId,
                       ) ?? null
                     }
                     onOpenView={(view, runId, intent) => {
-                      openFromRightTab(expTab, () =>
-                        openExperimentTab(tabExperiment.id, view, intent, runId),
-                      );
+                      if (view !== expTab.view) promoteRightTab(expTab);
+                      openExperimentTab(tabExperiment.id, view, intent, runId);
                     }}
                     onOpenCode={(view, intent) =>
                       openFromRightTab(expTab, () =>

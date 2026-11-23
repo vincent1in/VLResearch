@@ -1,6 +1,8 @@
 import { ChevronRight } from "lucide-react";
 import { useEffect, useState } from "react";
-import { timeAgo, fmtNumber } from "../api";
+import { timeAgo, fmtNumber, type Run } from "../api";
+import { runDisplay } from "../runDisplay";
+import { statusLabel } from "./StatusBadge";
 import { getLocale } from "../paraglide/runtime.js";
 import { m } from "../paraglide/messages.js";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
@@ -18,6 +20,10 @@ const STATUS_WORD: Record<HistoryStatus, () => string> = {
   cancelled: m.status_cancelled,
   lost: m.status_lost,
   running: m.status_running,
+  stale: m.status_unconfirmed,
+  flagged: m.status_flagged,
+  auto_stopped: m.status_auto_stopped,
+  revising: m.status_revising,
   none: m.history_status_not_run,
 };
 const STATUS_TONE: Record<HistoryStatus, string> = {
@@ -26,6 +32,10 @@ const STATUS_TONE: Record<HistoryStatus, string> = {
   cancelled: "var(--muted)",
   lost: "var(--muted)",
   running: "var(--accent-teal)",
+  stale: "var(--accent-amber)",
+  flagged: "var(--mark-amber)",
+  auto_stopped: "var(--accent-orange)",
+  revising: "var(--accent-purple)",
   none: "var(--muted)",
 };
 // Only runtime theme variables: an @theme colour that no class uses is dropped from the build.
@@ -33,7 +43,7 @@ const INK = "var(--lineage)";
 const LINE_OPACITY = 0.48;
 const DOT_OPACITY = 1;
 
-/** Status as a shape, so colour is never the only signal: ● done, ◆ failed, ⊘ cancelled, ◐ running, ○ not run. */
+/** Status as a shape, so colour is never the only signal: ● done, ◆ failed, ⊘ stopped, ◐ running, ◌ stale, ○ not run. */
 function StatusShape({ status, cx, cy, r, color, background = "var(--base)" }: {
   status: HistoryStatus;
   cx: number;
@@ -50,14 +60,15 @@ function StatusShape({ status, cx, cy, r, color, background = "var(--base)" }: {
     return <path d={`M${cx} ${cy - d}L${cx + d} ${cy}L${cx} ${cy + d}L${cx - d} ${cy}Z`} fill={color} />;
   }
   const ring = <circle cx={cx} cy={cy} r={inner} fill={background} stroke={color} strokeWidth={stroke} />;
-  if (status === "running")
+  if (status === "running" || status === "flagged")
     return (
       <g>
         {ring}
         <path d={`M${cx} ${cy - inner}A${inner} ${inner} 0 0 1 ${cx} ${cy + inner}Z`} fill={color} />
       </g>
     );
-  if (status === "cancelled" || status === "lost") {
+  if (status === "stale") return <circle cx={cx} cy={cy} r={inner} fill={background} stroke={color} strokeWidth={stroke} strokeDasharray={`${stroke} ${stroke}`} />;
+  if (status === "cancelled" || status === "lost" || status === "auto_stopped" || status === "revising") {
     const s = (r - stroke) * 0.7;
     return (
       <g>
@@ -69,13 +80,15 @@ function StatusShape({ status, cx, cy, r, color, background = "var(--base)" }: {
   return ring;
 }
 
-function StatusLabel({ status, word = true, size = 12 }: { status: HistoryStatus; word?: boolean; size?: number }) {
+function StatusLabel({ status, run, word = true, size = 12 }: { status: HistoryStatus; run: Run | null; word?: boolean; size?: number }) {
+  const display = run ? runDisplay(run) : null;
+  const label = display ? statusLabel(display.status, display.stopping) : STATUS_WORD[status]();
   return (
     <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-sm text-text">
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0" aria-hidden="true">
         <StatusShape status={status} cx={size / 2} cy={size / 2} r={size * 0.33} color={STATUS_TONE[status]} />
       </svg>
-      {word ? STATUS_WORD[status]() : <span className="sr-only">{STATUS_WORD[status]()}</span>}
+      {word ? label : <span className="sr-only">{label}</span>}
     </span>
   );
 }
@@ -184,7 +197,7 @@ function LineageStep({ node, current, onSelect }: { node: HistoryNode; current?:
       {...tabOpenGestureHandlers<HTMLButtonElement>((intent) => onSelect(node.id, intent))}
       className={`flex min-w-0 items-center gap-2 rounded-sm px-1.5 py-1 text-start ${current ? "bg-highlight" : "hover:bg-hover-faint"}`}
     >
-      <StatusLabel status={node.status} word={false} size={11} />
+      <StatusLabel status={node.status} run={node.latestRun} word={false} size={11} />
       {node.code && <span className="w-7 shrink-0 font-mono text-xs text-subtext">{node.code}</span>}
       <span className={`min-w-0 flex-1 truncate text-sm text-text ${current ? "font-medium" : ""}`}>{node.label}</span>
       <When ms={node.createdAt} />

@@ -1,43 +1,43 @@
-import { showConfirmDialog } from "../dialog";
+import { useRuntime } from "../RemoteRuntime";
+import { useWorkspace } from "../workspace";
+
 import { matchesKeyboardEvent } from "@tanstack/react-hotkeys";
 import { WorkspaceEmptyState } from "./WorkspaceEmptyState";
 import { useQuery } from "@tanstack/react-query";
-import { queryClient } from "../queries/client";
-import { getArtifactFileTextQuery } from "../queries/files";
+
 import { m } from "../paraglide/messages.js";
-import { ltr } from "../i18n";
+import { fmtBytes, ltr } from "../i18n";
 import { getLocale } from "../paraglide/runtime.js";
 import {
+  ArrowDownWideNarrow,
   ChevronRight,
   ExternalLink,
   Code,
+  Filter,
   MousePointerClick,
   Package,
   Trash2,
+  X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import {
-  artifactUrl,
-  deleteArtifact,
-  FILE_PREVIEW_BYTES,
-  fmtBytes,
-  manageArtifactFile,
-  revealArtifactInManager,
-  type ArtifactEntry,
-  type Project,
-  type ProjectArtifacts,
-} from "../api";
+import { FILE_PREVIEW_BYTES, type ArtifactEntry, type FileAction, type Project, type ProjectArtifacts } from "../api";
+import { mutDeleteArtifact, mutManageArtifactFile } from "../queries/files";
 import { CodeView } from "./CodeView";
 import { FileTypeIcon, isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind, type MediaPreviewKind } from "./MediaPreview";
 import { MediaToolbarSlot } from "./mediaToolbar";
 import { normalizeMarkdownForRendering } from "../markdownNormalization";
+import { isExternalMarkdownTarget, rehypeNetworkImages, resolveMarkdownTarget } from "../markdownTarget";
 import { useFileVersion } from "../useFileVersion";
 import { mdCodeComponents, remarkMathOptions } from "./Md";
+import { ImageMenu } from "./ImageMenu";
+import { fileNameOf } from "../download";
+import { filterArtifactEntries, sortArtifactEntries, type ArtifactOrder } from "./artifactTreeModel";
+import { OptionPicker } from "./ModelPicker";
 import {
   FileContextMenu,
   FileRenameInput,
@@ -46,47 +46,7 @@ import {
   type FileContextMenuEvent,
   type FileContextMenuTarget,
 } from "./FileTreeActions";
-import { IconButton, IconButtonLink, LoadingRow, showAlert, Spinner } from "./ui";
-
-/** Any href with a URI scheme (https:, mailto:, data:, …) or a
- * protocol-relative // — i.e. not an artifact-relative path to resolve. */
-function isExternalSrc(src: string): boolean {
-  return /^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("//");
-}
-
-/** Resolve a Markdown target within the artifacts root. URL suffixes stay
- * outside the encoded filesystem path, and upward escapes are rejected. */
-function artifactTarget(projectId: string, folder: string, src: string) {
-  const hashAt = src.indexOf("#");
-  const beforeHash = hashAt === -1 ? src : src.slice(0, hashAt);
-  const hash = hashAt === -1 ? "" : src.slice(hashAt);
-  const queryAt = beforeHash.indexOf("?");
-  const pathname = queryAt === -1 ? beforeHash : beforeHash.slice(0, queryAt);
-  const query = queryAt === -1 ? "" : beforeHash.slice(queryAt + 1);
-  const parts = pathname.startsWith("/")
-    ? []
-    : folder.split("/").filter((part) => part.length > 0);
-
-  for (const part of pathname.split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      if (parts.length === 0) return null;
-      parts.pop();
-    } else {
-      parts.push(part);
-    }
-  }
-
-  const path = parts.join("/");
-  if (!path) return null;
-  const queryParams = new URLSearchParams(query);
-  queryParams.delete("path");
-  const querySuffix = queryParams.toString();
-  return {
-    path,
-    url: `${artifactUrl(projectId, path)}${querySuffix ? `&${querySuffix}` : ""}${hash}`,
-  };
-}
+import { IconButton, IconButtonLink, LoadingRow, showAlert, Spinner, Tooltip } from "./ui";
 
 /** Drop a leading YAML frontmatter block so it doesn't render as markdown. */
 function stripFrontmatter(md: string): string {
@@ -102,6 +62,7 @@ const TREE_MIN_WIDTH = 180;
 const TREE_MAX_WIDTH = 320;
 const TREE_MAX_INDENT_DEPTH = 8;
 const TREE_DEFAULT_WIDTH = 280;
+const NO_COLLAPSED_DIRS = new Set<string>();
 
 function initialTreeWidth(): number {
   try {
@@ -150,20 +111,21 @@ export function ArtifactMarkdown({
   markdown: string;
   entries: ArtifactEntry[];
 }) {
+  const { artifactUrl } = useWorkspace().api;
   // Artifact writes refresh `src` through this ref; a new `img` type would remount images.
   const entriesRef = useRef(entries);
   entriesRef.current = entries;
   const components = useMemo((): Components => {
     const resolve = (src: string) => {
-      if (isExternalSrc(src)) return src;
-      const target = artifactTarget(projectId, folder, src);
+      if (isExternalMarkdownTarget(src)) return src;
+      const target = resolveMarkdownTarget(folder, src);
       if (!target) return null;
+      const query = new URLSearchParams(target.query);
+      query.delete("path");
+      const querySuffix = query.toString();
       const entry = findArtifactEntry(entriesRef.current, target.path);
-      if (!entry) return target.url;
-      const hashAt = target.url.indexOf("#");
-      const base = hashAt === -1 ? target.url : target.url.slice(0, hashAt);
-      const hash = hashAt === -1 ? "" : target.url.slice(hashAt);
-      return `${base}&v=${entry.modifiedAt}:${entry.size}${hash}`;
+      const version = entry ? `&v=${entry.modifiedAt}:${entry.size}` : "";
+      return `${artifactUrl(projectId, target.path)}${querySuffix ? `&${querySuffix}` : ""}${version}${target.hash}`;
     };
     return {
       // In-page anchors (headings, GFM footnotes) keep their hash href
@@ -187,10 +149,12 @@ export function ArtifactMarkdown({
         const url = resolve(src);
         if (!url) return null;
         return (
-          <a href={url} target="_blank" rel="noopener noreferrer" className="artifact-img">
-            <img src={url} alt={alt ?? ""} loading="lazy" />
-            {alt && <span className="artifact-img-caption">{alt}</span>}
-          </a>
+          <ImageMenu src={url} name={fileNameOf(src)}>
+            <a href={url} target="_blank" rel="noopener noreferrer" className="artifact-img">
+              <img src={url} alt={alt ?? ""} loading="lazy" />
+              {alt && <span className="artifact-img-caption">{alt}</span>}
+            </a>
+          </ImageMenu>
         );
       },
       ...mdCodeComponents,
@@ -200,7 +164,7 @@ export function ArtifactMarkdown({
     <div className="md min-w-0 wrap-anywhere text-text leading-relaxed [&_>_*:first-child]:mt-0 [&_>_*:last-child]:mb-0 [&_p]:my-2.5 [&_p]:mx-0 [&_strong]:text-text [&_strong]:font-semibold [&_pre]:bg-surface [&_pre]:border [&_pre]:border-border-muted [&_pre]:rounded-md [&_pre]:py-2 [&_pre]:px-3 [&_pre]:overflow-x-auto [&_pre]:text-sm [&_pre]:text-text [&_code]:font-mono [&_code]:text-sm [&_code]:font-normal [&_code]:text-text [&_code]:bg-surface [&_code]:border [&_code]:border-border-variant [&_code]:rounded-xs [&_code]:py-px [&_code]:px-1 [&_.katex]:text-prose-emphasis [&_.katex-display]:my-3 [&_.katex-display]:mx-0 [&_.katex-display]:overflow-x-auto [&_.katex-display]:overflow-y-hidden [&_.katex-display]:py-0.5 [&_.katex-display]:px-0 [&_.file-chip]:inline-flex [&_.file-chip]:items-center [&_.file-chip]:gap-1 [&_.file-chip]:max-w-full [&_.file-chip]:my-0 [&_.file-chip]:mx-px [&_.file-chip]:py-0 [&_.file-chip]:px-1.5 [&_.file-chip]:align-baseline [&_.file-chip]:font-mono [&_.file-chip]:text-sm [&_.file-chip]:font-medium [&_.file-chip]:text-text [&_.file-chip]:bg-panel [&_.file-chip]:border [&_.file-chip]:border-border-variant [&_.file-chip]:rounded-xs [&_.file-chip]:cursor-pointer [&_.file-chip:hover:not(:disabled)]:bg-surface [&_.file-chip_svg]:flex-none [&_.file-chip_svg]:opacity-60 [&_.file-chip-label]:max-w-65 [&_.file-chip-label]:overflow-hidden [&_.file-chip-label]:text-ellipsis [&_.file-chip-label]:whitespace-nowrap [&_.run-chip_svg]:opacity-100 [&_.run-chip_svg]:text-subtext [&_pre_code]:bg-none [&_pre_code]:bg-transparent [&_pre_code]:border-0 [&_pre_code]:text-inherit [&_pre_code]:p-0 [&_pre_code]:font-normal [&_h1]:text-text [&_h1]:font-semibold [&_h2]:text-text [&_h2]:font-semibold [&_h3]:text-text [&_h3]:font-semibold [&_h4]:text-text [&_h4]:font-semibold [&_ul]:my-1.5 [&_ul]:mx-0 [&_ul]:ps-5.5 [&_ol]:my-1.5 [&_ol]:mx-0 [&_ol]:ps-5.5 [&_li::marker]:text-subtext [&_table]:border-collapse [&_table]:text-sm [&_table]:my-2.5 [&_table]:mx-0 [&_table]:border [&_table]:border-border [&_table]:rounded-md [&_th]:border-b [&_th]:border-b-border-variant [&_th]:py-2 [&_th]:px-3.5 [&_th]:text-start [&_th]:text-text [&_th]:break-normal [&_th]:break-words [&_td]:border-b [&_td]:border-b-border-variant [&_td]:py-2 [&_td]:px-3.5 [&_td]:text-start [&_td]:text-text [&_td]:break-normal [&_td]:break-words [&_tr:last-child_td]:border-b-0 [&_thead_th]:bg-surface [&_thead_th]:font-medium [&_thead_th]:text-text [&_thead_th]:border-b [&_thead_th]:border-b-border [&_tbody_tr:hover_td]:bg-surface [&_blockquote]:my-1.5 [&_blockquote]:mx-0 [&_blockquote]:pt-0.5 [&_blockquote]:pe-0 [&_blockquote]:pb-0.5 [&_blockquote]:ps-2.5 [&_blockquote]:border-s-[3px] [&_blockquote]:border-s-border [&_blockquote]:text-subtext [:is(&,_.openresearch-diff,_.file-view)_.token.comment]:italic [:is(&,_.openresearch-diff,_.file-view)_.token.prolog]:italic [:is(&,_.openresearch-diff,_.file-view)_.token.cdata]:italic [:is(&,_.openresearch-diff,_.file-view)_.token.operator]:text-syntax-cyan [:is(&,_.openresearch-diff,_.file-view)_.token.entity]:text-syntax-cyan [:is(&,_.openresearch-diff,_.file-view)_.token.url]:text-syntax-cyan [:is(&,_.openresearch-diff,_.file-view)_.token.comment]:text-syntax-comment [:is(&,_.openresearch-diff,_.file-view)_.token.prolog]:text-syntax-comment [:is(&,_.openresearch-diff,_.file-view)_.token.cdata]:text-syntax-comment [:is(&,_.openresearch-diff,_.file-view)_.token.punctuation]:text-syntax-text [:is(&,_.openresearch-diff,_.file-view)_.token.property]:text-syntax-red [:is(&,_.openresearch-diff,_.file-view)_.token.tag]:text-syntax-red [:is(&,_.openresearch-diff,_.file-view)_.token.deleted]:text-syntax-red [:is(&,_.openresearch-diff,_.file-view)_.token.constant]:text-syntax-orange [:is(&,_.openresearch-diff,_.file-view)_.token.symbol]:text-syntax-orange [:is(&,_.openresearch-diff,_.file-view)_.token.boolean]:text-syntax-orange [:is(&,_.openresearch-diff,_.file-view)_.token.number]:text-syntax-orange [:is(&,_.openresearch-diff,_.file-view)_.token.selector]:text-syntax-green [:is(&,_.openresearch-diff,_.file-view)_.token.attr-name]:text-syntax-green [:is(&,_.openresearch-diff,_.file-view)_.token.char]:text-syntax-green [:is(&,_.openresearch-diff,_.file-view)_.token.inserted]:text-syntax-green [:is(&,_.openresearch-diff,_.file-view)_.token.string]:text-syntax-green [:is(&,_.openresearch-diff,_.file-view)_.token.builtin]:text-syntax-yellow [:is(&,_.openresearch-diff,_.file-view)_.token.atrule]:text-syntax-orange [:is(&,_.openresearch-diff,_.file-view)_.token.attr-value]:text-syntax-orange [:is(&,_.openresearch-diff,_.file-view)_.token.keyword]:text-syntax-purple [:is(&,_.openresearch-diff,_.file-view)_.token.function]:text-syntax-blue [:is(&,_.openresearch-diff,_.file-view)_.token.decorator]:text-syntax-blue [:is(&,_.openresearch-diff,_.file-view)_.token.def]:text-syntax-blue [:is(&,_.openresearch-diff,_.file-view)_.token.class-name]:text-syntax-yellow [:is(&,_.openresearch-diff,_.file-view)_.token.namespace]:text-syntax-yellow [:is(&,_.openresearch-diff,_.file-view)_.token.regex]:text-syntax-green [:is(&,_.openresearch-diff,_.file-view)_.token.important]:text-syntax-red [:is(&,_.openresearch-diff,_.file-view)_.token.variable]:text-syntax-red [:is(&,_.openresearch-diff,_.file-view)_.token.parameter]:text-syntax-text artifact-md text-lg [&_h1]:text-4xl [&_h1]:leading-tight [&_h1]:mt-7 [&_h1]:mx-0 [&_h1]:mb-3.5 [&_h2]:text-3xl [&_h2]:leading-tight [&_h2]:mt-7 [&_h2]:mx-0 [&_h2]:mb-2.5 [&_h3]:text-xl [&_h3]:leading-snug [&_h3]:mt-5.5 [&_h3]:mx-0 [&_h3]:mb-2 [&_h4]:text-lg [&_h4]:leading-snug [&_h4]:mt-4.5 [&_h4]:mx-0 [&_h4]:mb-1.5 [&_table]:block [&_table]:w-max [&_table]:max-w-full [&_table]:overflow-x-auto [&_.artifact-img]:block [&_.artifact-img]:my-3 [&_.artifact-img]:mx-0 [&_.artifact-img_img]:max-w-full [&_.artifact-img_img]:h-auto [&_.artifact-img_img]:border [&_.artifact-img_img]:border-border [&_.artifact-img_img]:rounded-sm [&_.artifact-img-caption]:block [&_.artifact-img-caption]:mt-1 [&_.artifact-img-caption]:text-center [&_.artifact-img-caption]:text-sm [&_.artifact-img-caption]:text-subtext">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions]]}
-        rehypePlugins={[rehypeKatex]}
+        rehypePlugins={[rehypeNetworkImages, rehypeKatex]}
         components={components}
       >
         {normalizeMarkdownForRendering(stripFrontmatter(markdown))}
@@ -219,6 +183,9 @@ function previewKind(entry: ArtifactEntry): PreviewKind {
 
 /** Fetched body for kinds that need text: markdown or raw text. */
 function useTextBody(projectId: string, entry: ArtifactEntry, kind: PreviewKind, version: string | null) {
+  const { getArtifactFileTextQuery } = useWorkspace().queries;
+  const { queryClient } = useWorkspace();
+
   const wantsText = kind === "markdown" || (kind === "text" && entry.size <= FILE_PREVIEW_BYTES);
   const options = getArtifactFileTextQuery(projectId, entry.path);
   const query = useQuery({ ...options, enabled: wantsText, subscribed: wantsText });
@@ -254,6 +221,10 @@ function PreviewPane({
   onDelete: (path: string) => Promise<void>;
   artifactEntries: ArtifactEntry[];
 }) {
+  const { showConfirmDialog } = useWorkspace().dialogs;
+
+  const { artifactUrl } = useWorkspace().api;
+
   const kind = previewKind(entry);
   const version = useFileVersion(artifactUrl(projectId, entry.path));
   const { text, binary, truncated, error, wantsText } = useTextBody(projectId, entry, kind, version);
@@ -365,7 +336,7 @@ function PreviewPane({
         {body}
         {truncated && (
           <div className="file-view-note py-2.5 px-4 text-sm text-muted">
-            {m.artifacts_tab_file_truncated_showing_the_first_512_kb()}
+            {m.artifacts_tab_file_truncated({ size: fmtBytes(FILE_PREVIEW_BYTES) })}
           </div>
         )}
       </div>
@@ -400,6 +371,8 @@ function TreeRows({
   onRename: (path: string, name: string) => void;
   onCancelRename: () => void;
 }) {
+  const { showConfirmDialog } = useWorkspace().dialogs;
+
   return (
     <div className="flex w-full max-w-full min-w-0 flex-col items-stretch">
       {entries.map((e) => {
@@ -550,24 +523,37 @@ export function ArtifactsTab({
   /** The dashboard is connected to a remote instance; OS actions would run there. */
   remote?: boolean;
 }) {
+  const { showConfirmDialog } = useWorkspace().dialogs;
+
+  const workspace = useWorkspace();
+  const { revealArtifactInManager } = workspace.api;
+
+  const runtime = useRuntime();
+  const storageProjectId = runtime.kind === "ssh" ? `${encodeURIComponent(runtime.session.host)}:${project.id}` : project.id;
   const [selected, setSelected] = useState<string | null>(null);
   // Folders are open by default — including ones that appear later — so this
   // tracks what the user closed instead.
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => initialCollapsed(project.id));
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => initialCollapsed(storageProjectId));
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth);
   const [contextMenu, setContextMenu] = useState<FileContextMenuTarget | null>(null);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
+  const [order, setOrder] = useState<ArtifactOrder>("name");
+  const [filter, setFilter] = useState("");
+  // Folders closed while a filter is active; the saved set stays untouched.
+  const [filterCollapsed, setFilterCollapsed] = useState(NO_COLLAPSED_DIRS);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const filterInputRef = useRef<HTMLInputElement>(null);
   const treeRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     try {
       localStorage.setItem(
-        `${COLLAPSED_DIRS_KEY_PREFIX}${project.id}`,
+        `${COLLAPSED_DIRS_KEY_PREFIX}${storageProjectId}`,
         JSON.stringify([...collapsed]),
       );
     } catch {
       // best-effort persistence
     }
-  }, [project.id, collapsed]);
+  }, [storageProjectId, collapsed]);
 
   // Drag the divider to resize the tree pane; width persists across reloads.
   // Mirrors App's end-panel resizer: capture the pointer so views under the
@@ -606,30 +592,38 @@ export function ArtifactsTab({
     if (!entry || entry.isDir) setSelected(null);
   }, [selected, artifacts]);
 
+  const sortedEntries = useMemo(
+    () => (artifacts ? sortArtifactEntries(artifacts.entries, order) : []),
+    [artifacts, order],
+  );
+  const visibleEntries = useMemo(
+    () => (filter.trim() ? filterArtifactEntries(sortedEntries, filter) : sortedEntries),
+    [sortedEntries, filter],
+  );
+  const filterActive = filter.trim() !== "";
+  // Each new filter shows every match expanded — the user's saved collapsed
+  // set would hide what they just searched for.
+  const treeCollapsed = filterActive ? filterCollapsed : collapsed;
+  const changeFilter = (next: string) => {
+    setFilter(next);
+    setFilterCollapsed(NO_COLLAPSED_DIRS);
+  };
   const toggle = (path: string) =>
-    setCollapsed((prev) => {
+    (filterActive ? setFilterCollapsed : setCollapsed)((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
+  useEffect(() => {
+    if (filterOpen) filterInputRef.current?.focus();
+  }, [filterOpen]);
 
   const remove = async (path: string) => {
-    await deleteArtifact(project.id, path);
-    if (selected === path || selected?.startsWith(path + "/")) setSelected(null);
+    await mutDeleteArtifact.runAsHeadlessPromise(workspace, project.id, path, {});
   };
 
-  const manage = async (
-    path: string,
-    action: Parameters<typeof manageArtifactFile>[2],
-  ) => {
-    try {
-      await manageArtifactFile(project.id, path, action);
-      if (action.action === "rename" && selected === path) setSelected(null);
-    } catch (error) {
-      showAlert(error instanceof Error ? error.message : String(error), "error");
-    }
-  };
+  const manage = (path: string, action: FileAction) => mutManageArtifactFile.run(workspace, project.id, path, action);
 
   const copyPath = (path: string) => {
     if (artifacts) copyFilePath(artifacts.dir, path);
@@ -657,7 +651,7 @@ export function ArtifactsTab({
     <TreeRows
       entries={entries}
       depth={0}
-      collapsed={collapsed}
+      collapsed={treeCollapsed}
       selected={selected}
       onToggle={toggle}
       onSelect={setSelected}
@@ -669,7 +663,7 @@ export function ArtifactsTab({
       }}
       onRename={(path, name) => {
         setRenamingPath(null);
-        void manage(path, { action: "rename", newName: name });
+        manage(path, { action: "rename", newName: name });
       }}
       onCancelRename={() => setRenamingPath(null)}
     />
@@ -690,10 +684,80 @@ export function ArtifactsTab({
     <div className="files-tab h-full min-h-0 flex bg-background @container">
       <div className="ftree-pane relative shrink-0 flex flex-col min-h-0 border-s border-s-border-variant border-e border-e-border-variant bg-background [@container((max-width:_720px))]:!w-full" ref={treeRef} style={{ width: treeWidth }}>
         <div className="ftree-resizer absolute -end-[3px] top-0 bottom-0 w-1.5 cursor-col-resize z-30 [&:hover]:bg-resizer-hover [&:active]:bg-resizer-hover [@container((max-width:_720px))]:hidden" onPointerDown={resizeTree} />
+        <div className="pane-toolbar flex shrink-0 flex-col gap-2 bg-background px-3 pt-2.5 pb-2">
+          <div className="artifacts-toolbar-controls flex w-full items-center gap-1">
+            <Tooltip interactive content={m.history_order()}>
+              <OptionPicker
+                triggerIcon={<ArrowDownWideNarrow size={16} />}
+                choices={[
+                  { id: "name", label: m.artifacts_order_name() },
+                  { id: "oldest", label: m.history_order_oldest() },
+                  { id: "newest", label: m.history_order_newest() },
+                ]}
+                value={order}
+                header={m.history_order()}
+                title={m.history_order()}
+                variant="bare"
+                dropDown
+                align="left"
+                onSelect={(id) => {
+                  if (id === "newest" || id === "oldest" || id === "name") setOrder(id);
+                }}
+              />
+            </Tooltip>
+            <span className="flex-1" />
+            <Tooltip interactive content={m.artifacts_filter()}>
+              <IconButton
+                size="small"
+                active={filterActive}
+                className="artifacts-filter-trigger [&.active]:text-text"
+                aria-label={m.artifacts_filter()}
+                aria-pressed={filterOpen}
+                onClick={() => {
+                  setFilterOpen((open) => !open);
+                  if (filterOpen) changeFilter("");
+                }}
+              >
+                <Filter size={16} strokeWidth={2.5} />
+              </IconButton>
+            </Tooltip>
+          </div>
+          {filterOpen && (
+            <div className="relative flex w-full items-center">
+              <input
+                ref={filterInputRef}
+                className="artifacts-filter-input h-7 w-full rounded-md border border-border bg-background ps-2 pe-7 text-sm text-text outline-none [&:focus]:border-focus-border"
+                placeholder={m.artifacts_filter_placeholder()}
+                aria-label={m.artifacts_filter()}
+                value={filter}
+                onChange={(event) => changeFilter(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    changeFilter("");
+                    setFilterOpen(false);
+                  }
+                }}
+              />
+              {filterActive && (
+                <IconButton
+                  size="small"
+                  className="absolute end-0.5"
+                  aria-label={m.artifacts_filter_clear()}
+                  onClick={() => changeFilter("")}
+                >
+                  <X size={13} />
+                </IconButton>
+              )}
+            </div>
+          )}
+        </div>
         <div data-keyboard-list className="ftree-scroll flex-1 min-h-0 overflow-y-auto file-tree py-1.5 px-0 text-sm">
-          {tree(artifacts.entries)}
+          {tree(visibleEntries)}
           {artifacts.truncated && (
             <p className="files-truncated m-0 py-2 px-3.5 text-sm text-muted">{m.artifacts_tab_listing_truncated_the_folder_has_more_artifacts()}</p>
+          )}
+          {visibleEntries.length === 0 && artifacts.entries.length > 0 && (
+            <p className="m-0 py-2 px-3.5 text-sm text-muted">{m.artifacts_filter_no_match()}</p>
           )}
         </div>
       </div>
@@ -719,7 +783,7 @@ export function ArtifactsTab({
           onOpen={() => onOpenFile(contextMenu.path)}
           onReveal={remote ? undefined : () => void reveal(contextMenu.path)}
           onRename={canRenameFile(contextMenu.path) ? () => setRenamingPath(contextMenu.path) : undefined}
-          onDuplicate={() => void manage(contextMenu.path, { action: "duplicate" })}
+          onDuplicate={() => manage(contextMenu.path, { action: "duplicate" })}
           onCopyPath={() => copyPath(contextMenu.path)}
           onDelete={() => {
             showConfirmDialog({

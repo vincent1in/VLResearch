@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
 import { isExternalMarkdownTarget } from "../markdownTarget";
+import { MediaUnavailable, mediaUnavailable } from "./MediaUnavailable";
 import { Spinner } from "./ui";
 import { OptionPicker } from "./ModelPicker";
 import { inlineHtmlHeight } from "../htmlPreviewSizing";
+
+/** What WebKit refuses to play once the desktop app disables media. */
+const MEDIA_MARKUP = /<(video|audio)\b|\bnew Audio\b|createElement\(\s*["'`](video|audio)\b|AudioContext|MediaSource/i;
 
 /** Elements whose relative URLs name a project file, each with the response
  * types it may legitimately be. The gate is the security boundary: the parent
@@ -175,8 +179,10 @@ export function HtmlPreview({
   resolveSrc: (src: string) => string | null;
   fitContent?: boolean;
 }) {
+  const prepared = useMemo<{ page: { source: string; partial: boolean } | null }>(() => ({ page: null }), [html, truncated, url, resolveSrc, fitContent]);
   const [page, setPage] = useState<{ source: string; partial: boolean } | null>(null);
   const frame = useRef<HTMLIFrameElement>(null);
+  const viewport = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(360);
   const [metricPicker, setMetricPicker] = useState<{
     choices: { id: string; label: string }[]; value: string; left: number; top: number; width: number;
@@ -210,6 +216,7 @@ export function HtmlPreview({
   }, [fitContent]);
 
   useEffect(() => {
+    if (prepared.page) { setPage(prepared.page); return; }
     let cancelled = false;
     const controller = new AbortController();
     setPage(null);
@@ -239,15 +246,33 @@ export function HtmlPreview({
         partial,
       }))
       .then((next) => {
-        if (!cancelled) setPage(next);
+        if (!cancelled) { prepared.page = next; setPage(next); }
       });
     return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [html, truncated, url, resolveSrc, fitContent]);
+  }, [html, truncated, url, resolveSrc, fitContent, prepared]);
 
-  if (page === null) {
+  useLayoutEffect(() => {
+    const element = viewport.current;
+    const iframe = frame.current;
+    if (!element || !iframe) return;
+    const resize = () => {
+      const width = element.clientWidth;
+      const height = iframe.getBoundingClientRect().height;
+      // A hidden workspace keeps the report's last usable viewport.
+      if (width > 0) iframe.style.width = `${width}px`;
+      if (!fitContent && height > 0) iframe.style.height = `${height}px`;
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(element);
+    observer.observe(iframe);
+    resize();
+    return () => observer.disconnect();
+  }, [page, fitContent]);
+
+  if (page === null || page !== prepared.page) {
     return (
       <div className="file-view-note flex items-center gap-2 py-2.5 px-4 text-sm text-muted">
         <Spinner /> {m.file_viewer_loading()}
@@ -255,32 +280,38 @@ export function HtmlPreview({
     );
   }
 
+  const blockedMedia = mediaUnavailable() && MEDIA_MARKUP.test(page.source);
+
   return (
-    <div className={fitContent ? "relative flex flex-col" : "flex h-full min-h-0 flex-col"}>
+    <div ref={viewport} className={fitContent ? "flex flex-col" : "flex h-full min-h-0 flex-col"}>
+      {blockedMedia && <MediaUnavailable />}
       {page.partial && (
         <div className="file-view-note shrink-0 border-b border-b-border-variant py-2 px-4 text-sm text-muted">
           {m.file_viewer_html_partial()}
         </div>
       )}
-      {metricPicker && metricPicker.choices.length > 1 && <div className="absolute z-10" style={{ left: metricPicker.left, top: metricPicker.top, width: metricPicker.width }}>
-        <OptionPicker choices={metricPicker.choices} value={metricPicker.value} variant="field" floating dropDown
-          onSelect={(value) => frame.current?.contentWindow?.postMessage({ type: "orx-chart-metric", value }, "*")} />
-      </div>}
-      <iframe
-        ref={frame}
-        style={fitContent ? { height } : undefined}
-        // White-backed: an unstyled document assumes the browser default, and
-        // the pane's dark ground would leave its black text unreadable.
-        className={`block min-h-0 w-full border-0 bg-white ${fitContent ? "shrink-0" : "flex-1"}`}
-        title={m.file_viewer_html_preview({ name: ltr(name) })}
-        // Never allow-same-origin: it would hand a repo's or an agent's HTML
-        // this page's origin and the unauthenticated loopback API. Popups so a
-        // report's links open (they inherit the sandbox, having no
-        // allow-popups-to-escape-sandbox), downloads so plot toolbars save.
-        sandbox="allow-scripts allow-popups allow-downloads"
-        referrerPolicy="no-referrer"
-        srcDoc={page.source}
-     />
+      {/* The picker's coordinates come from inside the frame, so it shares the frame's box. */}
+      <div className={fitContent ? "relative flex flex-col" : "relative flex min-h-0 flex-1 flex-col"}>
+        {metricPicker && metricPicker.choices.length > 1 && <div className="absolute z-10" style={{ left: metricPicker.left, top: metricPicker.top, width: metricPicker.width }}>
+          <OptionPicker choices={metricPicker.choices} value={metricPicker.value} variant="field" floating dropDown
+            onSelect={(value) => frame.current?.contentWindow?.postMessage({ type: "orx-chart-metric", value }, "*")} />
+        </div>}
+        <iframe
+          ref={frame}
+          style={fitContent ? { height } : undefined}
+          // White-backed: an unstyled document assumes the browser default, and
+          // the pane's dark ground would leave its black text unreadable.
+          className={`block min-h-0 w-full border-0 bg-white ${fitContent ? "shrink-0" : "flex-1"}`}
+          title={m.file_viewer_html_preview({ name: ltr(name) })}
+          // Never allow-same-origin: it would hand a repo's or an agent's HTML
+          // this page's origin and the unauthenticated loopback API. Popups so a
+          // report's links open (they inherit the sandbox, having no
+          // allow-popups-to-escape-sandbox), downloads so plot toolbars save.
+          sandbox="allow-scripts allow-popups allow-downloads"
+          referrerPolicy="no-referrer"
+          srcDoc={page.source}
+       />
+      </div>
     </div>
   );
 }

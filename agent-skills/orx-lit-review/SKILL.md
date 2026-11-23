@@ -66,7 +66,9 @@ orx discover pubmed "<biomedical query>"
 - `pubmed` searches PubMed's biomedical and life-science journal literature
   through NCBI E-utilities, ranked by PubMed's Best Match. It
   accepts PubMed query syntax such as field tags (`[ti]`, `[au]`, `[mh]`).
-  Result ids are PMIDs.
+  Result ids are PMIDs. Terms PubMed did not find or ignored are printed to
+  stderr (`PubMed phrases not found: …`) while stdout stays the JSON results;
+  fix the query when a term you relied on is listed.
 - Every primitive returns the same JSON shape: `source`, self-routing `id`,
   title, abstract, and publication date. alphaXiv results may include votes and
   full-text snippets; OpenAlex and bioRxiv results may include citations.
@@ -281,6 +283,7 @@ an available alphaXiv representation.
 | Embedded visual | `Figure N` / `Table N` | Existing local image file |
 
 Use these labels consistently, not vague labels such as "Source" or descriptions
-of the claim. Disambiguate figures by paper when needed. Introductory paper-title links can
+of the claim. The app lists every paper your answer links below the answer, so
+end without a sources or references list. Disambiguate figures by paper when needed. Introductory paper-title links can
 retain their titles. Discovery and figure-provenance links provide navigation;
 they do not imply every claim in a paper has been verified.

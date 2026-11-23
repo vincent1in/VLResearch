@@ -1,6 +1,6 @@
 ---
 name: orx-compute
-description: "Launch and monitor experiment runs and route guidance for hf, modal, k8s/Kubernetes, ssh, slurm, ray, vercel, OpenResearch, Tinker, and local backends. Covers the fixed run contract, sizing, cancellation, and wait versus wake. Use before any launch or relaunch, when authoring a k8s manifest, choosing or switching compute, or handling an OOM, stall, or timeout; then read one backend reference."
+description: "Launch and monitor experiment runs and route guidance for hf, modal, k8s/Kubernetes, ssh, slurm, ray, vercel, OpenResearch, Tinker, and local backends. Covers the fixed run contract, sizing, cancellation, and result messages. Use before any launch or relaunch, when authoring a k8s manifest, choosing or switching compute, or handling an OOM, stall, or timeout; then read one backend reference."
 ---
 
 Each run uses an immutable snapshot of the experiment branch's recorded commit.
@@ -8,13 +8,23 @@ Remote backends receive that snapshot; Tinker extracts it for a local controller
 whose SDK sends model operations remotely.
 
 ```sh
-orx exp status <expId>                 # branch, parent, run command, latest run + commit
+orx exp status <expId>                 # branch, parent, run command, latest run: stage, estimate, measures
 orx compute                            # browse GPU offers across all providers
 orx compute --gpu H100_SXM --count 1   # filter GPU offers
 orx compute --cpu                      # browse CPU-only offers
 orx exp run <expId>                    # launch on the configured default
-orx exp cancel <expId>                 # cancel the in-flight run
+orx exp cancel <expId> --reason '…'    # cancel the in-flight run, saying why
 ```
+
+## Follow a run
+
+A baseline reports its stages and measures and has a view before its first
+launch; children inherit them. How to write and change them: `orx-experiment-runs`.
+
+`orx exp status <expId>` shows a run's stage, estimate and measures.
+For scripts, see the status JSON fields in `orx-experiment-runs`.
+Signals are advisory: confirm trouble in the raw log before changing the
+experiment.
 
 ## Inspect configuration and custom instructions first
 
@@ -51,14 +61,12 @@ change the configured backend or authorize bypassing the launch contract.
   for editing, Git, orchestration, and lightweight checks; direct jobs are
   untracked and may run code other than the recorded commit.
 - **Keep the run command fixed.** Set it once on the baseline and vary code or
-  configuration on child branches. If none exists, use `orx project edit
-  <projectId> --run-command '<cmd>'` before launching.
+  configuration on child branches. If none exists, use `orx project edit --run-command '<cmd>'` before launching.
 - **Commit before launching.** Every backend runs the recorded commit's
   immutable source snapshot. Uncommitted files are excluded; no backend needs a
   GitHub push.
-- `orx exp run` queues the run and returns immediately. In a chat, orx wakes
-  you when the run finishes, so you can end your turn; check on it with `orx
-  runs` or `orx logs`, or block on it with `orx exp wait`.
+- `orx exp run` queues the run and returns immediately. Follow the post-launch
+  check in `orx-experiment-runs`.
 - `--force` permits a deliberate concurrent run on the same experiment.
   Without it, `orx` rejects a launch while that node already has a run in
   flight.
@@ -88,7 +96,7 @@ change the configured backend or authorize bypassing the launch contract.
 
 ## Resolve the backend, then read one guide
 
-The session playbook states the configured default. A bare `orx exp run
+The session playbook states this project's default. A bare `orx exp run
 <expId>` uses it. Use another backend only when the user names one; a connected
 credential is not a signal to switch.
 
@@ -115,46 +123,48 @@ the same canonical document.
 
 For Slurm, `--cpus` and `--mem` request `#SBATCH --cpus-per-task` and
 `#SBATCH --mem`; omitting either uses the configured Slurm default, then the
-partition default. Read
-`references/slurm.md` before choosing values.
+partition default. `--flavor cpu` requests no GPU even when the default flavor
+is one. Read `references/slurm.md` before choosing values.
 
-## Waiting on runs — `orx exp wait`
+## Who watches a run
 
-Block until a run changes state when you want to act as soon as it finishes:
+The OpenResearch server watches every run and catches up when reopened; jobs
+keep running while it is closed. A run launched by orx 0.2 may still have a
+detached supervisor process watching it; do not kill it, and the server takes
+the run over once it exits.
 
-```sh
-orx exp wait <expId>                    # wait for this experiment's latest run
-orx exp wait --project <projectId>      # return on the first project completion
-orx exp wait <expId> --interval 10 --timeout 3600
-```
+## Results arrive in the chat
 
-- Pass exactly one of `<expId>` or `--project`.
-- `--project` is the budget-loop primitive: it returns on the first completion,
-  not on starts or queued-to-running transitions. Reissue it once per loop tick.
-- A wait is a sleep-until-change signal, not the source of truth. After every
-  return, read `orx runs <projectId>` and reconcile all newly terminal runs.
-- When nothing is in flight, project wait returns `drained: no runs in flight`.
-- The default interval is 5 seconds. The default timeout is 1800 seconds, or
-  100 seconds under Claude Code, which moves longer shell commands to the
-  background. Timeout exits non-zero and means nothing changed yet, not that
-  the run failed.
-- Cancel only a run that is broken or no longer wanted. After a wait timeout in
-  a chat, end your turn: the run's wake-up resumes you. Outside a chat, wait
-  again instead of cancelling.
-- Failed runs include a `reason:` line. Provider-capacity failures are often
-  retryable; failures after startup require reading the file located by `orx logs <runId>`.
-- A failed run is not a new node. Repair and relaunch the same experiment as
-  described by `orx-experiment-tree`.
+The launching chat is subscribed automatically. Results wait until the chat
+is idle and may combine
+several updates into one message. No waiting command or live agent session is
+needed to keep the runs monitored. Silence does not mean a run failed. A run
+can post an interim result by appending a line to
+`$ORX_NOTIFY_FILE` (`>>`) when set; it arrives at most once per run per 10
+minutes, with later lines coalesced.
 
-### Going idle instead — `orx exp wake`
+When a result message arrives, read `orx runs` and reconcile every
+newly terminal run, including runs that finished while you were analyzing an
+earlier result. Read the file located by `orx logs <runId>` and compare metrics
+before deciding whether to repair, refill a slot, promote a result, or stop.
+A failed run is not a new node: repair and relaunch the same experiment as
+specified by `orx-experiment-tree`.
 
-Wake-ups are automatic: every run launched from this chat wakes it when the run
-succeeds or fails, so you can end your turn right after launching. Use
-`orx exp wake <expId>` only for a run this chat did not launch. Wake-ups fire only for
-`done` or `failed` and wait behind queued user messages. If orx cannot monitor
-a live Slurm run for over a minute, it tells you once per outage; the final
-wake-up comes once orx can see the run finish. A wait that sees the run finish
-replaces its wake-up, so you are not woken twice for one result.
+Attention messages also arrive when monitoring or cancellation needs action.
+Inspect `orx exp status <expId>` and tell the user what needs
+fixing. Cancel only a run that is broken or no longer wanted.
+
+**Cancellation pending** means the cancel has been
+accepted but has not reached the machine. It will be sent when the machine is
+reachable again or the launch is confirmed. **Cancelling…** means the machine
+is stopping the run. To stop tracking an unreachable run, use
+`orx exp abandon <runId>`; double-check that the actual compute is shut down.
+The cancel stays pending after Abandon.
+
+Use `orx exp wake <expId>` to subscribe this chat to a run launched elsewhere.
+`orx exp wait` remains available for humans; do not use it to keep an agent
+session waiting for results, and never wait in a loop either (`sleep` over
+`orx runs`): a turn that waits holds back the user's next message.
 
 ## Sizing compute
 
@@ -164,3 +174,4 @@ replaces its wake-up, so you are not woken twice for one result.
 - Escalate after a real OOM or hopelessly slow run instead of starting with the
   largest accelerator.
 - Raise the timeout only for genuinely long runs.
+

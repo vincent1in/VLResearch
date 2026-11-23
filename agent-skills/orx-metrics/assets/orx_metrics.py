@@ -7,7 +7,7 @@ Save this file next to the training code, then:
     log_metric("val_ic", ic, step=step)
     log_metrics({"train_loss": loss, "lr": lr}, step=step, split="train")
 
-orx reads these lines from the run's output, so nothing else is needed. In
+The orx CLI reads these lines from the run's output, so nothing else is needed. In
 distributed training, call it from rank 0 only. NaN and infinities are
 written as-is; orx records them as missing values and flags the run.
 """

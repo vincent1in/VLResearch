@@ -7,15 +7,56 @@ use crate::store::{Store, StoredRun};
 pub fn resolve_project(store: &Store, project_id: &str) -> Result<LocalProject> {
     store.get_local_project(project_id)?.ok_or_else(|| {
         anyhow!(
-            "Project {project_id} is not registered locally. Run `orx up` in its repository first."
+            "Project {project_id} is not registered in the orx store at {}. Run `orx up` in its repository first.",
+            store.data_dir().display()
         )
     })
+}
+
+/// The named project, or the one the command runs in when no id is given.
+pub fn resolve_project_or_current(store: &Store, project_id: Option<&str>) -> Result<LocalProject> {
+    if let Some(id) = project_id {
+        return resolve_project(store, id);
+    }
+    current_project(store)?.ok_or_else(|| {
+        anyhow!(
+            "Name a project: this command runs outside any project's chat or folder. `orx projects` lists their ids."
+        )
+    })
+}
+
+/// The project of the chat that started this process, else the registered project
+/// whose folder holds the working directory.
+pub fn current_project(store: &Store) -> Result<Option<LocalProject>> {
+    // A cloud box exports its own chat ids, which this store doesn't hold; its folder still says.
+    let chat = crate::local::chat::launching_chat_session()
+        .map(|id| store.get_chat_session(&id))
+        .transpose()?
+        .flatten();
+    if let Some(chat) = chat {
+        return Ok(Some(resolve_project(store, &chat.project_id)?));
+    }
+    let cwd = std::env::current_dir()?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    // The deepest folder wins, so a project nested inside another is the one named.
+    Ok(store
+        .list_local_projects()?
+        .into_iter()
+        .filter_map(|project| {
+            let root = std::path::Path::new(&project.repo_path);
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            cwd.starts_with(&root)
+                .then(|| (root.components().count(), project))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, project)| project))
 }
 
 pub fn resolve_experiment(store: &Store, exp_id: &str) -> Result<LocalExperiment> {
     store.get_local_experiment(exp_id)?.ok_or_else(|| {
         anyhow!(
-            "Experiment {exp_id} was not found in the local orx store. Find local experiment ids with `orx project view <projectId>`."
+            "Experiment {exp_id} was not found in the orx store at {}. Find local experiment ids with `orx project view`.",
+            store.data_dir().display()
         )
     })
 }
@@ -23,7 +64,8 @@ pub fn resolve_experiment(store: &Store, exp_id: &str) -> Result<LocalExperiment
 pub fn resolve_run(store: &Store, run_id: &str) -> Result<StoredRun> {
     crate::local::local_run(store, run_id)?.ok_or_else(|| {
         anyhow!(
-            "Run {run_id} was not found in a local orx project. Find local run ids with `orx runs <projectId>`."
+            "Run {run_id} was not found in the orx store at {}. Find local run ids with `orx runs`.",
+            store.data_dir().display()
         )
     })
 }
@@ -52,6 +94,8 @@ mod tests {
             repo_path: "/tmp/repo".to_string(),
             run_command: None,
             paper_id: None,
+            icon: None,
+            proposal: None,
             created_at: now,
             updated_at: now,
         }
@@ -112,20 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ids_are_local_not_found_errors() {
+    fn unknown_ids_name_the_store_they_were_looked_up_in() {
         let store = temp_store();
-        assert!(resolve_project(&store, "nope")
-            .unwrap_err()
-            .to_string()
-            .contains("not registered locally"));
-        assert!(resolve_experiment(&store, "nope")
-            .unwrap_err()
-            .to_string()
-            .contains("local orx store"));
-        assert!(resolve_run(&store, "nope")
-            .unwrap_err()
-            .to_string()
-            .contains("local orx project"));
+        let dir = store.data_dir().display().to_string();
+        for error in [
+            resolve_project(&store, "nope").map(|_| ()),
+            resolve_experiment(&store, "nope").map(|_| ()),
+            resolve_run(&store, "nope").map(|_| ()),
+        ] {
+            let error = error.unwrap_err().to_string();
+            assert!(error.contains("nope") && error.contains(&dir), "{error}");
+        }
     }
 
     #[test]

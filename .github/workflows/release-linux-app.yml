@@ -5,12 +5,12 @@
 #
 # Triggers mirror release-macos-app.yml: the automatic workflow_run after a
 # successful dispatched "Release", or a manual dispatch naming the tag. Gated on
-# the repo variable LINUX_APP_ENABLED. See docs/linux.md.
+# the repo variable LINUX_APP_ENABLED.
 
 name: Attach Linux app to release
 
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] Release has no PR trigger and `check` admits only dispatched runs
     workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
@@ -41,8 +41,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - id: gate
         env:
@@ -67,13 +68,15 @@ jobs:
           if [ -n "${expected_sha:-}" ]; then test "$sha" = "$expected_sha"; fi
           version=$(git show "$sha:Cargo.toml" | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
           test "$tag" = "v$version"
-          if [ -z "$RELEASE_RUN_ID" ] && ! git cat-file -e "$sha:ui/dist/index.html" 2>/dev/null; then
+          if [ -z "$RELEASE_RUN_ID" ] && { git cat-file -e "$sha:scripts/build-host.mjs" 2>/dev/null || ! git cat-file -e "$sha:ui/dist/index.html" 2>/dev/null; }; then
             RELEASE_RUN_ID=$(bash scripts/find-release-run.sh "$tag" "$sha")
           fi
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "release-run-id=$RELEASE_RUN_ID" >> "$GITHUB_OUTPUT"
+          {
+            echo "ok=true"
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "release-run-id=$RELEASE_RUN_ID"
+          } >> "$GITHUB_OUTPUT"
 
   appimage:
     needs: check
@@ -88,29 +91,61 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ needs.check.outputs.source-sha }}
+
+      - name: Take AppImage tools from the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: packaging-workflow
+          sparse-checkout: |
+            linux
+            scripts
 
       - name: Remove checked-in UI
         if: needs.check.outputs.release-run-id != ''
         run: rm -rf ui/dist
       - name: Download release UI
         if: needs.check.outputs.release-run-id != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-ui
           path: ui/dist
           run-id: ${{ needs.check.outputs.release-run-id }}
           github-token: ${{ github.token }}
 
+      - name: Download release hosts
+        if: needs.check.outputs.release-run-id != '' && hashFiles('scripts/build-host.mjs') != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-host
+          path: target/host-binaries
+          run-id: ${{ needs.check.outputs.release-run-id }}
+          github-token: ${{ github.token }}
+
       - name: Install WebKitGTK and packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev file patchelf xvfb xdotool
+          # LLVM's headers on Ubuntu 22.04 runners conflict with GStreamer's libunwind-dev.
+          sudo apt-get remove -y libunwind-14-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libgstreamer1.0-dev librsvg2-dev file patchelf xvfb xauth xdotool python3 imagemagick gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
 
       # The runner's preinstalled stable toolchain, as release-macos-app.yml uses.
+      - name: Build the media fault fixture when supported by the release source
+        env:
+          ORX_EMBED_HOST_DIR: ${{ github.workspace }}/target/host-binaries
+        run: |
+          if [ -f tests/fixtures/media_fault_plugin.rs ]; then
+            ORX_OFFICIAL_RELEASE_BUILD=1 cargo build --release --locked --features desktop --example gstorxprobe
+          fi
+
       - name: Build the production orx
+        env:
+          ORX_EMBED_HOST_DIR: ${{ github.workspace }}/target/host-binaries
         run: ORX_OFFICIAL_RELEASE_BUILD=1 cargo build --release --locked --features desktop
 
       - name: Verify the production channel
@@ -119,16 +154,52 @@ jobs:
         run: test "$(target/release/orx version --build-channel)" = production
 
       - name: Package the AppImage
-        run: scripts/build-linux-appimage.sh target/release/orx app-dist
+        run: |
+          packaging-workflow/scripts/build-linux-appimage.sh target/release/orx app-dist
 
-      # Otherwise the host's WebKit would stand in for a broken bundled one.
-      - name: Remove WebKitGTK from the runner
+      - name: Smoke-test the system runtime
+        run: |
+          packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage system
+          PATH=/usr/bin:/bin packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage system
+
+      - name: Check media-check crash and timeout isolation
+        run: |
+          ulimit -c 0
+          if [ -f tests/fixtures/media_fault_plugin.rs ]; then
+            for fault in abort hang; do
+              packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage "system-$fault" target/release/examples
+            done
+          fi
+
+      - name: Remove media plugins with system WebKit installed
+        run: sudo dpkg --remove --force-depends gstreamer1.0-plugins-good
+
+      - name: Check that missing media does not block the dashboard
+        run: packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage system-disabled
+
+      - name: Restore media plugins
+        run: sudo apt-get install -y gstreamer1.0-plugins-good
+
+      - name: Remove the system WebKit
         run: sudo apt-get remove -y libwebkit2gtk-4.1-0 libjavascriptcoregtk-4.1-0
 
-      - name: Smoke-test the AppImage
-        run: scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage
+      - name: Smoke-test the bundled fallback
+        run: |
+          packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage bundled
+          ulimit -c 0
+          if [ -f tests/fixtures/media_fault_plugin.rs ]; then
+            for fault in abort hang; do
+              packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage "bundled-$fault" target/release/examples
+            done
+          fi
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - name: Remove the system media plugins
+        run: sudo apt-get remove -y gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+
+      - name: Check the dashboard without media
+        run: packaging-workflow/scripts/smoke-test-linux-appimage.sh app-dist/OpenResearch-${{ matrix.arch }}.AppImage bundled-disabled
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: appimage-${{ matrix.arch }}
           path: app-dist/OpenResearch-${{ matrix.arch }}.AppImage
@@ -145,7 +216,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.check.outputs.tag }}
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: appimage-*
           merge-multiple: true

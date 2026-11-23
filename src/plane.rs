@@ -3,15 +3,40 @@
 use crate::error::{anyhow, Result};
 use crate::store::{Store, StoredRun};
 
+pub(crate) static LABELS: std::sync::LazyLock<std::collections::HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../ui/messages/en.json"))
+            .expect("English message catalog")
+    });
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Run {
     pub id: String,
     pub experiment_id: String,
     pub status: String,
+    pub contact: crate::store::Contact,
+    #[serde(default)]
+    pub cancelling: bool,
+    #[serde(default)]
+    pub cancel_unconfirmed: Option<Vec<u32>>,
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
+    #[serde(default)]
+    pub cancel_error: Option<String>,
+    pub host: Option<String>,
     pub commit_sha: Option<String>,
     pub duration_secs: i64,
     pub updated_display: String,
     pub result_markdown: Option<String>,
     pub cancel_reason: Option<String>,
+    /// For a failed run that recorded no message, the line in its log that says why.
+    #[serde(default)]
+    pub log_error: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
 }
 
 impl From<&StoredRun> for Run {
@@ -20,31 +45,242 @@ impl From<&StoredRun> for Run {
             id: run.id.clone(),
             experiment_id: run.experiment_id.clone(),
             status: run.status.clone(),
+            contact: crate::store::Contact::Live,
+            cancelling: run.cancel_requested
+                && !crate::engine::Phase::parse(&run.status)
+                    .is_some_and(crate::engine::Phase::is_terminal),
+            cancel_unconfirmed: None,
+            waiting_reason: None,
+            cancel_error: None,
+            host: None,
             commit_sha: run.commit_sha.clone(),
-            duration_secs: crate::local::run_duration_secs(run),
+            duration_secs: crate::local::run_duration_ms(run, None) / 1000,
             updated_display: crate::local::fmt_ago(run.updated_at),
             result_markdown: run.result_markdown.clone(),
             cancel_reason: run.cancel_reason.clone(),
+            log_error: None,
+            started_at: None,
+            exit_code: run.exit_code,
         }
     }
 }
 
 impl Run {
+    pub(crate) fn from_store(store: &Store, stored: &StoredRun) -> Result<Self> {
+        let mut run = Self::with_store_state(store, stored)?;
+        let silent = run
+            .result_markdown
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty());
+        if run.status == "failed" && silent {
+            // A log that cannot be read leaves the reason pointing at `orx logs`, which says why.
+            run.log_error = store
+                .recent_log(&stored.id, 64 * 1024)
+                .ok()
+                .and_then(|log| {
+                    crate::store::last_error(&log)
+                        .filter(|line| crate::local::share::find_secret(line).is_none())
+                        .map(str::to_owned)
+                });
+        }
+        Ok(run)
+    }
+
+    pub(crate) fn with_store_state(store: &Store, stored: &StoredRun) -> Result<Self> {
+        let mut run = Self::from(stored);
+        if let Some(state) = store.engine_run_state(&stored.id)? {
+            run.cancelling |= state.cancel_accepted_at.is_some()
+                && !crate::engine::Phase::parse(&stored.status)
+                    .is_some_and(crate::engine::Phase::is_terminal);
+            run.contact = state.contact;
+            run.cancel_unconfirmed = state.cancel_unconfirmed;
+            run.waiting_reason = state.waiting_reason;
+            run.started_at = state.started_at;
+            run.duration_secs = crate::local::run_duration_ms(stored, state.started_at) / 1000;
+        }
+        run.cancel_error = crate::commands::up::api_v2::cancel_error(&stored.id);
+        run.host = crate::commands::up::run_host(store, stored)?;
+        Ok(run)
+    }
+
+    pub fn contact_detail(&self) -> Option<String> {
+        use crate::store::Contact;
+        let (contact, since, cause) = match &self.contact {
+            Contact::Live | Contact::Stopping { .. } => return None,
+            Contact::Unreachable { since, cause } => ("unreachable", since, cause),
+            Contact::NeedsAuth { since, cause } => ("needs_auth", since, cause),
+            Contact::Unreconciled { since, detail } => ("unreconciled", since, detail),
+        };
+        Some(format!(
+            "contact: {contact}, since {}: {cause}",
+            crate::telemetry::iso8601_utc(*since)
+        ))
+    }
+
+    /// Ended before it ran a command: nothing started it and nothing exited.
+    pub fn never_started(&self) -> bool {
+        self.status == "failed" && self.started_at.is_none() && self.exit_code.is_none()
+    }
+
+    pub fn waiting_detail(&self) -> Option<String> {
+        let reason = self.waiting_reason.as_deref()?;
+        Some(format!("waiting: {reason}"))
+    }
+
+    pub fn display_status(&self) -> std::borrow::Cow<'_, str> {
+        if self.status == "cancelled" {
+            if let crate::store::Contact::Stopping { count, .. } = self.contact {
+                let host = self.host.as_deref().unwrap_or("localhost");
+                let key = if count == 1 {
+                    "status_stopping_one"
+                } else {
+                    "status_stopping_other"
+                };
+                return LABELS[key]
+                    .replace("{count}", &count.to_string())
+                    .replace("{host}", host)
+                    .into();
+            }
+            if self.cancel_unconfirmed.is_some() {
+                return LABELS["status_cancelled_unconfirmed"].as_str().into();
+            }
+            return LABELS["status_cancelled"].as_str().into();
+        }
+        if self.cancelling {
+            let pending = self.status == "submitting"
+                || self.cancel_error.is_some()
+                || matches!(
+                    self.contact,
+                    crate::store::Contact::Unreachable { .. }
+                        | crate::store::Contact::NeedsAuth { .. }
+                        | crate::store::Contact::Unreconciled { .. }
+                );
+            let key = if pending {
+                "status_cancellation_pending"
+            } else {
+                "status_cancelling"
+            };
+            return LABELS[key].as_str().into();
+        }
+        self.status.as_str().into()
+    }
+
+    /// The command that moves an unfinished run on when waiting alone won't.
+    pub fn next_step(&self) -> Option<String> {
+        use crate::store::Contact;
+        if crate::engine::Phase::parse(&self.status).is_some_and(crate::engine::Phase::is_terminal)
+        {
+            return None;
+        }
+        let abandon = format!("if the job is gone for good, `orx exp abandon {}`", self.id);
+        match (&self.contact, self.host.as_deref()) {
+            (Contact::NeedsAuth { .. }, Some(host)) => Some(format!(
+                "next: `orx compute connect ssh --host {host}` to sign in again; {abandon}."
+            )),
+            (
+                Contact::Unreachable { .. }
+                | Contact::NeedsAuth { .. }
+                | Contact::Unreconciled { .. },
+                _,
+            ) => Some(format!("next: {abandon}.")),
+            _ if self.cancel_error.is_some() => Some(format!(
+                "next: the cancel keeps failing ({}); {abandon}.",
+                self.cancel_error.as_deref().unwrap_or_default()
+            )),
+            _ if self.cancelling => Some(format!(
+                "next: `orx exp wait {}` returns when it ends.",
+                self.experiment_id
+            )),
+            _ => None,
+        }
+    }
+
     pub fn failure_detail(&self) -> Option<String> {
         if self.status == "cancelled" {
-            return self.cancel_reason.as_ref().map(|r| format!("reason: {r}"));
+            let reason = self
+                .cancel_reason
+                .iter()
+                .chain(self.result_markdown.iter())
+                .filter(|text| !text.trim().is_empty())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            return (!reason.is_empty()).then(|| format!("reason: {reason}"));
         }
         if self.status != "failed" {
             return None;
         }
         match self.result_markdown.as_deref().map(str::trim) {
-            Some(reason) if !reason.is_empty() => Some(format!("reason: {reason}")),
-            _ => Some(format!(
-                "reason: — (no message recorded — see `orx logs {}`)",
-                self.id
-            )),
+            Some(reason) if !reason.is_empty() => Some(format!("reason: {}", reason_words(reason))),
+            _ => Some(match &self.log_error {
+                Some(line) => format!(
+                    "reason: last error in the log: `{line}` (see `orx logs {}` for the log path and a tail preview)",
+                    self.id
+                ),
+                None => format!(
+                    "reason: — (no message recorded — see `orx logs {}`)",
+                    self.id
+                ),
+            }),
         }
     }
+}
+
+/// A run's recorded failure in the user's words: a provider refusal or provisioning failure orx knows
+/// becomes what happened and what to do; any other provider answer is its own message, without the
+/// HTTP request and JSON around it; everything else is kept as written.
+pub(crate) fn reason_words(text: &str) -> String {
+    static WRAPPED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?s)^Request to \S+ failed \(\d{3}[^)]*\): (.+)$").unwrap()
+    });
+    static NO_OFFER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^No offer available for (.+?) × (\d+)\b").unwrap()
+    });
+    let text = text.trim();
+    let message = match WRAPPED.captures(text) {
+        Some(wrapped) => {
+            let body = &wrapped[1];
+            let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+            let said = parsed.as_ref().and_then(|body| {
+                let error = &body["error"];
+                error["message"]
+                    .as_str()
+                    .or(error.as_str())
+                    .or(body["message"].as_str())
+            });
+            said.unwrap_or(body).trim().to_owned()
+        }
+        None => text.to_owned(),
+    };
+    if let Some(offer) = NO_OFFER.captures(&message) {
+        let gpu = &offer[1];
+        let gpus = if &offer[2] == "1" {
+            gpu.to_owned()
+        } else {
+            format!("{} × {gpu}", &offer[2])
+        };
+        return format!("There was no {gpus} free to rent. Try another GPU, or launch again.");
+    }
+    if let Some((code, said)) = message
+        .strip_prefix("Provisioning failed: ")
+        .and_then(|message| message.split_once(':'))
+        .filter(|(code, _)| {
+            !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        })
+    {
+        let said = said.trim();
+        if code == "provider_error"
+            && matches!(
+                said,
+                "" | "The provider could not provision this box."
+                    | "The provider could not provision this instance. Please try again."
+            )
+        {
+            return "The provider couldn't start the box. Launch again.".into();
+        }
+        return if said.is_empty() { code } else { said }.to_owned();
+    }
+    message
 }
 
 pub enum DescInput {
@@ -73,6 +309,7 @@ pub struct ProjectEdit {
     pub run_command: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
 pub struct RunListing {
     pub runs: Vec<Run>,
     pub titles: std::collections::HashMap<String, String>,
@@ -86,13 +323,13 @@ pub struct CreateExperimentSpec {
     pub run_command: Option<String>,
 }
 
-pub(crate) fn resolve_project(store: Store, project_id: &str) -> Result<LocalPlane> {
-    let project = crate::local::resolve::resolve_project(&store, project_id)?;
+pub(crate) fn resolve_project(store: Store, project_id: Option<&str>) -> Result<LocalPlane> {
+    let project = crate::local::resolve::resolve_project_or_current(&store, project_id)?;
     Ok(LocalPlane {
         store,
+        id: project.id.clone(),
         project: Some(project),
         experiment: None,
-        id: project_id.to_string(),
     })
 }
 
@@ -103,16 +340,6 @@ pub(crate) fn resolve_experiment(store: Store, exp_id: &str) -> Result<LocalPlan
         project: None,
         experiment: Some(experiment),
         id: exp_id.to_string(),
-    })
-}
-
-pub(crate) fn resolve_run(store: Store, run_id: &str) -> Result<LocalPlane> {
-    crate::local::resolve::resolve_run(&store, run_id)?;
-    Ok(LocalPlane {
-        store,
-        project: None,
-        experiment: None,
-        id: run_id.to_string(),
     })
 }
 
@@ -148,6 +375,39 @@ mod tests {
     }
 
     #[test]
+    fn contact_details_decode_the_v2_shape() {
+        for (contact, reason) in [
+            (
+                serde_json::json!({"type":"unreachable", "since":1000, "cause":"offline"}),
+                "offline",
+            ),
+            (
+                serde_json::json!({"type":"needs_auth", "since":1000, "cause":"key rejected"}),
+                "key rejected",
+            ),
+            (
+                serde_json::json!({"type":"unreconciled", "since":1000, "detail":"receipt unreadable"}),
+                "receipt unreadable",
+            ),
+            (serde_json::json!({"type":"live"}), ""),
+        ] {
+            let mut view = serde_json::to_value(stored_run("running", None)).unwrap();
+            view["durationSecs"] = 1.into();
+            view["updatedDisplay"] = "now".into();
+            view["contact"] = contact.clone();
+            let run: Run = serde_json::from_value(view).unwrap();
+            if reason.is_empty() {
+                assert_eq!(run.contact_detail(), None);
+            } else {
+                let detail = run.contact_detail().unwrap();
+                assert!(detail.contains(contact["type"].as_str().unwrap()));
+                assert!(detail.contains("1970-01-01T00:00:01"));
+                assert!(detail.contains(reason));
+            }
+        }
+    }
+
+    #[test]
     fn stored_run_maps_to_cli_run() {
         let run = Run::from(&stored_run("done", None));
         assert_eq!(run.id, "r1");
@@ -164,6 +424,62 @@ mod tests {
             run.failure_detail().as_deref(),
             Some("reason: — (no message recorded — see `orx logs r1`)")
         );
+    }
+
+    #[test]
+    fn a_provisioning_failure_keeps_the_providers_detail() {
+        let detail = "This machine has only 200 GB of disk. Request a smaller disk.";
+        let reason = format!("Provisioning failed: provider_error: {detail}");
+        let run = Run::from(&stored_run("failed", Some(&reason)));
+        assert!(run.failure_detail().unwrap().contains(detail));
+    }
+
+    #[test]
+    fn a_failure_reads_in_the_users_words() {
+        let offer = r#"Request to /sandboxes failed (400 Bad Request): {"error":{"message":"No offer available for L40S × 1 with ≥100 GB disk. Try a different configuration."}}"#;
+        assert_eq!(
+            reason_words(offer),
+            "There was no L40S free to rent. Try another GPU, or launch again."
+        );
+        assert_eq!(
+            reason_words(&offer.replace("× 1", "× 2")),
+            "There was no 2 × L40S free to rent. Try another GPU, or launch again."
+        );
+        assert_eq!(
+            reason_words("Provisioning failed: provider_error: The provider could not provision this instance. Please try again."),
+            "The provider couldn't start the box. Launch again."
+        );
+        assert_eq!(
+            reason_words(
+                r#"Request to /sandboxes failed (422 Unprocessable Entity): {"error":{"message":"Disk must be at most 2000 GB."}}"#
+            ),
+            "Disk must be at most 2000 GB."
+        );
+        assert_eq!(
+            reason_words(
+                "Request to /sandboxes failed (500 Internal Server Error): upstream timed out"
+            ),
+            "upstream timed out"
+        );
+        assert_eq!(
+            reason_words("Provisioning failed: no_gpu: Out of H100s."),
+            "Out of H100s."
+        );
+        for kept in ["Killed by signal 15.", "No orx-host for linux-x86_64"] {
+            assert_eq!(reason_words(kept), kept);
+        }
+    }
+
+    #[test]
+    fn a_run_that_never_started_is_told_from_one_that_ran() {
+        let mut run = Run::from(&stored_run("failed", None));
+        assert!(run.never_started());
+        run.exit_code = Some(1);
+        assert!(!run.never_started());
+        run.exit_code = None;
+        run.started_at = Some(1);
+        assert!(!run.never_started());
+        assert!(!Run::from(&stored_run("running", None)).never_started());
     }
 
     #[test]
@@ -195,6 +511,8 @@ mod tests {
                     repo_path: "/tmp/repo".into(),
                     run_command: None,
                     paper_id: None,
+                    icon: None,
+                    proposal: None,
                     created_at: 0,
                     updated_at: 0,
                 })
@@ -233,5 +551,100 @@ mod tests {
         assert_eq!(label("user_exp"), None);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn next_step_names_the_command_that_moves_a_run_on() {
+        let mut value = serde_json::json!({
+            "id": "run", "experimentId": "exp", "status": "running", "commitSha": null,
+            "durationSecs": 1, "updatedDisplay": "now", "resultMarkdown": null, "cancelReason": null,
+            "contact": {"type":"live"}, "cancelling": false, "host": "gpu-box",
+        });
+        let next = |value: &serde_json::Value| {
+            serde_json::from_value::<Run>(value.clone())
+                .unwrap()
+                .next_step()
+        };
+        assert_eq!(next(&value), None);
+        value["cancelling"] = true.into();
+        assert!(next(&value).unwrap().contains("`orx exp wait exp`"));
+        value["cancelError"] = "HTTP 500".into();
+        let refused = next(&value).unwrap();
+        assert!(refused.contains("HTTP 500") && refused.contains("`orx exp abandon run`"));
+        value["cancelError"] = serde_json::Value::Null;
+        for contact in [
+            serde_json::json!({"type":"unreachable", "since":1, "cause":"offline"}),
+            serde_json::json!({"type":"unreconciled", "since":1, "detail":"no orx-host"}),
+        ] {
+            value["contact"] = contact;
+            assert!(next(&value).unwrap().contains("`orx exp abandon run`"));
+        }
+        value["contact"] = serde_json::json!({"type":"needs_auth", "since":1, "cause":"Duo"});
+        assert!(next(&value)
+            .unwrap()
+            .contains("`orx compute connect ssh --host gpu-box`"));
+        value["status"] = "lost".into();
+        assert_eq!(next(&value), None);
+    }
+
+    #[test]
+    fn cli_labels_decode_the_v2_cancel_fields_without_replacing_the_phase() {
+        let mut value = serde_json::json!({
+            "id": "run", "experimentId": "exp", "status": "running", "commitSha": null,
+            "durationSecs": 1, "updatedDisplay": "now", "resultMarkdown": null, "cancelReason": null,
+            "contact": {"type":"live"}, "cancelling": true, "host": "gpu-box",
+        });
+        let run: Run = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(run.status, "running");
+        assert_eq!(run.display_status(), "Cancelling…");
+        for contact in [
+            serde_json::json!({"type":"unreachable", "since":1, "cause":"offline"}),
+            serde_json::json!({"type":"needs_auth", "since":1, "cause":"connect"}),
+            serde_json::json!({"type":"unreconciled", "since":1, "detail":"2 survivors"}),
+        ] {
+            value["contact"] = contact;
+            let run: Run = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(run.display_status(), "Cancellation pending");
+        }
+        value["status"] = serde_json::json!("cancelled");
+        value["cancelling"] = serde_json::json!(false);
+        value["contact"] = serde_json::json!({"type":"stopping", "since":1, "count":2});
+        let run: Run = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(
+            run.display_status(),
+            "Not fully stopped · 2 processes still running on gpu-box"
+        );
+        value["contact"] = serde_json::json!({"type":"stopping", "since":1, "count":1});
+        let run: Run = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            run.display_status(),
+            "Not fully stopped · 1 process still running on gpu-box"
+        );
+        assert_eq!(run.contact_detail(), None);
+        value["contact"] = serde_json::json!({"type":"live"});
+        assert_eq!(
+            serde_json::from_value::<Run>(value.clone())
+                .unwrap()
+                .display_status(),
+            "Cancelled"
+        );
+        value["cancelUnconfirmed"] = serde_json::json!([789]);
+        value["resultMarkdown"] = "The host couldn't inspect process 789.".into();
+        let run: Run = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(run.display_status(), "Cancelled · couldn't confirm");
+        assert!(run.failure_detail().unwrap().contains("process 789"));
+        value["resultMarkdown"] = "Edited".into();
+        assert_eq!(
+            serde_json::from_value::<Run>(value)
+                .unwrap()
+                .display_status(),
+            "Cancelled · couldn't confirm"
+        );
     }
 }
