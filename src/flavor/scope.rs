@@ -1180,6 +1180,7 @@ pub(crate) mod tests {
             run_command: None,
             paper_id: None,
             icon: None,
+            proposal: None,
             created_at: 1,
             updated_at: 1,
         }
