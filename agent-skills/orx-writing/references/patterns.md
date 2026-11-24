@@ -132,9 +132,10 @@ a plainer one is more precise.
 
 ## 4. Equations, figures and notation
 
-**An equation where a sentence does.** "The final score is
-$s = \frac{1}{K}\sum_{k=1}^{K} s_k$", when $s$, $s_k$ and $K$ never appear
-again. Write "the final score is the mean of the five fold scores".
+**An equation where a sentence does.** "The reported IC is
+$\bar{\rho} = \frac{1}{K}\sum_{k=1}^{K} \rho_k$", when $\bar{\rho}$,
+$\rho_k$ and $K$ never appear again. Write "the reported IC is the mean of
+the five fold ICs".
 
 **An equation where a figure does.** The bias-variance decomposition is
 displayed, then a paragraph describes how each term moves as $\lambda$
@@ -177,8 +178,29 @@ axis says `alpha`. Label the axis $\lambda$ and say once that scikit-learn
 calls it `alpha`.
 
 **A symbol back after a gap.** $\kappa$ is defined in Section 2 and used in
-Section 5 with no reminder. Write "the condition number $\kappa$" where it
-returns.
+Section 5 with no reminder. Write "the condition number $\kappa$ of
+$X^\top X$ (Eq. 4)" where it returns, with the equation number a link.
+
+**A generic label.** A report defines "the score" in Section 2 as the
+fold-mean rank IC, also reports a validation loss, and later says "the score
+rises by 0.006". Write "the fold-mean rank IC (Eq. 2) rises from 0.021 to
+0.027", and give the formula again when the reader needs its exact form and
+Eq. 2 is out of view.
+
+**A notation section.** A "Notation" list at the top defines twelve symbols,
+and Section 4 uses $\bar{\rho}_{\mathrm{oos}}$ with no other help. Define
+each symbol where it is first used, give its name and a link wherever it
+returns, and delete the list.
+
+**A pointer ahead.** "We report the adjusted IC (defined in Section 5)."
+State the definition at its first use, even in one line ("the rank IC net of
+costs: the rank IC minus the per-period cost drag"), and put the derivation
+after it.
+
+**An item behind a generic label.** "The baseline beats the model on recent
+data." Name both and link them: "ridge on 120 features (`<run id="…" />`)
+beats the gradient-boosted trees (`<run id="…" />`) on 2025 data". In LaTeX or
+HTML, link to the table row or figure that reports each.
 
 ## 5. Replies in chat
 
@@ -193,6 +215,9 @@ returns.
 - Answer a conceptual question in words, with a figure or worked numbers
   where they help. Add notation only when the user needs the exact form,
   and define each symbol in the reply.
+- Refer back to an earlier result by what it is, with its `<run id>` or
+  `<file path>` tag, not by a label coined earlier in the conversation
+  ("option B", "the second score").
 
 ## 6. Sources
 

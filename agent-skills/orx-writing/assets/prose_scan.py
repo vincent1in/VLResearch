@@ -33,6 +33,9 @@ PATTERNS = [
     ("hedge stack", r"\b(may|might|could) (potentially|possibly)\b|\bpotentially (suggest|indicate)\w*\b"),
     ("chat opener/closer", r"^\s*(great question|certainly!|absolutely!|i hope this helps|let me know if you (have|need|want))\b"),
     ("agency verb", r"\b(ridge|lasso|the (estimator|optimizer|penalty|model|eigen\w+)) (decides|prefers|wants|chooses|knows)\b"),
+    ("pointer to a definition", r"\b(as )?defined (above|below|earlier|later|previously)\b|\bdefined in (section|appendix|chapter)\b|\bsee (the )?notation\b|\brecall that\b"),
+    ("generic label", r"\bthe (score|metric|quantity|measure|statistic)\b"),
+    ("notation section", r"^\s*(#+\s*|\\(sub)*section\*?\{)\s*(notation|symbols|glossary|definitions)\b"),
 ]
 
 COMPILED = [(label, re.compile(rx, re.IGNORECASE)) for label, rx in PATTERNS]

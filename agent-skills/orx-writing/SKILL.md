@@ -1,6 +1,6 @@
 ---
 name: orx-writing
-description: "Edit prose for precision and strip machine-writing patterns: inflated claims, vague attribution, stock phrasing, staged reveals, slogans, recap boxes. Use equations only when needed, prefer figures, derive step by step with one meaning per symbol. Use before finishing a paper, report, finding, brief, README or long reply, when explaining math, or when revising a manuscript or removing AI slop."
+description: "Edit prose for precision and strip machine-writing patterns: inflated claims, vague attribution, stock phrasing, staged reveals, slogans, recap boxes. Prefer figures to equations, derive step by step, and name each quantity specifically, with its formula or a link each time. Use before finishing a paper, report, finding, brief or long reply, when explaining math, or when revising a manuscript."
 ---
 
 ## Scope
@@ -53,8 +53,8 @@ an equation only when the reader needs the exact relation: a definition that
 later steps use, a derivation the claim rests on, or a formula someone will
 implement or check.
 
-- If a sentence states the relation exactly, write the sentence: "the score
-  is the mean of the five fold scores" needs no summation.
+- If a sentence states the relation exactly, write the sentence: "the
+  reported IC is the mean of the five fold ICs" needs no summation.
 - If the point is a shape, a trend, a trade-off or a mechanism, show it with
   a plot, a diagram or a small worked example in real numbers. Make figures
   with `orx-figures`; its diagram reference covers schematics.
@@ -98,11 +98,29 @@ Keep the notation stable from one step to the next:
   estimate, a bar for an average, a tilde for a transformed copy.
 - Keep index letters fixed ($i$ for observations, $t$ for periods), and do
   not sum over a letter that already names something.
-- When a symbol returns after a gap of a page or a section, restate it in a
-  few words: "the penalty $\lambda$". With many symbols, add a notation
-  table near the start.
 - When revising the user's text, keep their notation. Point out a collision
   and propose a fix; rename throughout only within the scope they asked for.
+
+Name each quantity so the reader never has to go looking for what a word or
+symbol means:
+
+- Call a quantity what it is: what is measured, on which data, and how it is
+  aggregated. Write "out-of-sample rank IC averaged over the five folds", not
+  "the score", and "ridge on 120 features (experiment 14)", not "the model".
+  A generic label (the score, the metric, the signal, the model, the
+  baseline) is ambiguous as soon as a second quantity could fit it.
+- Define a quantity where it is first used, beside its formula or the item it
+  comes from. Do not gather definitions in a notation section, glossary or
+  symbol table for the text to point back to, and do not point ahead to a
+  definition further down.
+- Wherever the quantity appears again out of view of its definition, bring
+  the definition along: repeat the formula inline, or link the name to the
+  equation, figure, table, run or file that defines it. Use `\eqref` and
+  `\ref` in LaTeX (hyperref makes them clickable), `<run id="…" />` and
+  `<file path="…" />` tags in chat, and anchor links in HTML or Markdown.
+- In prose, a symbol travels with its name and its reference: "the ridge
+  penalty $\lambda$ (Eq. 3)", never a bare $\lambda$ three sections after it
+  was introduced.
 
 Section 4 of [references/patterns.md](references/patterns.md) has a worked
 example of each point.
@@ -137,6 +155,7 @@ simpler wrong one.
 | Tour-guide transitions | "Back to finance." | A substantive link or none |
 | Repeated metaphor | "what X buys", "prices the signal" | Literal description |
 | Agency for math objects | ridge "decides", a direction "prefers" | Describe the behavior |
+| Detached labels | "the score", "see Notation", a symbol defined pages earlier | A specific name, with its formula or a link to its definition |
 | Mirror sentences | "A does p, and B does q." | Keep only if the claim really is that clean |
 | Consultancy and moral words | "playbook", "audit", "honest validation" | Name the procedure or the property |
 | Theatrical disclaimers | "not every conceivable case" | State the limit plainly |
@@ -159,7 +178,8 @@ python3 /tmp/prose_scan.py paper.tex docs/report.md
 
 A hit is a place to look, not a verdict: keep a line when the pattern serves
 the text. Patterns of structure (repeated caveats, recap boxes, staged
-questions) need a full read; the scanner sees only phrases, not notation.
+questions) need a full read; the scanner sees only phrases, such as "defined
+above" or "the score", not notation.
 
 If the text has equations, list its symbols with each one's meaning and
 where it is defined. Fix any symbol with two meanings, any object with two
@@ -169,6 +189,11 @@ uses the symbols of the equations it illustrates, and check a derivation's
 result on small numbers (a few lines of Python) when the algebra is not
 obvious. Last, ask of each remaining display whether a sentence or a figure
 would carry it.
+
+Then follow each named quantity and symbol from its definition to every later
+use. Each use out of view of the definition carries the formula or a link to
+it, no generic label is left that two quantities could fit, and nothing points
+to a notation section or to a definition further down.
 
 Then re-read the edited passages in order. Check that every claim you kept
 still has its evidence and qualifiers, that terms and notation match the rest
@@ -180,5 +205,7 @@ of the document, and that no paragraph now repeats another.
   `orx-paper` describes, read the log for new warnings, and look at the
   pages you changed. Keep the project's macros and build conventions; define
   new macros locally rather than editing a shared macro file.
+- An HTML page you build fills the width of the screen: no centered column,
+  reading-width cap or side margins beyond a small gutter.
 - Report what you changed, what you checked, and any material problem you
   could not resolve. Do not summarize the edits with the patterns above.
